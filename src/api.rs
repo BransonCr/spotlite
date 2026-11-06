@@ -2,15 +2,48 @@
 
 use crate::auth::{self, Token};
 use crate::config::Config;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::fmt;
 use std::time::Duration;
 
 const API: &str = "https://api.spotify.com/v1";
 /// Dev-mode apps get at most 10 search results per request.
-const SEARCH_LIMIT: &str = "10";
+pub const SEARCH_PAGE: usize = 10;
+pub const PAGE: usize = 50;
+
+/// Errors the UI reacts to differently from a plain message.
+#[derive(Debug)]
+pub enum ApiError {
+    /// 429: wait this many seconds before the next request.
+    RateLimited(u64),
+    /// 401: the login is no longer valid.
+    Unauthorized,
+    /// 403 "Insufficient client scope": the token is missing a permission.
+    MissingScope,
+    /// 403 on a playlist the user does not own or collaborate on.
+    Forbidden,
+    /// 404 "no active device".
+    NoDevice,
+    Other(u16, String),
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ApiError::RateLimited(s) => write!(f, "rate limited by Spotify; retrying in {s}s"),
+            ApiError::Unauthorized => write!(f, "login expired; run `spotlite auth`"),
+            ApiError::MissingScope => write!(f, "permission missing; run `spotlite auth` again"),
+            ApiError::Forbidden => write!(f, "Spotify does not allow this"),
+            ApiError::NoDevice => write!(f, "no active device; is spotifyd running?"),
+            ApiError::Other(code, msg) => write!(f, "Spotify API {code}: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Named {
@@ -26,28 +59,59 @@ pub struct Track {
     #[serde(default)]
     pub artists: Vec<Named>,
     pub album: Option<Named>,
+    /// Podcast episodes have a show instead of artists.
+    pub show: Option<Named>,
 }
 
 impl Track {
     pub fn artist_names(&self) -> String {
+        if self.artists.is_empty() {
+            return self.show.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+        }
         self.artists
             .iter()
             .map(|a| a.name.as_str())
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    pub fn album_name(&self) -> &str {
+        self.album.as_ref().map_or("", |a| a.name.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Owner {
+    pub id: String,
     pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct Total {
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Playlist {
+    pub id: String,
     pub uri: String,
     pub name: String,
-    pub owner: Option<Owner>,
+    pub owner: Owner,
+    #[serde(default)]
+    pub collaborative: bool,
+    /// Called `tracks` before the Feb 2026 rename.
+    #[serde(alias = "tracks")]
+    pub items: Option<Total>,
+}
+
+impl Playlist {
+    pub fn track_count(&self) -> Option<usize> {
+        self.items.as_ref().map(|t| t.total)
+    }
+
+    pub fn owner_name(&self) -> &str {
+        self.owner.display_name.as_deref().unwrap_or(&self.owner.id)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +124,11 @@ pub struct Device {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct Context {
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Playback {
     pub device: Option<Device>,
     #[serde(default)]
@@ -67,29 +136,71 @@ pub struct Playback {
     pub progress_ms: Option<u64>,
     #[serde(default)]
     pub shuffle_state: bool,
+    /// "off", "context" or "track".
+    #[serde(default = "repeat_off")]
+    pub repeat_state: String,
+    pub context: Option<Context>,
     pub item: Option<Track>,
+}
+
+fn repeat_off() -> String {
+    "off".into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct User {
+    pub id: String,
+    pub uri: String,
+}
+
+/// One page of a list, plus the size of the whole list.
+#[derive(Debug, Clone)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// Entries Spotify returned, null ones included; the next page starts this far on.
+    pub raw: usize,
+    pub total: usize,
+}
+
+impl<T> Page<T> {
+    fn empty() -> Self {
+        Page { items: Vec::new(), raw: 0, total: 0 }
+    }
 }
 
 /// Spotify paging object. Items can be null (e.g. removed tracks), so they are skipped.
 #[derive(Deserialize)]
-struct Page<T> {
+struct RawPage<T> {
     items: Vec<Option<T>>,
+    #[serde(default)]
+    total: usize,
 }
 
-impl<T> Page<T> {
-    fn into_items(self) -> Vec<T> {
-        self.items.into_iter().flatten().collect()
+impl<T> RawPage<T> {
+    fn into_page<U>(self, f: impl FnMut(T) -> Option<U>) -> Page<U> {
+        Page {
+            raw: self.items.len(),
+            items: self.items.into_iter().flatten().filter_map(f).collect(),
+            total: self.total,
+        }
     }
 }
 
 #[derive(Deserialize)]
 struct SearchResponse {
-    tracks: Page<Track>,
+    tracks: RawPage<Track>,
 }
 
 #[derive(Deserialize)]
 struct SavedTrack {
-    track: Track,
+    track: Option<Track>,
+}
+
+/// Entry of /playlists/{id}/items. The track was in `track` before the Feb 2026 rename.
+#[derive(Deserialize)]
+struct PlaylistEntry {
+    item: Option<Track>,
+    track: Option<Track>,
 }
 
 #[derive(Deserialize)]
@@ -98,13 +209,12 @@ struct Devices {
 }
 
 /// What to start playing.
-pub enum Play<'a> {
-    /// Continue the current track.
-    Resume,
-    /// Play a playlist/album context.
-    Context(&'a str),
+#[derive(Debug, Clone)]
+pub enum Play {
+    /// Play a playlist/album/collection context, optionally from one track in it.
+    Context { uri: String, from: Option<String> },
     /// Play a list of track URIs, starting at `offset`.
-    Tracks(&'a [String], usize),
+    Tracks { uris: Vec<String>, offset: usize },
 }
 
 pub struct Spotify {
@@ -125,22 +235,16 @@ impl Spotify {
         })
     }
 
-    /// A client with a fake token, for UI tests that make no requests.
-    #[cfg(test)]
-    pub fn offline() -> Self {
-        Spotify {
-            agent: ureq::agent(),
-            cfg: toml::from_str(r#"client_id = "test""#).unwrap(),
-            token: Token {
-                access_token: String::new(),
-                refresh_token: String::new(),
-                expires_at: u64::MAX,
-            },
-        }
-    }
-
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// False when the saved login predates a scope that spotlite now asks for.
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.token
+            .scope
+            .as_deref()
+            .is_some_and(|s| s.split_whitespace().any(|x| x == scope))
     }
 
     fn bearer(&mut self) -> Result<String> {
@@ -175,15 +279,13 @@ impl Spotify {
             Ok(resp) if resp.status() == 204 => Ok(None),
             Ok(resp) => Ok(Some(resp)),
             Err(ureq::Error::Status(code, resp)) => {
+                let retry_after = resp
+                    .header("Retry-After")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(5);
                 let body: Value = resp.into_json().unwrap_or(Value::Null);
-                let msg = body["error"]["message"].as_str().unwrap_or("no details");
-                match code {
-                    404 if msg.contains("device") || msg.contains("Device") => {
-                        bail!("no active device; is spotifyd running?")
-                    }
-                    429 => bail!("rate limited by Spotify; wait a moment"),
-                    _ => bail!("Spotify API {code}: {msg}"),
-                }
+                let msg = body["error"]["message"].as_str().unwrap_or("no details").to_owned();
+                Err(classify(code, msg, retry_after).into())
             }
             Err(e) => Err(e.into()),
         }
@@ -196,12 +298,21 @@ impl Spotify {
         }
     }
 
+    /// Player commands answer 200 with a plain-text body, or 204; the body is not used.
     fn send(&mut self, method: &str, path: &str, query: &[(&str, &str)], body: Option<Value>) -> Result<()> {
         self.request(method, path, query, body).map(|_| ())
     }
 
-    fn device_query(device_id: Option<&str>) -> Vec<(&str, &str)> {
-        device_id.map(|id| vec![("device_id", id)]).unwrap_or_default()
+    fn with_device<'a>(device_id: Option<&'a str>, mut query: Vec<(&'a str, &'a str)>) -> Vec<(&'a str, &'a str)> {
+        if let Some(id) = device_id {
+            query.push(("device_id", id));
+        }
+        query
+    }
+
+    pub fn me(&mut self) -> Result<User> {
+        self.get("/me", &[])?
+            .ok_or_else(|| anyhow::anyhow!("empty /me response"))
     }
 
     pub fn playback(&mut self) -> Result<Option<Playback>> {
@@ -226,58 +337,120 @@ impl Spotify {
             .cloned())
     }
 
-    pub fn search_tracks(&mut self, query: &str) -> Result<Vec<Track>> {
+    pub fn search_tracks(&mut self, query: &str, offset: usize) -> Result<Page<Track>> {
+        let offset = offset.to_string();
+        let limit = SEARCH_PAGE.to_string();
         let resp: Option<SearchResponse> = self.get(
             "/search",
-            &[("q", query), ("type", "track"), ("limit", SEARCH_LIMIT)],
+            &[("q", query), ("type", "track"), ("limit", &limit), ("offset", &offset)],
         )?;
-        Ok(resp.map(|r| r.tracks.into_items()).unwrap_or_default())
+        Ok(resp
+            .map(|r| r.tracks.into_page(Some))
+            .unwrap_or_else(Page::empty))
     }
 
-    pub fn playlists(&mut self) -> Result<Vec<Playlist>> {
-        let page: Option<Page<Playlist>> = self.get("/me/playlists", &[("limit", "50")])?;
-        Ok(page.map(Page::into_items).unwrap_or_default())
+    fn page<T: DeserializeOwned, U>(
+        &mut self,
+        path: &str,
+        offset: usize,
+        f: impl FnMut(T) -> Option<U>,
+    ) -> Result<Page<U>> {
+        let offset = offset.to_string();
+        let limit = PAGE.to_string();
+        let raw: Option<RawPage<T>> = self.get(path, &[("limit", &limit), ("offset", &offset)])?;
+        Ok(raw
+            .map(|r| r.into_page(f))
+            .unwrap_or_else(Page::empty))
     }
 
-    pub fn liked_tracks(&mut self) -> Result<Vec<Track>> {
-        let page: Option<Page<SavedTrack>> = self.get("/me/tracks", &[("limit", "50")])?;
-        Ok(page
-            .map(|p| p.into_items().into_iter().map(|s| s.track).collect())
-            .unwrap_or_default())
+    pub fn playlists(&mut self, offset: usize) -> Result<Page<Playlist>> {
+        self.page("/me/playlists", offset, Some)
     }
 
-    pub fn play(&mut self, device_id: Option<&str>, what: Play) -> Result<()> {
-        let body = match what {
-            Play::Resume => None,
-            Play::Context(uri) => Some(json!({ "context_uri": uri })),
-            Play::Tracks(uris, offset) => Some(json!({ "uris": uris, "offset": { "position": offset } })),
-        };
-        self.send("PUT", "/me/player/play", &Self::device_query(device_id), body)
+    pub fn liked_tracks(&mut self, offset: usize) -> Result<Page<Track>> {
+        self.page("/me/tracks", offset, |s: SavedTrack| s.track)
+    }
+
+    /// Only works for playlists the user owns or collaborates on (else ApiError::Forbidden).
+    pub fn playlist_tracks(&mut self, playlist_id: &str, offset: usize) -> Result<Page<Track>> {
+        self.page(&format!("/playlists/{playlist_id}/items"), offset, |e: PlaylistEntry| {
+            e.item.or(e.track)
+        })
+    }
+
+    pub fn play(&mut self, device_id: Option<&str>, what: Option<&Play>) -> Result<()> {
+        let body = what.map(|what| match what {
+            Play::Context { uri, from: Some(track) } => {
+                json!({ "context_uri": uri, "offset": { "uri": track } })
+            }
+            Play::Context { uri, from: None } => json!({ "context_uri": uri }),
+            Play::Tracks { uris, offset } => json!({ "uris": uris, "offset": { "position": offset } }),
+        });
+        self.send("PUT", "/me/player/play", &Self::with_device(device_id, vec![]), body)
+    }
+
+    /// Moves playback to a device (used when no device is active).
+    pub fn transfer(&mut self, device_id: &str, play: bool) -> Result<()> {
+        self.send("PUT", "/me/player", &[], Some(json!({ "device_ids": [device_id], "play": play })))
     }
 
     pub fn pause(&mut self, device_id: Option<&str>) -> Result<()> {
-        self.send("PUT", "/me/player/pause", &Self::device_query(device_id), None)
+        self.send("PUT", "/me/player/pause", &Self::with_device(device_id, vec![]), None)
     }
 
     pub fn next(&mut self, device_id: Option<&str>) -> Result<()> {
-        self.send("POST", "/me/player/next", &Self::device_query(device_id), None)
+        self.send("POST", "/me/player/next", &Self::with_device(device_id, vec![]), None)
     }
 
     pub fn previous(&mut self, device_id: Option<&str>) -> Result<()> {
-        self.send("POST", "/me/player/previous", &Self::device_query(device_id), None)
+        self.send("POST", "/me/player/previous", &Self::with_device(device_id, vec![]), None)
+    }
+
+    pub fn seek(&mut self, device_id: Option<&str>, position_ms: u64) -> Result<()> {
+        let pos = position_ms.to_string();
+        self.send("PUT", "/me/player/seek", &Self::with_device(device_id, vec![("position_ms", &pos)]), None)
     }
 
     pub fn set_volume(&mut self, device_id: Option<&str>, percent: u8) -> Result<()> {
         let pct = percent.min(100).to_string();
-        let mut query = vec![("volume_percent", pct.as_str())];
-        query.extend(Self::device_query(device_id));
-        self.send("PUT", "/me/player/volume", &query, None)
+        self.send("PUT", "/me/player/volume", &Self::with_device(device_id, vec![("volume_percent", &pct)]), None)
     }
 
     pub fn set_shuffle(&mut self, device_id: Option<&str>, on: bool) -> Result<()> {
-        let mut query = vec![("state", if on { "true" } else { "false" })];
-        query.extend(Self::device_query(device_id));
-        self.send("PUT", "/me/player/shuffle", &query, None)
+        let state = if on { "true" } else { "false" };
+        self.send("PUT", "/me/player/shuffle", &Self::with_device(device_id, vec![("state", state)]), None)
+    }
+
+    /// `state` is "off", "context" or "track".
+    pub fn set_repeat(&mut self, device_id: Option<&str>, state: &str) -> Result<()> {
+        self.send("PUT", "/me/player/repeat", &Self::with_device(device_id, vec![("state", state)]), None)
+    }
+
+    pub fn queue(&mut self, device_id: Option<&str>, uri: &str) -> Result<()> {
+        self.send("POST", "/me/player/queue", &Self::with_device(device_id, vec![("uri", uri)]), None)
+    }
+
+    pub fn is_saved(&mut self, uri: &str) -> Result<bool> {
+        let saved: Option<Vec<bool>> = self.get("/me/library/contains", &[("uris", uri)])?;
+        Ok(saved.and_then(|v| v.first().copied()).unwrap_or(false))
+    }
+
+    /// Adds or removes a track from Liked Songs (needs user-library-modify).
+    pub fn set_saved(&mut self, uri: &str, saved: bool) -> Result<()> {
+        let method = if saved { "PUT" } else { "DELETE" };
+        self.send(method, "/me/library", &[("uris", uri)], None)
+    }
+}
+
+fn classify(code: u16, msg: String, retry_after: u64) -> ApiError {
+    let lower = msg.to_lowercase();
+    match code {
+        401 => ApiError::Unauthorized,
+        403 if lower.contains("scope") => ApiError::MissingScope,
+        403 => ApiError::Forbidden,
+        404 if lower.contains("device") => ApiError::NoDevice,
+        429 => ApiError::RateLimited(retry_after),
+        _ => ApiError::Other(code, msg),
     }
 }
 
@@ -289,22 +462,60 @@ mod tests {
     fn playback_with_nulls_parses() {
         let json = r#"{
             "device": {"id": "d1", "name": "spotlite", "is_active": true, "volume_percent": 40},
-            "is_playing": true, "progress_ms": 1234, "shuffle_state": false,
+            "is_playing": true, "progress_ms": 1234, "shuffle_state": false, "repeat_state": "context",
+            "context": {"uri": "spotify:user:u:collection", "type": "collection"},
             "item": {"uri": "spotify:track:1", "name": "Song", "duration_ms": 200000,
                      "artists": [{"name": "A"}, {"name": "B"}], "album": {"name": "Al"}},
             "currently_playing_type": "track"
         }"#;
         let pb: Playback = serde_json::from_str(json).unwrap();
+        assert_eq!(pb.repeat_state, "context");
         assert_eq!(pb.item.unwrap().artist_names(), "A, B");
 
         let idle: Playback = serde_json::from_str(r#"{"device": null, "item": null}"#).unwrap();
         assert!(!idle.is_playing && idle.item.is_none());
+        assert_eq!(idle.repeat_state, "off");
+    }
+
+    #[test]
+    fn episode_uses_show_name() {
+        let ep: Track = serde_json::from_str(
+            r#"{"uri": "spotify:episode:1", "name": "Ep", "show": {"name": "Pod"}}"#,
+        )
+        .unwrap();
+        assert_eq!(ep.artist_names(), "Pod");
     }
 
     #[test]
     fn page_skips_null_items() {
-        let json = r#"{"items": [{"track": {"uri": "u", "name": "n"}}, null]}"#;
-        let page: Page<SavedTrack> = serde_json::from_str(json).unwrap();
-        assert_eq!(page.into_items().len(), 1);
+        let json = r#"{"items": [{"track": {"uri": "u", "name": "n"}}, null, {"track": null}], "total": 3}"#;
+        let raw: RawPage<SavedTrack> = serde_json::from_str(json).unwrap();
+        let page = raw.into_page(|s| s.track);
+        assert_eq!((page.items.len(), page.raw, page.total), (1, 3, 3));
+    }
+
+    #[test]
+    fn playlist_parses_new_and_old_names() {
+        let new = r#"{"id": "1", "uri": "spotify:playlist:1", "name": "P",
+                      "owner": {"id": "me", "display_name": null}, "items": {"total": 45}}"#;
+        let old = r#"{"id": "1", "uri": "spotify:playlist:1", "name": "P",
+                      "owner": {"id": "me"}, "tracks": {"total": 7}}"#;
+        let p: Playlist = serde_json::from_str(new).unwrap();
+        assert_eq!((p.track_count(), p.owner_name()), (Some(45), "me"));
+        let p: Playlist = serde_json::from_str(old).unwrap();
+        assert_eq!(p.track_count(), Some(7));
+
+        let entry: PlaylistEntry =
+            serde_json::from_str(r#"{"item": {"uri": "u", "name": "n"}, "added_at": "x"}"#).unwrap();
+        assert!(entry.item.or(entry.track).is_some());
+    }
+
+    #[test]
+    fn errors_are_classified() {
+        assert!(matches!(classify(429, String::new(), 7), ApiError::RateLimited(7)));
+        assert!(matches!(classify(403, "Insufficient client scope".into(), 0), ApiError::MissingScope));
+        assert!(matches!(classify(403, "Forbidden".into(), 0), ApiError::Forbidden));
+        assert!(matches!(classify(404, "Player command failed: No active device found".into(), 0), ApiError::NoDevice));
+        assert!(matches!(classify(401, String::new(), 0), ApiError::Unauthorized));
     }
 }

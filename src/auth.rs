@@ -14,7 +14,7 @@ const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 
 pub const SCOPES: &str = "user-read-playback-state user-modify-playback-state \
-user-read-currently-playing user-library-read playlist-read-private \
+user-read-currently-playing user-library-read user-library-modify playlist-read-private \
 playlist-read-collaborative user-read-private";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +23,9 @@ pub struct Token {
     pub refresh_token: String,
     /// Unix time (seconds) when the access token stops working.
     pub expires_at: u64,
+    /// Scopes the user granted; missing in tokens saved by older versions.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -30,6 +33,7 @@ struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: u64,
+    scope: Option<String>,
 }
 
 fn now() -> u64 {
@@ -67,15 +71,16 @@ impl Token {
         now() + 60 >= self.expires_at
     }
 
-    fn from_response(resp: TokenResponse, old_refresh: Option<&str>) -> Result<Self> {
+    fn from_response(resp: TokenResponse, old: Option<&Token>) -> Result<Self> {
         let refresh_token = resp
             .refresh_token
-            .or_else(|| old_refresh.map(str::to_owned))
+            .or_else(|| old.map(|t| t.refresh_token.clone()))
             .ok_or_else(|| anyhow!("Spotify returned no refresh token"))?;
         Ok(Token {
             access_token: resp.access_token,
             refresh_token,
             expires_at: now() + resp.expires_in,
+            scope: resp.scope.or_else(|| old.and_then(|t| t.scope.clone())),
         })
     }
 }
@@ -196,7 +201,7 @@ pub fn refresh(cfg: &Config, token: &Token) -> Result<Token> {
         ("refresh_token", &token.refresh_token),
         ("client_id", &cfg.client_id),
     ])?;
-    let token = Token::from_response(resp, Some(&token.refresh_token))?;
+    let token = Token::from_response(resp, Some(token))?;
     token.save()?;
     Ok(token)
 }
@@ -235,13 +240,21 @@ mod tests {
 
     #[test]
     fn refresh_keeps_old_refresh_token() {
+        let old = Token {
+            access_token: "x".into(),
+            refresh_token: "old".into(),
+            expires_at: 0,
+            scope: Some("a b".into()),
+        };
         let resp = TokenResponse {
             access_token: "a".into(),
             refresh_token: None,
             expires_in: 3600,
+            scope: None,
         };
-        let token = Token::from_response(resp, Some("old")).unwrap();
+        let token = Token::from_response(resp, Some(&old)).unwrap();
         assert_eq!(token.refresh_token, "old");
+        assert_eq!(token.scope.as_deref(), Some("a b"));
         assert!(!token.expired());
     }
 }

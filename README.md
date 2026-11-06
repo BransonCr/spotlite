@@ -6,10 +6,9 @@ A small Spotify client for the terminal. It replaces the official Electron app
 | Part | Job | Idle RAM |
 |------|-----|----------|
 | [`spotifyd`](https://github.com/Spotifyd/spotifyd) | Spotify Connect daemon (librespot). Plays the audio. | ~10–30 MB |
-| `spotlite` | Terminal UI. Searches, browses, and controls playback through the Spotify Web API. | ~5 MB, 1 thread, 0% CPU |
+| `spotlite` | Terminal UI. Searches, browses, and controls playback through the Spotify Web API. | ~6 MB, 2 threads, ~0.2% CPU |
 
-`spotlite` is a single-threaded Rust binary (~2.3 MB release build). It polls the
-player state every 5 seconds and moves the progress bar locally between polls.
+`spotlite` is a small Rust binary (~2.4 MB release build).
 
 ## Requirements
 
@@ -56,18 +55,37 @@ player state every 5 seconds and moves the progress bar locally between polls.
 
 ## Keys
 
+Press `?` in the app for this list.
+
 | Key | Action |
 |-----|--------|
-| `/` | Search (Enter to run, Esc to stop typing) |
+| `/` | Search (Enter to run, Esc to stop typing, `Ctrl+U` to clear) |
 | `1` `2` `3`, `Tab` | Search / Playlists / Liked |
-| `j` `k`, arrows, `g` `G` | Move |
-| `Enter` | Play the selected track or playlist |
-| `Space` | Play / pause |
+| `j` `k`, arrows, `g` `G`, `Ctrl+D` `Ctrl+U` | Move (more pages load as you scroll) |
+| `Enter` | Play the selected track, or open a playlist |
+| `P` | Play the whole playlist |
+| `Esc` | Back from a playlist to the list |
+| `a` | Add the selected track to the queue |
+| `Space` | Play / pause (starts spotifyd if nothing is active) |
 | `n` / `p` | Next / previous |
+| `←` / `→` | Seek 10 seconds |
 | `+` / `-` | Volume |
 | `s` | Shuffle |
-| `r` | Reload the list and find the device again |
+| `r` | Repeat: off, all, one |
+| `f` | Like / unlike the playing song |
+| `R` | Reload the list |
 | `q` | Quit |
+
+## How it works
+
+- The UI thread only draws and reads keys. A second thread makes every Web API
+  call, so the UI never waits on the network.
+- The player state is read every 5 seconds; the progress bar moves locally in
+  between. When idle, the UI wakes once a second.
+- Liked Songs and your own playlists play as a context, so playback continues
+  past the tracks that are loaded.
+- If spotifyd restarts, spotlite finds the device again and retries once.
+  On a rate limit (429), it waits for the time Spotify asks for.
 
 ## Commands
 
@@ -105,5 +123,7 @@ bind = , XF86AudioPrev, exec, playerctl -p spotifyd previous
 
 - 5 users per app, owner must have Premium.
 - Search returns 10 results at most.
-- Playlist tracks are only readable for playlists you own or collaborate on,
-  so spotlite plays a playlist as a whole (`context_uri`) instead of listing it.
+- Playlist tracks are only readable for playlists you own or collaborate on.
+  Enter opens those; other playlists play as a whole.
+- Liking songs needs the `user-library-modify` permission. If you logged in
+  with an older spotlite, run `spotlite auth` again.

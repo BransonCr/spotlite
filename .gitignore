@@ -1,1 +1,3 @@
 /target
+# personal config copies (the real one is ~/.config/spotlite/config.toml)
+/config.toml

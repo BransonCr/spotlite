@@ -2,12 +2,15 @@ mod api;
 mod app;
 mod auth;
 mod config;
+mod theme;
 mod ui;
+mod worker;
 
 use anyhow::{bail, Result};
-use api::{Play, Spotify};
+use api::Spotify;
 use config::Config;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 const USAGE: &str = "\
@@ -51,7 +54,7 @@ fn main() -> Result<()> {
                 "prev" => api.previous(device),
                 _ => match api.playback()? {
                     Some(pb) if pb.is_playing => api.pause(device),
-                    _ => api.play(device, Play::Resume),
+                    _ => api.play(device, None),
                 },
             }
         }
@@ -64,18 +67,29 @@ fn main() -> Result<()> {
 }
 
 fn run_tui() -> Result<()> {
-    let mut app = app::App::new(Spotify::new(Config::load()?)?);
+    let api = Spotify::new(Config::load()?)?;
+    let can_like = api.has_scope("user-library-modify");
+    let (tx, rx) = worker::spawn(api);
+    let mut app = app::App::new(tx, can_like);
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         while !app.quit {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => app.on_msg(msg),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => anyhow::bail!("the API thread stopped"),
+                }
+            }
             app.tick();
-            terminal.draw(|f| ui::draw(f, &app))?;
-            // Wake once a second to move the progress bar; keys wake us at once.
-            if event::poll(Duration::from_secs(1))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        app.on_key(key);
-                    }
+            terminal.draw(|f| ui::draw(f, &mut app))?;
+            // Idle: wake once a second to move the progress bar. While a request is
+            // open, wake often so its reply shows at once. Keys always wake us.
+            let wait = if app.busy() { Duration::from_millis(30) } else { Duration::from_secs(1) };
+            if event::poll(wait)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    _ => {}
                 }
             }
         }
