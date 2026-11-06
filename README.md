@@ -55,17 +55,25 @@ A small Spotify client for the terminal. It replaces the official Electron app
 
 ## Keys
 
-Press `?` in the app for this list.
+Press `?` in the app for this list. `.` (or a right-click) opens every action for the
+selected song, so you do not need to remember the keys below.
 
 | Key | Action |
 |-----|--------|
 | `/` | Search (Enter to run, Esc to stop typing, `Ctrl+U` to clear) |
 | `1` `2` `3`, `Tab` | Search / Playlists / Liked |
 | `j` `k`, arrows, `g` `G`, `Ctrl+D` `Ctrl+U` | Move (more pages load as you scroll) |
-| `Enter` | Play the selected track, or open a playlist |
-| `P` | Play the whole playlist |
-| `Esc` | Back from a playlist, or up one folder |
-| `a` | Add the selected track to the queue |
+| `Esc`, `h` | Back: close a page, a playlist, or go up a folder |
+| `c` | Jump to the playing song in the list |
+| `Enter` | Play the selected song, or open a playlist, album or folder |
+| `P` | Play the whole playlist or album |
+| `.` | Action menu for the selected song |
+| `a` | Add the selected song to the queue |
+| `i` / `b` | Go to the song's artist / album |
+| `o` | Song radio from the selected song |
+| `F` | Radio filters (on a radio page) |
+| `e` | Add the selected song to one of your playlists |
+| `D` | Remove the selected song from the open playlist (asks first) |
 | `Space` | Play / pause (starts spotifyd if nothing is active) |
 | `n` / `p` | Next / previous |
 | `←` / `→` | Seek 10 seconds |
@@ -74,14 +82,33 @@ Press `?` in the app for this list.
 | `s` | Shuffle |
 | `r` | Repeat: off, all, one |
 | `f` | Like / unlike the playing song |
+| `v` | Sound visualizer on / off |
 | `R` | Reload the list |
 | `q` | Quit (music keeps playing) |
 | `Q` | Quit and stop spotifyd: nothing keeps running (spotlite starts it again next time) |
-| `v` | Sound visualizer on / off |
+
+### Artists, albums, radio
+
+- **Artist page** (`i`): picture, 10 popular songs and up to 30 albums and singles.
+  The 2026 dev-mode API has no top-tracks, related-artists or genres, so the popular
+  songs come from a search for the artist's tracks.
+- **Album page** (`b`, or Enter on an album): cover, year, tracks; Enter plays the album
+  from that song, `P` plays it from the start.
+- **Song radio** (`o`): Spotify's own "song radio" (about 50 songs), read over the client
+  protocol like the folders. Spotify shapes it by your listening, and no API offers a
+  neutral radio any more, so the filters (`F`) are how to step outside your taste:
+  hide songs or artists already in Liked Songs, hide explicit songs, hide the seed's
+  artist, at most 1 or 2 songs per artist, songs from near the seed's year, popular
+  songs only or deep cuts only. The list updates as you change a filter.
+- **Playlists**: `e` adds a song to one of your playlists (type to narrow the list);
+  `D` removes it from the open playlist. These need the `playlist-modify-*` permissions:
+  if you logged in with an older spotlite, run `spotlite auth` again.
 
 ### Mouse
 
 - Click a tab, the search box, `‹` (back), or a player button (`◀◀ ▶ ▶▶`, `⇄`, `↻`, `♥`).
+- In the player, click the artist name to open the artist, or the cover to open the album.
+- Right-click a row for its action menu.
 - Click a row to select it; double-click to play it or open the playlist.
 - Wheel scrolls the list. Over the progress or volume bar, the wheel seeks or changes the volume.
 - Click or drag the progress bar to seek, and the volume slider to set the volume.
@@ -100,10 +127,11 @@ background thread at start; the tree is cached in `~/.cache/spotlite/folders.jso
 
 `v` draws the spectrum of what spotifyd plays as dim steel-blue bars behind the main
 panel, only in empty cells, so text stays readable. `parec` records spotifyd's own
-stream (22 kHz mono); a built-in FFT turns it into 48 bands. Off by default.
-It runs only while it is on, the music plays, and the window has focus; otherwise no
+stream (22 kHz mono); a built-in FFT turns it into 48 bands, eased and blurred into a
+soft wave, with a thin braille line in a lighter steel tracing it. Off by default.
+It runs only while it is on and the music plays; otherwise no
 capture runs and the UI goes back to one redraw per second.
-Cost while running (15 fps): about 0.5% CPU in spotlite and a few percent in the terminal,
+Cost while running (20 fps): about 0.5% CPU in spotlite and a few percent in the terminal,
 which redraws the changed cells. `SPOTLITE_VIZ=1` starts with it on;
 `SPOTLITE_VIZ_FPS` sets the frame rate (lower = cheaper).
 

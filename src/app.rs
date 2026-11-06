@@ -1,7 +1,9 @@
-use crate::api::{Page, Play, Playback, Playlist, Track};
+use crate::api::{Album, Page as ApiPage, Play, Playback, Playlist, Track};
 use crate::control::Ctl;
 use crate::folders::Entry;
 use crate::images::Images;
+use crate::pages::{AlbumPage, ArtistPage, ArtistRow, FilterItem, Page, RadioPage};
+use crate::radio::Library;
 use crate::viz::Visualizer;
 use crate::worker::{Cmd, Kind, List, Msg};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -102,7 +104,7 @@ impl<T> Listing<T> {
         self.state.select(Some(next as usize));
     }
 
-    fn apply(&mut self, offset: usize, page: Page<T>) {
+    fn apply(&mut self, offset: usize, page: ApiPage<T>) {
         if offset == 0 {
             self.items.clear();
             self.fetched = 0;
@@ -147,6 +149,46 @@ pub enum View {
     Playlists,
     Playlist,
     Liked,
+    Artist,
+    Album,
+    Radio,
+}
+
+/// What a menu entry does.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    Play,
+    Queue,
+    Artist { id: String, name: String },
+    Album(Album),
+    Radio,
+    AddToPlaylist,
+    RemoveFromPlaylist,
+    Like,
+    Filter(FilterItem),
+}
+
+/// A pop-up list of actions: for a track (`.` or right-click), or the radio filters (`F`).
+pub struct Menu {
+    pub title: String,
+    /// (key hint, label, action); the label of a filter shows its current value.
+    pub items: Vec<(&'static str, String, Action)>,
+    pub cursor: usize,
+    /// The track the actions apply to (None for the filter menu).
+    pub track: Option<Track>,
+}
+
+/// Choose a playlist to add a track to; type to narrow the list.
+pub struct Picker {
+    pub track: Track,
+    pub query: String,
+    pub cursor: usize,
+}
+
+/// A yes/no question before a change that cannot be undone from spotlite.
+pub struct Confirm {
+    pub text: String,
+    pub cmd: Cmd,
 }
 
 /// Where clickable things were drawn in the last frame (filled by ui::draw).
@@ -169,6 +211,12 @@ pub struct Hits {
     pub progress: Rect,
     /// The bar part of the volume slider.
     pub volume: Rect,
+    /// Now playing: artist name and album (title, cover) open their pages.
+    pub np_artist: Rect,
+    pub np_album: Rect,
+    /// Rows of an open menu or picker, and the index each one stands for.
+    pub popup_rows: Vec<(Rect, usize)>,
+    pub popup: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,8 +263,6 @@ pub struct App {
     /// Sound visualizer (v); off by default.
     pub viz_on: bool,
     pub viz: Visualizer,
-    /// The terminal window has focus (the visualizer pauses when it does not).
-    pub focused: bool,
     /// Quit and also stop spotifyd (Q): nothing keeps running.
     pub stop_services: bool,
     pub images: Images,
@@ -248,6 +294,16 @@ pub struct App {
     seek_hold: Option<Instant>,
     /// A poll was asked for while one was already running.
     repoll: bool,
+    /// Artist, album and radio pages opened on top of the tabs (Esc goes back).
+    pub pages: Vec<Page>,
+    pub menu: Option<Menu>,
+    pub picker: Option<Picker>,
+    pub confirm: Option<Confirm>,
+    /// Liked Songs index for the radio filters; asked for once, when a radio opens.
+    pub library: Option<Library>,
+    library_asked: bool,
+    /// Playlist edits allowed by the saved login (playlist-modify-*).
+    pub can_edit: bool,
 }
 
 impl App {
@@ -275,7 +331,6 @@ impl App {
             stop_services: false,
             viz_on: false,
             viz: Visualizer::default(),
-            focused: true,
             images,
             hits: Hits::default(),
             tx,
@@ -296,6 +351,13 @@ impl App {
             play_hold: None,
             seek_hold: None,
             repoll: false,
+            pages: Vec::new(),
+            menu: None,
+            picker: None,
+            confirm: None,
+            library: None,
+            library_asked: false,
+            can_edit: true,
         };
         app.send(Cmd::Init);
         app
@@ -523,6 +585,12 @@ impl App {
     }
 
     pub fn view(&self) -> View {
+        match self.pages.last() {
+            Some(Page::Artist(_)) => return View::Artist,
+            Some(Page::Album(_)) => return View::Album,
+            Some(Page::Radio(_)) => return View::Radio,
+            None => {}
+        }
         match self.tab {
             Tab::Search => View::Search,
             Tab::Playlists if self.open.is_some() => View::Playlist,
@@ -533,21 +601,54 @@ impl App {
 
     /// Track list of the current view, if it shows tracks.
     pub fn tracks(&self) -> Option<&Listing<Track>> {
-        match self.view() {
-            View::Search => Some(&self.search),
-            View::Liked => Some(&self.liked),
-            View::Playlist => self.open.as_ref().map(|o| &o.tracks),
-            View::Playlists => None,
+        match (self.view(), self.pages.last()) {
+            (View::Album, Some(Page::Album(a))) => Some(&a.tracks),
+            (View::Radio, Some(Page::Radio(r))) => Some(&r.tracks),
+            (View::Search, _) => Some(&self.search),
+            (View::Liked, _) => Some(&self.liked),
+            (View::Playlist, _) => self.open.as_ref().map(|o| &o.tracks),
+            _ => None,
         }
     }
 
-    fn tracks_mut(&mut self) -> Option<&mut Listing<Track>> {
+    pub fn tracks_mut(&mut self) -> Option<&mut Listing<Track>> {
         match self.view() {
             View::Search => Some(&mut self.search),
             View::Liked => Some(&mut self.liked),
             View::Playlist => self.open.as_mut().map(|o| &mut o.tracks),
-            View::Playlists => None,
+            View::Album => match self.pages.last_mut() {
+                Some(Page::Album(a)) => Some(&mut a.tracks),
+                _ => None,
+            },
+            View::Radio => match self.pages.last_mut() {
+                Some(Page::Radio(r)) => Some(&mut r.tracks),
+                _ => None,
+            },
+            View::Playlists | View::Artist => None,
         }
+    }
+
+    fn artist_page_mut(&mut self) -> Option<&mut ArtistPage> {
+        match self.pages.last_mut() {
+            Some(Page::Artist(a)) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The track under the cursor, in any view that lists tracks.
+    pub fn selected_track(&self) -> Option<Track> {
+        if let Some(Page::Artist(a)) = self.pages.last() {
+            return match a.rows.current()? {
+                ArtistRow::Track(t) => Some(t.clone()),
+                ArtistRow::Album(_) => None,
+            };
+        }
+        self.tracks()?.current().cloned()
+    }
+
+    /// The selected track, else the playing one (for keys like `i` and `o`).
+    fn target_track(&self) -> Option<Track> {
+        self.selected_track().or_else(|| self.playback.as_ref()?.item.clone())
     }
 
     pub fn playing_uri(&self) -> Option<&str> {
@@ -598,9 +699,10 @@ impl App {
         self.unmute_to.is_some() && self.volume() == Some(0)
     }
 
-    /// True while the visualizer should move: on, focused, and music playing.
+    /// True while the visualizer should move: on, and music playing. (Not tied to window
+    /// focus: with focus-follows-mouse, focus leaves whenever the pointer does.)
     pub fn animating(&self) -> bool {
-        self.viz_on && self.focused && self.playback.as_ref().is_some_and(|pb| pb.is_playing)
+        self.viz_on && self.playback.as_ref().is_some_and(|pb| pb.is_playing)
     }
 
     /// Called on every loop pass: polls the player and loads pages that are needed.
@@ -651,7 +753,18 @@ impl App {
                     .wants_page()
                     .map(|off| (List::Playlist(o.playlist.id.clone()), off))
             }),
+            View::Album => match self.pages.last() {
+                Some(Page::Album(a)) => a.tracks.wants_page().map(|off| (List::Album(a.id.clone()), off)),
+                _ => None,
+            },
+            View::Artist | View::Radio => None,
         };
+        // The playlist picker lists every playlist, so it needs them all.
+        let request = request.or_else(|| {
+            let l = &self.playlists;
+            (self.picker.is_some() && !l.loading && l.total.is_none_or(|t| l.fetched < t))
+                .then_some((List::Playlists, l.fetched))
+        });
         if let Some((list, offset)) = request {
             if list == List::Playlists {
                 self.playlists.loading = true;
@@ -671,6 +784,10 @@ impl App {
                 .as_mut()
                 .filter(|o| &o.playlist.id == id)
                 .map(|o| &mut o.tracks),
+            List::Album(id) => self.pages.iter_mut().rev().find_map(|p| match p {
+                Page::Album(a) if &a.id == id => Some(&mut a.tracks),
+                _ => None,
+            }),
             _ => None,
         }
     }
@@ -736,6 +853,97 @@ impl App {
                     None => self.saved = None,
                 }
             }
+            Msg::Tracks { list: List::Album(id), offset, mut page } => {
+                if let Some(a) = self.pages.iter().rev().find_map(|p| match p {
+                    Page::Album(a) if a.id == id => Some(a),
+                    _ => None,
+                }) {
+                    page.items = page.items.into_iter().map(|t| a.adopt(t)).collect();
+                }
+                if let Some(listing) = self.listing_for(&List::Album(id)) {
+                    listing.apply(offset, page);
+                }
+            }
+            Msg::Artist { artist, top, albums } => {
+                for p in self.pages.iter_mut() {
+                    if let Page::Artist(a) = p {
+                        if a.id == artist.id {
+                            a.fill(artist.clone(), top.clone(), albums.clone());
+                        }
+                    }
+                }
+            }
+            Msg::PageFailed { id, error } => {
+                for p in self.pages.iter_mut() {
+                    if let Page::Artist(a) = p {
+                        if a.id == id {
+                            a.rows.loading = false;
+                            a.error = Some(error.clone());
+                        }
+                    }
+                }
+            }
+            Msg::Album(album) => {
+                for p in self.pages.iter_mut() {
+                    if let Page::Album(a) = p {
+                        if Some(&a.id) == album.id.as_ref() {
+                            a.album = album.clone();
+                            for t in a.tracks.items.iter_mut() {
+                                if let Some(ta) = t.album.as_mut() {
+                                    ta.images = album.images.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Msg::Radio { seed, result } => {
+                let library = self.library.clone().unwrap_or_default();
+                for p in self.pages.iter_mut() {
+                    if let Page::Radio(r) = p {
+                        if r.seed.uri == seed {
+                            match &result {
+                                Ok(radio) => {
+                                    r.radio = Some(radio.clone());
+                                    r.refilter(&library);
+                                }
+                                Err(e) => {
+                                    r.error = Some(e.clone());
+                                    r.tracks.loading = false;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Err(e) = result {
+                    self.error(e);
+                }
+            }
+            Msg::Library(library) => {
+                for p in self.pages.iter_mut() {
+                    if let Page::Radio(r) = p {
+                        r.refilter(&library);
+                    }
+                }
+                self.library = Some(library);
+            }
+            Msg::Removed { playlist_id, uri } => {
+                if let Some(o) = self.open.as_mut().filter(|o| o.playlist.id == playlist_id) {
+                    let before = o.tracks.items.len();
+                    o.tracks.items.retain(|t| t.uri != uri);
+                    let removed = before - o.tracks.items.len();
+                    o.tracks.total = o.tracks.total.map(|t| t.saturating_sub(removed));
+                    let len = o.tracks.items.len();
+                    let sel = o.tracks.selected().min(len.saturating_sub(1));
+                    o.tracks.state.select((len > 0).then_some(sel));
+                }
+            }
+            Msg::Added { playlist_id } => {
+                // Reload an open copy of that playlist so the new song shows.
+                if let Some(o) = self.open.as_mut().filter(|o| o.playlist.id == playlist_id) {
+                    o.tracks.reset();
+                }
+            }
             Msg::Tracks { list, offset, page } => {
                 if let Some(listing) = self.listing_for(&list) {
                     listing.apply(offset, page);
@@ -770,10 +978,284 @@ impl App {
     fn switch_tab(&mut self, tab: Tab) {
         self.tab = tab;
         self.typing = false;
+        self.pages.clear();
+    }
+
+    /// Back one step: close a page, then an open playlist, then a folder.
+    fn back(&mut self) {
+        if self.pages.pop().is_some() {
+            return;
+        }
+        if self.open.take().is_none() {
+            self.close_folder();
+        }
+    }
+
+    pub fn open_artist(&mut self, id: String, name: String) {
+        self.typing = false;
+        self.pages.push(Page::Artist(ArtistPage::new(id.clone(), name)));
+        self.send(Cmd::Artist(id));
+    }
+
+    pub fn open_album(&mut self, album: Album) {
+        let Some(id) = album.id.clone() else {
+            self.info("This song has no album page.");
+            return;
+        };
+        self.typing = false;
+        let details = album.release_date.is_none() || album.images.is_empty();
+        self.pages.push(Page::Album(AlbumPage { id: id.clone(), album, tracks: Listing::default() }));
+        if details {
+            self.send(Cmd::Album(id));
+        }
+    }
+
+    pub fn start_radio(&mut self, seed: Track) {
+        if !crate::client::AVAILABLE {
+            self.error("Song radio needs the `client` feature.");
+            return;
+        }
+        if !seed.uri.starts_with("spotify:track:") {
+            self.info("Radio works for songs only.");
+            return;
+        }
+        self.typing = false;
+        self.send(Cmd::Radio(seed.uri.clone()));
+        if !self.library_asked {
+            self.library_asked = true;
+            self.send(Cmd::Library);
+        }
+        self.pages.push(Page::Radio(Box::new(RadioPage::new(seed))));
+    }
+
+    fn go_to_artist(&mut self, track: &Track) {
+        match track.artists.iter().find(|a| a.id().is_some()) {
+            Some(a) => {
+                let (id, name) = (a.id().unwrap_or_default().to_owned(), a.name.clone());
+                self.open_artist(id, name);
+            }
+            None => self.info("This song has no artist page."),
+        }
+    }
+
+    fn go_to_album(&mut self, track: &Track) {
+        match track.album.clone() {
+            Some(a) => self.open_album(a),
+            None => self.info("This song has no album page."),
+        }
+    }
+
+    /// The playlist open in the Playlists tab, if the user may edit it.
+    fn editable_open_playlist(&self) -> Option<&Playlist> {
+        let o = self.open.as_ref()?;
+        (self.view() == View::Playlist && self.owns(&o.playlist)).then_some(&o.playlist)
+    }
+
+    /// Opens the action menu for the selected track.
+    pub fn open_menu(&mut self) {
+        let Some(track) = self.selected_track() else {
+            self.info("Select a song first.");
+            return;
+        };
+        let mut items: Vec<(&'static str, String, Action)> = vec![
+            ("⏎", "Play".into(), Action::Play),
+            ("a", "Add to queue".into(), Action::Queue),
+        ];
+        for a in track.artists.iter().filter(|a| a.id().is_some()).take(3) {
+            items.push((
+                if items.iter().any(|i| matches!(i.2, Action::Artist { .. })) { "" } else { "i" },
+                format!("Go to artist: {}", a.name),
+                Action::Artist { id: a.id().unwrap_or_default().to_owned(), name: a.name.clone() },
+            ));
+        }
+        if let Some(album) = track.album.clone().filter(|a| a.id.is_some()) {
+            items.push(("b", format!("Go to album: {}", album.name), Action::Album(album)));
+        }
+        if crate::client::AVAILABLE && track.uri.starts_with("spotify:track:") {
+            items.push(("o", "Start song radio".into(), Action::Radio));
+        }
+        items.push(("e", "Add to playlist…".into(), Action::AddToPlaylist));
+        if let Some(pl) = self.editable_open_playlist() {
+            items.push(("D", format!("Remove from {}", pl.name), Action::RemoveFromPlaylist));
+        }
+        let liked = matches!(&self.saved, Some((u, true)) if *u == track.uri);
+        if self.playing_uri() == Some(track.uri.as_str()) {
+            items.push(("f", if liked { "Remove from Liked Songs" } else { "Add to Liked Songs" }.into(), Action::Like));
+        }
+        self.menu = Some(Menu { title: track.name.clone(), items, cursor: 0, track: Some(track) });
+    }
+
+    fn filter_menu_items(&self) -> Vec<(&'static str, String, Action)> {
+        let Some(Page::Radio(r)) = self.pages.last() else { return Vec::new() };
+        FilterItem::ALL
+            .iter()
+            .map(|i| {
+                let (label, value) = i.describe(&r.filters);
+                let text = if value.is_empty() { label.to_owned() } else { format!("{label}: {value}") };
+                ("", text, Action::Filter(*i))
+            })
+            .collect()
+    }
+
+    fn open_filters(&mut self) {
+        if self.view() != View::Radio {
+            return;
+        }
+        let items = self.filter_menu_items();
+        self.menu = Some(Menu { title: "Radio filters".into(), items, cursor: 0, track: None });
+    }
+
+    /// Runs the menu entry under the cursor.
+    fn run_menu(&mut self) {
+        let Some(menu) = self.menu.as_ref() else { return };
+        let Some((_, _, action)) = menu.items.get(menu.cursor).cloned() else { return };
+        let track = menu.track.clone();
+        if let Action::Filter(item) = action {
+            // Filters stay open: change, see the list update, change again.
+            let library = self.library.clone().unwrap_or_default();
+            if let Some(Page::Radio(r)) = self.pages.last_mut() {
+                item.step(&mut r.filters);
+                r.refilter(&library);
+            }
+            let items = self.filter_menu_items();
+            if let Some(m) = self.menu.as_mut() {
+                m.items = items;
+            }
+            return;
+        }
+        self.menu = None;
+        let Some(track) = track else { return };
+        self.run_action(action, track);
+    }
+
+    fn run_action(&mut self, action: Action, track: Track) {
+        match action {
+            Action::Play => self.play_selected(),
+            Action::Queue => {
+                let cmd = Cmd::Queue { uri: track.uri.clone(), name: track.name.clone() };
+                self.send(cmd);
+            }
+            Action::Artist { id, name } => self.open_artist(id, name),
+            Action::Album(album) => self.open_album(album),
+            Action::Radio => self.start_radio(track),
+            Action::AddToPlaylist => self.open_picker(track),
+            Action::RemoveFromPlaylist => self.ask_remove(track),
+            Action::Like => self.toggle_like(),
+            Action::Filter(_) => {}
+        }
+    }
+
+    fn open_picker(&mut self, track: Track) {
+        if !self.can_edit {
+            self.error("Run `spotlite auth` again to allow editing playlists.");
+            return;
+        }
+        self.picker = Some(Picker { track, query: String::new(), cursor: 0 });
+    }
+
+    /// Playlists the user may add to, narrowed by the picker's text.
+    pub fn picker_choices(&self) -> Vec<&Playlist> {
+        let q = self.picker.as_ref().map(|p| p.query.to_lowercase()).unwrap_or_default();
+        self.playlists
+            .items
+            .iter()
+            .filter(|p| self.owns(p))
+            .filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    fn pick_playlist(&mut self) {
+        let Some(picker) = self.picker.as_ref() else { return };
+        let Some(pl) = self.picker_choices().get(picker.cursor).map(|p| (*p).clone()) else { return };
+        let track = picker.track.clone();
+        self.picker = None;
+        self.send(Cmd::AddToPlaylist {
+            playlist_id: pl.id,
+            playlist: pl.name,
+            uris: vec![track.uri],
+            what: track.name,
+        });
+    }
+
+    fn ask_remove(&mut self, track: Track) {
+        if !self.can_edit {
+            self.error("Run `spotlite auth` again to allow editing playlists.");
+            return;
+        }
+        let Some(pl) = self.editable_open_playlist().cloned() else {
+            self.info("Open one of your playlists to remove songs from it.");
+            return;
+        };
+        self.confirm = Some(Confirm {
+            text: format!("Remove “{}” from {}?", track.name, pl.name),
+            cmd: Cmd::RemoveFromPlaylist { playlist_id: pl.id, playlist: pl.name, uri: track.uri, what: track.name },
+        });
+    }
+
+    /// Moves the cursor to the playing track, if the current list has it.
+    fn jump_to_playing(&mut self) {
+        let Some(uri) = self.playing_uri().map(str::to_owned) else { return };
+        let found = self.tracks().and_then(|l| l.items.iter().position(|t| t.uri == uri));
+        match found {
+            Some(i) => self.select(i),
+            None => self.info("The playing song is not in this list."),
+        }
+    }
+
+    fn move_popup(&mut self, delta: isize) {
+        let len = if let Some(m) = &self.menu {
+            m.items.len()
+        } else if self.picker.is_some() {
+            self.picker_choices().len()
+        } else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        let step = |c: usize| (c as isize + delta).rem_euclid(len as isize) as usize;
+        if let Some(m) = self.menu.as_mut() {
+            m.cursor = step(m.cursor);
+        } else if let Some(p) = self.picker.as_mut() {
+            p.cursor = step(p.cursor.min(len - 1));
+        }
     }
 
     fn play_selected(&mut self) {
         match self.view() {
+            View::Album => {
+                let Some(Page::Album(a)) = self.pages.last() else { return };
+                let Some(t) = a.tracks.current() else { return };
+                let uri = a.album.uri.clone().unwrap_or_else(|| format!("spotify:album:{}", a.id));
+                self.send(Cmd::Play(Play::Context { uri, from: Some(t.uri.clone()) }));
+                self.poll_soon();
+            }
+            View::Radio => {
+                let Some(Page::Radio(r)) = self.pages.last() else { return };
+                let uris: Vec<String> = r.tracks.items.iter().map(|t| t.uri.clone()).collect();
+                if !uris.is_empty() {
+                    let offset = r.tracks.selected();
+                    self.send(Cmd::Play(Play::Tracks { uris, offset }));
+                    self.poll_soon();
+                }
+            }
+            View::Artist => {
+                let Some(Page::Artist(a)) = self.pages.last() else { return };
+                match a.rows.current() {
+                    Some(ArtistRow::Album(album)) => {
+                        let album = album.clone();
+                        self.open_album(album);
+                    }
+                    Some(ArtistRow::Track(t)) => {
+                        let top = a.top_tracks();
+                        let offset = top.iter().position(|x| x.uri == t.uri).unwrap_or(0);
+                        let uris = top.iter().map(|t| t.uri.clone()).collect();
+                        self.send(Cmd::Play(Play::Tracks { uris, offset }));
+                        self.poll_soon();
+                    }
+                    None => {}
+                }
+            }
             View::Search => {
                 let uris: Vec<String> = self.search.items.iter().map(|t| t.uri.clone()).collect();
                 if !uris.is_empty() {
@@ -826,6 +1308,13 @@ impl App {
     }
 
     fn play_whole_playlist(&mut self) {
+        if let Some(Page::Album(a)) = self.pages.last() {
+            let uri = a.album.uri.clone().unwrap_or_else(|| format!("spotify:album:{}", a.id));
+            self.info(format!("Playing {}", a.album.name));
+            self.send(Cmd::Play(Play::Context { uri, from: None }));
+            self.poll_soon();
+            return;
+        }
         let pl = match self.view() {
             View::Playlists => self.current_playlist(),
             View::Playlist => self.open.as_ref().map(|o| o.playlist.clone()),
@@ -954,6 +1443,7 @@ impl App {
 
     fn reload(&mut self) {
         match self.view() {
+            View::Artist | View::Album | View::Radio => {}
             View::Search => self.search.reset(),
             View::Playlists => {
                 self.playlists.reset();
@@ -970,7 +1460,9 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.view() == View::Playlists && self.foldered() {
+        if let Some(a) = self.artist_page_mut() {
+            a.rows.move_by(delta);
+        } else if self.view() == View::Playlists && self.foldered() {
             self.rows.move_by(delta);
         } else if self.view() == View::Playlists {
             self.playlists.move_by(delta);
@@ -980,6 +1472,9 @@ impl App {
     }
 
     fn list_len(&self) -> usize {
+        if let Some(Page::Artist(a)) = self.pages.last() {
+            return a.rows.items.len();
+        }
         match self.view() {
             View::Playlists if self.foldered() => self.rows.items.len(),
             View::Playlists => self.playlists.items.len(),
@@ -988,7 +1483,9 @@ impl App {
     }
 
     fn select(&mut self, i: usize) {
-        if self.view() == View::Playlists && self.foldered() {
+        if let Some(a) = self.artist_page_mut() {
+            a.rows.state.select(Some(i));
+        } else if self.view() == View::Playlists && self.foldered() {
             self.rows.state.select(Some(i));
         } else if self.view() == View::Playlists {
             self.playlists.state.select(Some(i));
@@ -1020,7 +1517,58 @@ impl App {
             }
             return;
         }
+        // Pop-ups take the mouse while they are open; a click outside closes them.
+        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let hit = self.hits.popup_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i);
+                    match hit {
+                        Some(i) if self.menu.is_some() => {
+                            if let Some(menu) = self.menu.as_mut() {
+                                menu.cursor = i;
+                            }
+                            self.run_menu();
+                        }
+                        Some(i) if self.picker.is_some() => {
+                            if let Some(p) = self.picker.as_mut() {
+                                p.cursor = i;
+                            }
+                            self.pick_playlist();
+                        }
+                        Some(0) => {
+                            if let Some(c) = self.confirm.take() {
+                                self.send(c.cmd);
+                            }
+                        }
+                        _ if !self.hits.popup.contains(pos) || self.confirm.is_some() => {
+                            self.menu = None;
+                            self.picker = None;
+                            self.confirm = None;
+                        }
+                        _ => {}
+                    }
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let delta: isize = if m.kind == MouseEventKind::ScrollUp { -1 } else { 1 };
+                    self.move_popup(delta);
+                }
+                _ => {}
+            }
+            return;
+        }
         match m.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                if let Some(i) = self.row_at(pos) {
+                    self.select(i);
+                    self.open_menu();
+                } else if self.hits.np_artist.contains(pos) || self.hits.np_album.contains(pos) {
+                    if let Some(t) = self.playback.as_ref().and_then(|p| p.item.clone()) {
+                        let items_track = t;
+                        self.menu = None;
+                        self.run_action(Action::Radio, items_track);
+                    }
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => self.on_click(pos),
             MouseEventKind::Drag(MouseButton::Left) => match self.drag {
                 Some(Drag::Volume) => self.set_volume((fraction(self.hits.volume, m.column) * 100.0).round() as u8),
@@ -1058,8 +1606,14 @@ impl App {
             self.tab = Tab::Search;
             self.typing = true;
         } else if h.back.contains(pos) {
-            if self.open.take().is_none() {
-                self.close_folder();
+            self.back();
+        } else if h.np_artist.contains(pos) {
+            if let Some(t) = self.playback.as_ref().and_then(|p| p.item.clone()) {
+                self.go_to_artist(&t);
+            }
+        } else if h.np_album.contains(pos) {
+            if let Some(t) = self.playback.as_ref().and_then(|p| p.item.clone()) {
+                self.go_to_album(&t);
             }
         } else if h.play.contains(pos) {
             self.toggle_play();
@@ -1106,6 +1660,64 @@ impl App {
             self.help = false;
             return;
         }
+        if self.confirm.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    if let Some(c) = self.confirm.take() {
+                        self.send(c.cmd);
+                    }
+                }
+                _ => self.confirm = None,
+            }
+            return;
+        }
+        if self.picker.is_some() {
+            match key.code {
+                KeyCode::Esc => self.picker = None,
+                KeyCode::Enter => self.pick_playlist(),
+                KeyCode::Down => self.move_popup(1),
+                KeyCode::Up => self.move_popup(-1),
+                KeyCode::Char('n') if ctrl => self.move_popup(1),
+                KeyCode::Char('p') if ctrl => self.move_popup(-1),
+                KeyCode::Backspace => {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.query.pop();
+                        p.cursor = 0;
+                    }
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.query.push(c);
+                        p.cursor = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.menu.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('.') => self.menu = None,
+                KeyCode::Char('F') if self.menu.as_ref().is_some_and(|m| m.track.is_none()) => self.menu = None,
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') => self.run_menu(),
+                KeyCode::Down | KeyCode::Char('j') => self.move_popup(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_popup(-1),
+                KeyCode::Char(c) => {
+                    // A key hint runs its entry directly.
+                    let hit = self.menu.as_ref().and_then(|m| {
+                        m.items.iter().position(|(k, _, _)| k.len() == c.len_utf8() && k.starts_with(c))
+                    });
+                    if let Some(i) = hit {
+                        if let Some(m) = self.menu.as_mut() {
+                            m.cursor = i;
+                        }
+                        self.run_menu();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.typing {
             match key.code {
                 KeyCode::Esc => self.typing = false,
@@ -1143,12 +1755,35 @@ impl App {
             KeyCode::Char('1') => self.switch_tab(Tab::Search),
             KeyCode::Char('2') => self.switch_tab(Tab::Playlists),
             KeyCode::Char('3') => self.switch_tab(Tab::Liked),
-            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') if self.view() == View::Playlist => {
-                self.open = None;
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => self.back(),
+            KeyCode::Char('.') => self.open_menu(),
+            KeyCode::Char('i') => {
+                if let Some(t) = self.target_track() {
+                    self.go_to_artist(&t);
+                }
             }
-            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') if self.view() == View::Playlists => {
-                self.close_folder();
+            KeyCode::Char('b') => {
+                if let Some(t) = self.target_track() {
+                    self.go_to_album(&t);
+                }
             }
+            KeyCode::Char('o') => {
+                if let Some(t) = self.target_track() {
+                    self.start_radio(t);
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(t) = self.selected_track() {
+                    self.open_picker(t);
+                }
+            }
+            KeyCode::Char('D') => {
+                if let Some(t) = self.selected_track() {
+                    self.ask_remove(t);
+                }
+            }
+            KeyCode::Char('F') => self.open_filters(),
+            KeyCode::Char('c') => self.jump_to_playing(),
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.change_volume(true),
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.change_volume(false),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -1195,9 +1830,9 @@ mod tests {
             .unwrap()
     }
 
-    fn page(range: std::ops::Range<usize>, total: usize) -> Page<Track> {
+    fn page(range: std::ops::Range<usize>, total: usize) -> ApiPage<Track> {
         let items: Vec<Track> = range.map(track).collect();
-        Page { raw: items.len(), items, total }
+        ApiPage { raw: items.len(), items, total }
     }
 
     fn drain(rx: &std::sync::mpsc::Receiver<Cmd>) -> Vec<Cmd> {
@@ -1422,7 +2057,7 @@ mod tests {
         app.tick();
         let cmds = drain(&rx);
         assert!(matches!(cmds.as_slice(), [Cmd::Load { list: List::Playlists, offset: 0 }]), "{cmds:?}");
-        let page = Page { items: vec![pl("a", "A"), pl("b", "B"), pl("c", "C"), pl("new", "New one")], raw: 4, total: 120 };
+        let page = ApiPage { items: vec![pl("a", "A"), pl("b", "B"), pl("c", "C"), pl("new", "New one")], raw: 4, total: 120 };
         app.on_msg(Msg::Playlists { offset: 0, page });
         app.tick();
         let cmds = drain(&rx);
@@ -1460,6 +2095,162 @@ mod tests {
         let (mut app, _rx) = test_app();
         app.set_folders(crate::folders::parse_rootlist(["spotify:playlist:a"]));
         assert!(!app.foldered());
+    }
+
+    fn track_by(id: &str, artist: (&str, &str), album: (&str, &str)) -> Track {
+        serde_json::from_value(serde_json::json!({
+            "uri": format!("spotify:track:{id}"), "name": format!("Song {id}"), "duration_ms": 1000,
+            "artists": [{"name": artist.1, "uri": format!("spotify:artist:{}", artist.0)}],
+            "album": {"name": album.1, "id": album.0, "uri": format!("spotify:album:{}", album.0), "images": []}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn menu_opens_artist_album_and_back() {
+        let (mut app, rx) = test_app();
+        app.switch_tab(Tab::Liked);
+        let t = track_by("1", ("ar1", "Bowie"), ("al1", "Low"));
+        app.on_msg(Msg::Tracks { list: List::Liked, offset: 0, page: ApiPage { items: vec![t], raw: 1, total: 1 } });
+        drain(&rx);
+
+        app.on_key(KeyEvent::from(KeyCode::Char('.')));
+        let labels: Vec<String> = app.menu.as_ref().unwrap().items.iter().map(|i| i.1.clone()).collect();
+        assert!(labels.iter().any(|l| l == "Go to artist: Bowie"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "Go to album: Low"), "{labels:?}");
+        assert!(!labels.iter().any(|l| l.starts_with("Remove from")), "not an editable playlist: {labels:?}");
+
+        // The key hint runs its entry.
+        app.on_key(KeyEvent::from(KeyCode::Char('i')));
+        assert!(app.menu.is_none());
+        assert_eq!(app.view(), View::Artist);
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Artist(id) if id == "ar1")));
+
+        app.on_msg(Msg::Artist {
+            artist: serde_json::from_value(serde_json::json!({"id": "ar1", "name": "David Bowie", "images": []})).unwrap(),
+            top: vec![track_by("9", ("ar1", "Bowie"), ("al2", "Heroes"))],
+            albums: vec![serde_json::from_value(serde_json::json!({"name": "Low", "id": "al1", "uri": "spotify:album:al1"})).unwrap()],
+        });
+        let Some(Page::Artist(a)) = app.pages.last() else { panic!() };
+        assert_eq!((a.name.as_str(), a.rows.items.len()), ("David Bowie", 2));
+
+        // Second row is the album: Enter opens it, and its tracks load.
+        app.move_selection(1);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.view(), View::Album);
+        app.tick();
+        let cmds = drain(&rx);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Load { list: List::Album(id), offset: 0 } if id == "al1")), "{cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Album(id) if id == "al1")), "details asked for: {cmds:?}");
+
+        // Album tracks get the album (for covers), and Enter plays the album from that song.
+        let bare: Track = serde_json::from_value(serde_json::json!({"uri": "spotify:track:a1", "name": "Speed of Life"})).unwrap();
+        app.on_msg(Msg::Tracks { list: List::Album("al1".into()), offset: 0, page: ApiPage { items: vec![bare], raw: 1, total: 1 } });
+        assert_eq!(app.selected_track().unwrap().album_name(), "Low");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let cmds = drain(&rx);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::Play(Play::Context { uri, from: Some(f) }) if uri == "spotify:album:al1" && f == "spotify:track:a1")),
+            "{cmds:?}"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.view(), View::Artist);
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.view(), View::Liked);
+    }
+
+    #[test]
+    fn radio_filters_update_the_list() {
+        use crate::radio::RadioTrack;
+        let (mut app, rx) = test_app();
+        app.switch_tab(Tab::Liked);
+        let seed = track_by("s", ("ar1", "A"), ("al1", "X"));
+        app.on_msg(Msg::Tracks { list: List::Liked, offset: 0, page: ApiPage { items: vec![seed.clone()], raw: 1, total: 1 } });
+        drain(&rx);
+        app.on_key(KeyEvent::from(KeyCode::Char('o')));
+        assert_eq!(app.view(), View::Radio);
+        let cmds = drain(&rx);
+        if crate::client::AVAILABLE {
+            assert!(cmds.iter().any(|c| matches!(c, Cmd::Radio(u) if u == "spotify:track:s")), "{cmds:?}");
+            assert!(cmds.iter().any(|c| matches!(c, Cmd::Library)), "{cmds:?}");
+        }
+        let rt = |id: &str, artist: &str, explicit: bool| RadioTrack {
+            uri: format!("spotify:track:{id}"),
+            name: id.into(),
+            artists: vec![artist.into()],
+            artist_uris: vec![format!("spotify:artist:{artist}")],
+            album: String::new(),
+            year: Some(2000),
+            duration_ms: 1000,
+            popularity: 50,
+            explicit,
+            album_uri: None,
+            images: Vec::new(),
+        };
+        let result = Ok((rt("s", "ar1", false), vec![rt("1", "x", true), rt("2", "y", false), rt("3", "y", false)]));
+        app.on_msg(Msg::Radio { seed: "spotify:track:s".into(), result });
+        assert_eq!(app.tracks().unwrap().items.len(), 3);
+
+        app.on_key(KeyEvent::from(KeyCode::Char('F')));
+        // Third entry: hide explicit songs; the menu stays open and the list updates.
+        app.move_popup(2);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.menu.is_some());
+        assert_eq!(app.tracks().unwrap().items.len(), 2);
+        assert!(app.menu.as_ref().unwrap().items[2].1.ends_with(": on"));
+        // Songs per artist: at most 2, then at most 1.
+        app.move_popup(2);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.tracks().unwrap().items.len(), 1);
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+
+        // Enter plays the filtered list.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let cmds = drain(&rx);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Play(Play::Tracks { uris, .. }) if uris == &["spotify:track:2"])), "{cmds:?}");
+    }
+
+    #[test]
+    fn add_and_remove_with_picker_and_confirm() {
+        let (mut app, rx) = test_app();
+        app.on_msg(Msg::User(serde_json::from_value(serde_json::json!({"id": "me", "uri": "spotify:user:me"})).unwrap()));
+        let theirs: Playlist = serde_json::from_value(serde_json::json!({
+            "id": "t", "uri": "spotify:playlist:t", "name": "Theirs", "owner": {"id": "x"}
+        }))
+        .unwrap();
+        app.on_msg(Msg::Playlists {
+            offset: 0,
+            page: ApiPage { items: vec![pl("p1", "Gym"), pl("p2", "Chill"), theirs], raw: 3, total: 3 },
+        });
+        app.tab = Tab::Playlists;
+        app.open = Some(OpenPlaylist { playlist: pl("p1", "Gym"), tracks: Listing::default() });
+        let t = track_by("1", ("a", "A"), ("b", "B"));
+        app.on_msg(Msg::Tracks { list: List::Playlist("p1".into()), offset: 0, page: ApiPage { items: vec![t], raw: 1, total: 1 } });
+        drain(&rx);
+
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert_eq!(app.picker_choices().len(), 2, "only your own playlists");
+        for c in "chi".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(app.picker_choices().iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Chill"]);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let cmds = drain(&rx);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::AddToPlaylist { playlist_id, uris, .. } if playlist_id == "p2" && uris == &["spotify:track:1"])), "{cmds:?}");
+
+        app.on_key(KeyEvent::from(KeyCode::Char('D')));
+        assert!(app.confirm.is_some());
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(app.confirm.is_none());
+        assert!(drain(&rx).is_empty(), "cancel sends nothing");
+        app.on_key(KeyEvent::from(KeyCode::Char('D')));
+        app.on_key(KeyEvent::from(KeyCode::Char('y')));
+        let cmds = drain(&rx);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::RemoveFromPlaylist { playlist_id, uri, .. } if playlist_id == "p1" && uri == "spotify:track:1")), "{cmds:?}");
+        app.on_msg(Msg::Removed { playlist_id: "p1".into(), uri: "spotify:track:1".into() });
+        assert!(app.open.as_ref().unwrap().tracks.items.is_empty());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Playlist folders. The Web API only lists playlists; the folder tree lives in the account's
-//! "rootlist", which only Spotify's client protocol can read. With the `folders` feature,
-//! spotlite logs in with spotifyd's saved librespot login (read-only), reads the rootlist once
-//! at start, and keeps the tree in ~/.cache/spotlite/folders.json so it shows at once next time.
+//! "rootlist", which only Spotify's client protocol can read (see client.rs). spotlite reads
+//! it once at start and keeps the tree in ~/.cache/spotlite/folders.json so it shows at once
+//! next time.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ impl Entry {
 
 /// Builds the tree from rootlist URIs, where folders are bracketed by
 /// `spotify:start-group:<id>:<name>` and `spotify:end-group:<id>`.
-#[cfg_attr(not(feature = "folders"), allow(dead_code))]
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
 pub fn parse_rootlist<'a>(uris: impl IntoIterator<Item = &'a str>) -> Vec<Entry> {
     let mut stack: Vec<(String, Vec<Entry>)> = vec![(String::new(), Vec::new())];
     for uri in uris {
@@ -79,29 +79,14 @@ pub fn has_folders(tree: &[Entry]) -> bool {
     tree.iter().any(|e| matches!(e, Entry::Folder { .. }))
 }
 
-/// spotifyd's saved librespot login (written by `spotifyd authenticate`).
-#[cfg(feature = "folders")]
-fn spotifyd_credentials() -> Option<librespot_core::authentication::Credentials> {
-    let base = dirs::cache_dir()?.join("spotifyd");
-    ["oauth", "zeroconf", ""].iter().find_map(|sub| {
-        let file = base.join(sub).join("credentials.json");
-        serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()
-    })
-}
-
 /// Reads the rootlist over Spotify's client protocol. Blocks; run it on its own thread.
-#[cfg(feature = "folders")]
+#[cfg(feature = "client")]
 pub fn fetch() -> Result<Vec<Entry>> {
-    use librespot_core::{Session, SessionConfig};
     use librespot_protocol::playlist4_external::SelectedListContent;
     use protobuf::Message;
 
-    let credentials = spotifyd_credentials()
-        .ok_or_else(|| anyhow::anyhow!("no spotifyd login found; run `spotifyd authenticate`"))?;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let (rt, session) = crate::client::connect()?;
     rt.block_on(async {
-        let session = Session::new(SessionConfig::default(), None);
-        session.connect(credentials, false).await?;
         let mut uris = Vec::new();
         loop {
             let bytes = session.spclient().get_rootlist(uris.len(), Some(500)).await?;
@@ -117,9 +102,9 @@ pub fn fetch() -> Result<Vec<Entry>> {
     })
 }
 
-#[cfg(not(feature = "folders"))]
+#[cfg(not(feature = "client"))]
 pub fn fetch() -> Result<Vec<Entry>> {
-    anyhow::bail!("built without the `folders` feature")
+    anyhow::bail!("built without the `client` feature")
 }
 
 #[cfg(test)]

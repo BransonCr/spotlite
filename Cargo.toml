@@ -26,9 +26,12 @@ ureq = { version = "2.12", features = ["json"] }
 url = "2"
 
 [features]
-default = ["folders"]
-# Playlist folders come only from Spotify's client protocol (librespot), not the Web API.
-folders = ["dep:librespot-core", "dep:librespot-protocol", "dep:protobuf", "dep:tokio"]
+default = ["client"]
+# Spotify's client protocol (librespot): playlist folders and song radio, which the Web API
+# does not offer.
+client = ["dep:librespot-core", "dep:librespot-protocol", "dep:protobuf", "dep:tokio"]
+# Old name of `client`.
+folders = ["client"]
 
 [profile.release]
 opt-level = "s"

@@ -1,6 +1,7 @@
 //! Background thread that owns the API client, so the UI never waits on the network.
 
-use crate::api::{ApiError, Page, Play, Playback, Playlist, Spotify, Track, User};
+use crate::api::{Album, ApiError, Artist, Page, Play, Playback, Playlist, Spotify, Track, User};
+use crate::radio::{Library, RadioTrack};
 use anyhow::{anyhow, Result};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -12,6 +13,7 @@ pub enum List {
     Playlists,
     Liked,
     Playlist(String),
+    Album(String),
 }
 
 #[derive(Debug)]
@@ -33,6 +35,16 @@ pub enum Cmd {
     Queue { uri: String, name: String },
     CheckSaved(String),
     SetSaved { uri: String, saved: bool },
+    /// Profile, popular songs and albums of an artist (by id).
+    Artist(String),
+    /// Album details (by id); its tracks load through `Load { list: List::Album }`.
+    Album(String),
+    /// Song radio for a track URI (runs on its own thread: it takes about 2 s).
+    Radio(String),
+    /// Every Liked Songs track and artist, for the radio filters.
+    Library,
+    AddToPlaylist { playlist_id: String, playlist: String, uris: Vec<String>, what: String },
+    RemoveFromPlaylist { playlist_id: String, playlist: String, uri: String, what: String },
 }
 
 #[derive(Debug)]
@@ -51,6 +63,16 @@ pub enum Msg {
     Backoff(u64),
     /// The user's playlist folders (from the folder thread).
     Folders(Vec<crate::folders::Entry>),
+    Artist { artist: Artist, top: Vec<Track>, albums: Vec<Album> },
+    Album(Album),
+    Radio { seed: String, result: Result<(RadioTrack, Vec<RadioTrack>), String> },
+    Library(Library),
+    /// Loading a page (artist id, album id or radio seed) failed; it shows the error.
+    PageFailed { id: String, error: String },
+    /// A track was removed from a playlist.
+    Removed { playlist_id: String, uri: String },
+    /// A track was added to a playlist.
+    Added { playlist_id: String },
     /// Sent after every command.
     Done(Kind),
 }
@@ -191,6 +213,61 @@ impl Worker {
                 self.send(Msg::Info(if saved { "Added to Liked Songs" } else { "Removed from Liked Songs" }.into()));
                 Ok(())
             }
+            Cmd::Artist(id) => {
+                let result = (|| -> Result<()> {
+                    let artist = self.api.artist(&id)?;
+                    let top = self.api.artist_top_tracks(&artist)?;
+                    let albums = self.api.artist_albums(&id)?;
+                    self.send(Msg::Artist { artist, top, albums });
+                    Ok(())
+                })();
+                if let Err(e) = &result {
+                    self.send(Msg::PageFailed { id, error: format!("{e:#}") });
+                }
+                result
+            }
+            Cmd::Album(id) => {
+                let album = self.api.album(&id)?;
+                self.send(Msg::Album(album));
+                Ok(())
+            }
+            Cmd::Radio(seed) => {
+                let tx = self.tx.clone();
+                thread::Builder::new().name("spotlite-radio".into()).spawn(move || {
+                    let result = crate::radio::fetch(&seed).map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::Radio { seed, result });
+                })?;
+                Ok(())
+            }
+            Cmd::Library => {
+                let mut library = Library::default();
+                let mut offset = 0;
+                loop {
+                    let page = self.api.liked_tracks(offset)?;
+                    offset += page.raw;
+                    for t in &page.items {
+                        library.tracks.insert(t.uri.clone());
+                        library.artists.extend(t.artists.iter().filter_map(|a| a.uri.clone()));
+                    }
+                    if page.raw == 0 || offset >= page.total {
+                        break;
+                    }
+                }
+                self.send(Msg::Library(library));
+                Ok(())
+            }
+            Cmd::AddToPlaylist { playlist_id, playlist, uris, what } => {
+                self.api.add_to_playlist(&playlist_id, &uris)?;
+                self.send(Msg::Added { playlist_id });
+                self.send(Msg::Info(format!("Added {what} to {playlist}")));
+                Ok(())
+            }
+            Cmd::RemoveFromPlaylist { playlist_id, playlist, uri, what } => {
+                self.api.remove_from_playlist(&playlist_id, std::slice::from_ref(&uri))?;
+                self.send(Msg::Removed { playlist_id, uri });
+                self.send(Msg::Info(format!("Removed {what} from {playlist}")));
+                Ok(())
+            }
         }
     }
 
@@ -248,6 +325,10 @@ impl Worker {
             }
             List::Playlist(id) => {
                 let page = self.api.playlist_tracks(id, offset)?;
+                self.send(Msg::Tracks { list, offset, page });
+            }
+            List::Album(id) => {
+                let page = self.api.album_tracks(id, offset)?;
                 self.send(Msg::Tracks { list, offset, page });
             }
             List::Playlists => {

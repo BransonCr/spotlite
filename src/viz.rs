@@ -16,17 +16,17 @@ pub const BANDS: usize = 48;
 const RATE: usize = 22_050;
 /// FFT size: about 46 ms of sound, 21.5 Hz per bin.
 const N: usize = 1024;
-/// New samples per update: about 23 ms.
-const HOP: usize = 512;
+/// New samples per update: about 12 ms.
+const HOP: usize = 256;
 const LOW_HZ: f32 = 40.0;
 const HIGH_HZ: f32 = 10_000.0;
 /// Level range shown, in dB.
 const FLOOR_DB: f32 = -62.0;
 const RANGE_DB: f32 = 52.0;
-/// Easing per update (~23 ms): bars rise over about 150 ms and fall over about 0.5 s,
+/// Easing per update (~12 ms): bars rise over about 70 ms and fall over about 0.35 s,
 /// so they glide instead of jumping.
-const RISE: f32 = 0.15;
-const FALL: f32 = 0.045;
+const RISE: f32 = 0.18;
+const FALL: f32 = 0.035;
 /// Blur across neighbouring bands, so the shape is a gentle wave, not jagged bars.
 const BLUR: [f32; 5] = [0.1, 0.2, 0.4, 0.2, 0.1];
 /// Automatic gain: the loudest band is scaled toward this level; the reference loudness
@@ -292,7 +292,7 @@ mod tests {
 
         let before = f.levels[band];
         // Once the window holds only silence, the level eases down.
-        for _ in 0..4 {
+        for _ in 0..N / HOP + 2 {
             f = a.push(std::iter::repeat_n(0.0, HOP));
         }
         assert!(f.levels[band] < before, "falls on silence");

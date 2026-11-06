@@ -1,0 +1,290 @@
+//! Song radio: tracks similar to a seed track, with filters.
+//!
+//! The Web API's /recommendations is closed to new apps, so the tracks come from Spotify's own
+//! song radio (the app's "Go to song radio", `inspiredby-mix`) over the client protocol (see
+//! client.rs). Spotify shapes it by your listening; no API offers a neutral radio any more, so
+//! the filters (new songs only, new artists only, ...) are the way to step outside your taste.
+//! One batched metadata request gives each track's artist, year, length, popularity and
+//! explicit flag, which the filters use.
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RadioTrack {
+    pub uri: String,
+    pub name: String,
+    pub artists: Vec<String>,
+    pub artist_uris: Vec<String>,
+    pub album: String,
+    pub year: Option<i32>,
+    pub duration_ms: u64,
+    /// 0-100, from Spotify's metadata.
+    pub popularity: u8,
+    pub explicit: bool,
+    pub album_uri: Option<String>,
+    /// Cover sizes (64, 300, 640 px).
+    pub images: Vec<crate::api::ImageRef>,
+}
+
+impl RadioTrack {
+    /// As a Web API track, for the shared track list.
+    pub fn to_track(&self) -> crate::api::Track {
+        use crate::api::{Album, Named, Track};
+        Track {
+            uri: self.uri.clone(),
+            name: self.name.clone(),
+            duration_ms: self.duration_ms,
+            artists: self
+                .artists
+                .iter()
+                .zip(self.artist_uris.iter().map(Some).chain(std::iter::repeat(None)))
+                .map(|(name, uri)| Named { name: name.clone(), uri: uri.cloned() })
+                .collect(),
+            album: Some(Album {
+                name: self.album.clone(),
+                images: self.images.clone(),
+                id: self.album_uri.as_deref().and_then(|u| u.rsplit(':').next()).map(str::to_owned),
+                uri: self.album_uri.clone(),
+                release_date: self.year.map(|y| y.to_string()),
+                ..Default::default()
+            }),
+            show: None,
+            images: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Era {
+    Any,
+    /// Within 10 years of the seed's release year.
+    NearSeed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fame {
+    Any,
+    /// Popularity 55 and up.
+    Popular,
+    /// Popularity under 40.
+    DeepCuts,
+}
+
+/// Which radio tracks to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Filters {
+    /// Leave out songs that are already in Liked Songs.
+    pub new_only: bool,
+    /// Leave out artists that appear in Liked Songs.
+    pub new_artists: bool,
+    pub no_explicit: bool,
+    /// Leave out the seed's own artist.
+    pub other_artists: bool,
+    /// At most this many songs per artist (0 = no limit).
+    pub per_artist: u8,
+    pub era: Era,
+    pub fame: Fame,
+}
+
+impl Default for Filters {
+    fn default() -> Self {
+        Filters {
+            new_only: false,
+            new_artists: false,
+            no_explicit: false,
+            other_artists: false,
+            per_artist: 0,
+            era: Era::Any,
+            fame: Fame::Any,
+        }
+    }
+}
+
+/// What the filters know about Liked Songs.
+#[derive(Debug, Clone, Default)]
+pub struct Library {
+    pub tracks: std::collections::HashSet<String>,
+    pub artists: std::collections::HashSet<String>,
+}
+
+/// Keeps the tracks that pass the filters, in radio order.
+pub fn apply(tracks: &[RadioTrack], seed: &RadioTrack, filters: &Filters, library: &Library) -> Vec<RadioTrack> {
+    let mut per_artist: std::collections::HashMap<&str, u8> = std::collections::HashMap::new();
+    let seed_artist = seed.artist_uris.first().map(String::as_str);
+    tracks
+        .iter()
+        .filter(|t| t.uri != seed.uri)
+        .filter(|t| !(filters.new_only && library.tracks.contains(&t.uri)))
+        .filter(|t| !(filters.new_artists && t.artist_uris.iter().any(|a| library.artists.contains(a))))
+        .filter(|t| !(filters.no_explicit && t.explicit))
+        .filter(|t| !(filters.other_artists && t.artist_uris.first().map(String::as_str) == seed_artist))
+        .filter(|t| match (filters.era, t.year, seed.year) {
+            (Era::NearSeed, Some(y), Some(s)) => (y - s).abs() <= 10,
+            _ => true,
+        })
+        .filter(|t| match filters.fame {
+            Fame::Any => true,
+            Fame::Popular => t.popularity >= 55,
+            Fame::DeepCuts => t.popularity < 40,
+        })
+        .filter(|t| {
+            if filters.per_artist == 0 {
+                return true;
+            }
+            let key = t.artist_uris.first().map_or("", String::as_str);
+            let n = per_artist.entry(key).or_insert(0);
+            *n += 1;
+            *n <= filters.per_artist
+        })
+        .cloned()
+        .collect()
+}
+
+/// Seed track and radio tracks. Blocks; run it on its own thread.
+#[cfg(feature = "client")]
+pub fn fetch(seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
+    use anyhow::{anyhow, Context};
+    use librespot_core::{SpotifyId, SpotifyUri};
+    use librespot_protocol::playlist4_external::SelectedListContent;
+    use protobuf::Message;
+
+    let (rt, session) = crate::client::connect()?;
+    let result = rt.block_on(async {
+        let sp = session.spclient();
+        let seed = SpotifyUri::from_uri(seed_uri).map_err(|e| anyhow!("bad track: {e}"))?;
+        let json: serde_json::Value = serde_json::from_slice(&sp.get_radio_for_track(&seed).await?)?;
+        let playlist = json["mediaItems"][0]["uri"]
+            .as_str()
+            .and_then(|u| u.strip_prefix("spotify:playlist:"))
+            .context("Spotify returned no radio for this song")?;
+        let id = SpotifyId::from_base62(playlist).map_err(|e| anyhow!("bad radio id: {e}"))?;
+        let list = SelectedListContent::parse_from_bytes(&sp.get_playlist(&id).await?)?;
+        let uris: Vec<String> = list.contents.items.iter().map(|i| i.uri().to_owned()).collect();
+        let mut all = vec![seed_uri.to_owned()];
+        all.extend(uris.into_iter().filter(|u| u.starts_with("spotify:track:")));
+        let meta = metadata(&session, &all).await?;
+        session.shutdown();
+        anyhow::Ok(meta)
+    })?;
+    let mut tracks = result.into_iter();
+    let seed = tracks.next().ok_or_else(|| anyhow!("no metadata for the seed song"))?;
+    Ok((seed, tracks.collect()))
+}
+
+#[cfg(not(feature = "client"))]
+pub fn fetch(_seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
+    anyhow::bail!("song radio needs the `client` feature")
+}
+
+/// Track metadata for many URIs in one request, in the same order (unknown ones dropped).
+#[cfg(feature = "client")]
+async fn metadata(session: &librespot_core::Session, uris: &[String]) -> anyhow::Result<Vec<RadioTrack>> {
+    use librespot_core::SpotifyId;
+    use librespot_protocol::extended_metadata::{BatchedEntityRequest, EntityRequest, ExtensionQuery};
+    use librespot_protocol::extension_kind::ExtensionKind;
+    use librespot_protocol::metadata::Track;
+    use protobuf::{EnumOrUnknown, Message};
+
+    let req = BatchedEntityRequest {
+        entity_request: uris
+            .iter()
+            .map(|u| EntityRequest {
+                entity_uri: u.clone(),
+                query: vec![ExtensionQuery {
+                    extension_kind: EnumOrUnknown::new(ExtensionKind::TRACK_V4),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let res = session.spclient().get_extended_metadata(req).await?;
+    let mut by_uri = std::collections::HashMap::new();
+    for array in res.extended_metadata {
+        for data in array.extension_data {
+            let Some(any) = data.extension_data.as_ref() else { continue };
+            let Ok(t) = Track::parse_from_bytes(&any.value) else { continue };
+            let uri_of = |kind: &str, gid: &[u8]| {
+                SpotifyId::from_raw(gid).ok().and_then(|id| id.to_base62().ok()).map(|b| format!("spotify:{kind}:{b}"))
+            };
+            let images = t
+                .album
+                .cover_group
+                .image
+                .iter()
+                .map(|img| crate::api::ImageRef {
+                    url: format!(
+                        "https://i.scdn.co/image/{}",
+                        img.file_id().iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    ),
+                    width: Some(img.width().max(0) as u32).filter(|w| *w > 0),
+                })
+                .collect();
+            by_uri.insert(
+                data.entity_uri.clone(),
+                RadioTrack {
+                    uri: data.entity_uri.clone(),
+                    name: t.name().to_owned(),
+                    artists: t.artist.iter().map(|a| a.name().to_owned()).collect(),
+                    artist_uris: t.artist.iter().filter_map(|a| uri_of("artist", a.gid())).collect(),
+                    album_uri: uri_of("album", t.album.gid()),
+                    images,
+                    album: t.album.name().to_owned(),
+                    year: t.album.date.as_ref().map(|d| d.year()).filter(|y| *y > 0),
+                    duration_ms: t.duration().max(0) as u64,
+                    popularity: t.popularity().clamp(0, 100) as u8,
+                    explicit: t.explicit(),
+                },
+            );
+        }
+    }
+    Ok(uris.iter().filter_map(|u| by_uri.remove(u)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(id: &str, artist: &str, year: i32, pop: u8, explicit: bool) -> RadioTrack {
+        RadioTrack {
+            uri: format!("spotify:track:{id}"),
+            name: id.into(),
+            artists: vec![artist.into()],
+            artist_uris: vec![format!("spotify:artist:{artist}")],
+            album: String::new(),
+            year: Some(year),
+            duration_ms: 200_000,
+            popularity: pop,
+            explicit,
+            album_uri: None,
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn filters_combine() {
+        let seed = t("seed", "a", 1995, 70, false);
+        let tracks = vec![
+            seed.clone(),
+            t("1", "a", 1996, 80, false),
+            t("2", "b", 2020, 30, true),
+            t("3", "b", 1990, 50, false),
+            t("4", "b", 1999, 20, false),
+            t("5", "c", 1994, 60, false),
+        ];
+        let library = Library {
+            tracks: ["spotify:track:5".to_owned()].into(),
+            artists: ["spotify:artist:b".to_owned()].into(),
+        };
+        let ids = |f: Filters| apply(&tracks, &seed, &f, &library).iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+
+        assert_eq!(ids(Filters::default()), ["1", "2", "3", "4", "5"], "seed itself is dropped");
+        assert_eq!(ids(Filters { new_only: true, ..Default::default() }), ["1", "2", "3", "4"]);
+        assert_eq!(ids(Filters { new_artists: true, ..Default::default() }), ["1", "5"]);
+        assert_eq!(ids(Filters { no_explicit: true, ..Default::default() }), ["1", "3", "4", "5"]);
+        assert_eq!(ids(Filters { other_artists: true, ..Default::default() }), ["2", "3", "4", "5"]);
+        assert_eq!(ids(Filters { per_artist: 1, ..Default::default() }), ["1", "2", "5"]);
+        assert_eq!(ids(Filters { era: Era::NearSeed, ..Default::default() }), ["1", "3", "4", "5"]);
+        assert_eq!(ids(Filters { fame: Fame::Popular, ..Default::default() }), ["1", "5"]);
+        assert_eq!(ids(Filters { fame: Fame::DeepCuts, ..Default::default() }), ["2", "4"]);
+    }
+}

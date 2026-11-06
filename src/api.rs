@@ -45,13 +45,21 @@ impl fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Named {
     pub name: String,
+    /// Artist URI (absent on some old or local items).
+    pub uri: Option<String>,
+}
+
+impl Named {
+    pub fn id(&self) -> Option<&str> {
+        self.uri.as_deref()?.rsplit(':').next()
+    }
 }
 
 /// One size of a cover picture. Custom playlist covers come without a size.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ImageRef {
     pub url: String,
     pub width: Option<u32>,
@@ -73,8 +81,43 @@ pub fn pick_image(images: &[ImageRef], min_px: u32) -> Option<&str> {
         .map(|i| i.url.as_str())
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Album {
+    pub name: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub images: Vec<ImageRef>,
+    pub id: Option<String>,
+    pub uri: Option<String>,
+    /// "1999", "1999-05" or "1999-05-17".
+    pub release_date: Option<String>,
+    /// "album", "single" or "compilation".
+    pub album_type: Option<String>,
+    pub total_tracks: Option<usize>,
+}
+
+impl Album {
+    pub fn year(&self) -> Option<&str> {
+        self.release_date.as_deref().map(|d| d.split('-').next().unwrap_or(d))
+    }
+
+    /// "Album · 1999 · 12 tracks"
+    pub fn summary(&self) -> String {
+        let kind = match self.album_type.as_deref() {
+            Some("single") => "Single",
+            Some("compilation") => "Compilation",
+            _ => "Album",
+        };
+        let mut parts = vec![kind.to_owned()];
+        parts.extend(self.year().map(str::to_owned));
+        parts.extend(self.total_tracks.map(|n| format!("{n} tracks")));
+        parts.join(" · ")
+    }
+}
+
+/// An artist's profile. The Feb 2026 API keeps only name and pictures here.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Artist {
+    pub id: String,
     pub name: String,
     #[serde(default, deserialize_with = "null_as_empty")]
     pub images: Vec<ImageRef>,
@@ -413,6 +456,63 @@ impl Spotify {
     }
 
     /// Only works for playlists the user owns or collaborates on (else ApiError::Forbidden).
+    pub fn artist(&mut self, id: &str) -> Result<Artist> {
+        self.get(&format!("/artists/{id}"), &[])?
+            .ok_or_else(|| anyhow::anyhow!("empty artist response"))
+    }
+
+    /// Albums and singles, as Spotify orders them; the first 30 (dev-mode pages hold 10).
+    pub fn artist_albums(&mut self, id: &str) -> Result<Vec<Album>> {
+        let mut out = Vec::new();
+        for offset in [0, 10, 20] {
+            let offset = offset.to_string();
+            let raw: Option<RawPage<Album>> = self.get(
+                &format!("/artists/{id}/albums"),
+                &[("include_groups", "album,single"), ("limit", "10"), ("offset", &offset)],
+            )?;
+            let Some(page) = raw.map(|r| r.into_page(Some)) else { break };
+            let done = out.len() + page.raw >= page.total || page.raw == 0;
+            out.extend(page.items);
+            if done {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The artist's popular songs. /artists/{id}/top-tracks is closed to dev-mode apps, so this
+    /// searches for the artist's tracks (Spotify ranks them by popularity) and keeps theirs.
+    pub fn artist_top_tracks(&mut self, artist: &Artist) -> Result<Vec<Track>> {
+        let q = format!("artist:\"{}\"", artist.name.replace('"', ""));
+        let mut out = Vec::new();
+        for offset in [0, SEARCH_PAGE] {
+            let page = self.search_tracks(&q, offset)?;
+            out.extend(page.items.into_iter().filter(|t| t.artists.iter().any(|a| a.id() == Some(artist.id.as_str()))));
+        }
+        Ok(out)
+    }
+
+    pub fn album(&mut self, id: &str) -> Result<Album> {
+        self.get(&format!("/albums/{id}"), &[])?
+            .ok_or_else(|| anyhow::anyhow!("empty album response"))
+    }
+
+    /// Tracks of an album (simplified: their `album` field is empty).
+    pub fn album_tracks(&mut self, album_id: &str, offset: usize) -> Result<Page<Track>> {
+        self.page(&format!("/albums/{album_id}/tracks"), offset, Some)
+    }
+
+    /// Adds tracks to the end of a playlist (needs playlist-modify-*).
+    pub fn add_to_playlist(&mut self, playlist_id: &str, uris: &[String]) -> Result<()> {
+        self.send("POST", &format!("/playlists/{playlist_id}/items"), &[], Some(json!({ "uris": uris })))
+    }
+
+    /// Removes every occurrence of the tracks from a playlist (needs playlist-modify-*).
+    pub fn remove_from_playlist(&mut self, playlist_id: &str, uris: &[String]) -> Result<()> {
+        let items: Vec<Value> = uris.iter().map(|u| json!({ "uri": u })).collect();
+        self.send("DELETE", &format!("/playlists/{playlist_id}/items"), &[], Some(json!({ "items": items })))
+    }
+
     pub fn playlist_tracks(&mut self, playlist_id: &str, offset: usize) -> Result<Page<Track>> {
         self.page(&format!("/playlists/{playlist_id}/items"), offset, |e: PlaylistEntry| {
             e.item.or(e.track)
