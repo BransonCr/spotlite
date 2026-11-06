@@ -31,21 +31,26 @@ player state every 5 seconds and moves the progress bar locally between polls.
    # redirect_port = 8898
    ```
 
-3. Configure and start spotifyd:
+3. Configure spotifyd, log in once in the browser, and start it
+   (run from the repo folder):
 
    ```sh
+   cd ~/projects/spotlite
    mkdir -p ~/.config/spotifyd
    cp contrib/spotifyd.conf ~/.config/spotifyd/spotifyd.conf
-   spotifyd authenticate          # log in once in the browser
+   spotifyd authenticate
    systemctl --user enable --now spotifyd
    ```
 
-4. Install and log in spotlite:
+   If spotifyd was already running, restart it after you log in:
+   `systemctl --user restart spotifyd`.
+
+4. Install spotlite, log in, and check that the `spotlite` device is listed:
 
    ```sh
    cargo install --path .
    spotlite auth
-   spotlite devices               # "spotlite" must be in the list
+   spotlite devices
    spotlite
    ```
 
