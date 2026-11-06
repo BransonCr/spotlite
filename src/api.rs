@@ -50,6 +50,36 @@ pub struct Named {
     pub name: String,
 }
 
+/// One size of a cover picture. Custom playlist covers come without a size.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageRef {
+    pub url: String,
+    pub width: Option<u32>,
+}
+
+/// `images` can be missing or null; both mean "no picture".
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ImageRef>, D::Error> {
+    Ok(Option::<Vec<ImageRef>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// URL of the smallest picture that is at least `min_px` wide, else the largest one.
+pub fn pick_image(images: &[ImageRef], min_px: u32) -> Option<&str> {
+    let size = |i: &ImageRef| i.width.unwrap_or(u32::MAX);
+    images
+        .iter()
+        .filter(|i| size(i) >= min_px)
+        .min_by_key(|i| size(i))
+        .or_else(|| images.iter().max_by_key(|i| size(i)))
+        .map(|i| i.url.as_str())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Album {
+    pub name: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub images: Vec<ImageRef>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Track {
     pub uri: String,
@@ -58,9 +88,11 @@ pub struct Track {
     pub duration_ms: u64,
     #[serde(default)]
     pub artists: Vec<Named>,
-    pub album: Option<Named>,
-    /// Podcast episodes have a show instead of artists.
+    pub album: Option<Album>,
+    /// Podcast episodes have a show instead of artists, and their own pictures.
     pub show: Option<Named>,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub images: Vec<ImageRef>,
 }
 
 impl Track {
@@ -77,6 +109,13 @@ impl Track {
 
     pub fn album_name(&self) -> &str {
         self.album.as_ref().map_or("", |a| a.name.as_str())
+    }
+
+    pub fn images(&self) -> &[ImageRef] {
+        match &self.album {
+            Some(a) if !a.images.is_empty() => &a.images,
+            _ => &self.images,
+        }
     }
 }
 
@@ -102,6 +141,8 @@ pub struct Playlist {
     /// Called `tracks` before the Feb 2026 rename.
     #[serde(alias = "tracks")]
     pub items: Option<Total>,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub images: Vec<ImageRef>,
 }
 
 impl Playlist {
@@ -508,6 +549,31 @@ mod tests {
         let entry: PlaylistEntry =
             serde_json::from_str(r#"{"item": {"uri": "u", "name": "n"}, "added_at": "x"}"#).unwrap();
         assert!(entry.item.or(entry.track).is_some());
+    }
+
+    #[test]
+    fn picks_the_right_image_size() {
+        let imgs: Vec<ImageRef> = serde_json::from_str(
+            r#"[{"url": "640", "width": 640}, {"url": "300", "width": 300}, {"url": "64", "width": 64}]"#,
+        )
+        .unwrap();
+        assert_eq!(pick_image(&imgs, 40), Some("64"));
+        assert_eq!(pick_image(&imgs, 100), Some("300"));
+        assert_eq!(pick_image(&imgs, 2000), Some("640"));
+        let custom: Vec<ImageRef> = serde_json::from_str(r#"[{"url": "c", "width": null}]"#).unwrap();
+        assert_eq!(pick_image(&custom, 40), Some("c"));
+        assert_eq!(pick_image(&[], 40), None);
+
+        let p: Playlist = serde_json::from_str(
+            r#"{"id": "1", "uri": "u", "name": "P", "owner": {"id": "me"}, "images": null}"#,
+        )
+        .unwrap();
+        assert!(p.images.is_empty());
+        let t: Track = serde_json::from_str(
+            r#"{"uri": "u", "name": "n", "album": {"name": "A", "images": [{"url": "a", "width": 64}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(pick_image(t.images(), 10), Some("a"));
     }
 
     #[test]

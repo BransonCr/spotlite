@@ -8,9 +8,15 @@ description = "Lightweight Spotify client: a terminal UI on top of spotifyd and 
 anyhow = "1"
 base64 = "0.22"
 dirs = "5"
+librespot-core = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+librespot-protocol = { version = "=0.8.0", optional = true }
+protobuf = { version = "3", optional = true }
+tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 open = "5"
 rand = "0.8"
 ratatui = "0.29"
+ratatui-image = { version = "=9.0.0", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -18,6 +24,11 @@ toml = "0.8"
 unicode-width = "0.2"
 ureq = { version = "2.12", features = ["json"] }
 url = "2"
+
+[features]
+default = ["folders"]
+# Playlist folders come only from Spotify's client protocol (librespot), not the Web API.
+folders = ["dep:librespot-core", "dep:librespot-protocol", "dep:protobuf", "dep:tokio"]
 
 [profile.release]
 opt-level = "s"

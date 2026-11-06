@@ -4,10 +4,6 @@ use crate::api::{ApiError, Page, Play, Playback, Playlist, Spotify, Track, User}
 use anyhow::{anyhow, Result};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
-
-/// Spotify needs a moment to apply a player command before the state reflects it.
-const SETTLE: Duration = Duration::from_millis(350);
 
 /// A list the UI shows, used to route pages back to the right place.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +40,7 @@ pub enum Msg {
     User(User),
     /// Name of the device spotlite will play on, if Spotify sees it.
     Device(Option<String>),
-    Playback(Option<Playback>),
+    Playback(Option<Box<Playback>>),
     Tracks { list: List, offset: usize, page: Page<Track> },
     Playlists { offset: usize, page: Page<Playlist> },
     LoadFailed { list: List, forbidden: bool },
@@ -53,16 +49,30 @@ pub enum Msg {
     Error(String),
     /// Spotify asked us to wait this many seconds.
     Backoff(u64),
-    /// Sent after every command; `poll` is true when it was a Poll.
-    Done { poll: bool },
+    /// The user's playlist folders (from the folder thread).
+    Folders(Vec<crate::folders::Entry>),
+    /// Sent after every command.
+    Done(Kind),
 }
 
-pub fn spawn(api: Spotify) -> (Sender<Cmd>, Receiver<Msg>) {
+/// Which kind of command finished, for the UI's in-flight bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Poll,
+    Volume,
+    /// A player command (the UI then asks for fresh state soon).
+    Player,
+    Other,
+}
+
+/// Starts the API thread. Returns its command sender, a sender other threads can use to
+/// post messages to the UI, and the UI's message receiver.
+pub fn spawn(api: Spotify) -> (Sender<Cmd>, Sender<Msg>, Receiver<Msg>) {
     let (cmd_tx, cmd_rx) = channel();
     let (msg_tx, msg_rx) = channel();
     let worker = Worker {
         api,
-        tx: msg_tx,
+        tx: msg_tx.clone(),
         device: None,
         user: None,
         last: None,
@@ -71,7 +81,7 @@ pub fn spawn(api: Spotify) -> (Sender<Cmd>, Receiver<Msg>) {
         .name("spotlite-api".into())
         .spawn(move || worker.run(cmd_rx))
         .expect("cannot start the API thread");
-    (cmd_tx, msg_rx)
+    (cmd_tx, msg_tx, msg_rx)
 }
 
 struct Worker {
@@ -85,7 +95,12 @@ struct Worker {
 impl Worker {
     fn run(mut self, rx: Receiver<Cmd>) {
         for cmd in rx {
-            let poll = matches!(cmd, Cmd::Poll);
+            let kind = match cmd {
+                Cmd::Poll => Kind::Poll,
+                Cmd::Volume(_) => Kind::Volume,
+                Cmd::Play(_) | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
+                _ => Kind::Other,
+            };
             let list = match &cmd {
                 Cmd::Load { list, .. } => Some(list.clone()),
                 _ => None,
@@ -93,7 +108,7 @@ impl Worker {
             if let Err(err) = self.handle(cmd) {
                 self.report(err, list);
             }
-            if self.tx.send(Msg::Done { poll }).is_err() {
+            if self.tx.send(Msg::Done(kind)).is_err() {
                 return; // UI has quit
             }
         }
@@ -149,8 +164,7 @@ impl Worker {
                 } else if idle {
                     // Nothing is active: move playback to our device and resume there.
                     let dev = self.require_device()?;
-                    self.api.transfer(&dev, true)?;
-                    self.settle_and_poll()
+                    self.api.transfer(&dev, true)
                 } else {
                     self.player(|api, dev| api.play(dev, None))
                 }
@@ -183,13 +197,8 @@ impl Worker {
     fn poll(&mut self) -> Result<()> {
         let pb = self.api.playback()?;
         self.last = pb.clone();
-        self.send(Msg::Playback(pb));
+        self.send(Msg::Playback(pb.map(Box::new)));
         Ok(())
-    }
-
-    fn settle_and_poll(&mut self) -> Result<()> {
-        thread::sleep(SETTLE);
-        self.poll()
     }
 
     fn find_device(&mut self) -> Result<Option<String>> {
@@ -212,7 +221,8 @@ impl Worker {
     }
 
     /// Runs a player command on our device. If Spotify says the device is gone
-    /// (e.g. spotifyd restarted), looks it up again and retries once.
+    /// (e.g. spotifyd restarted), looks it up again and retries once. The UI asks for the new
+    /// state itself, so the thread is free for the next command at once.
     fn player(&mut self, mut f: impl FnMut(&mut Spotify, Option<&str>) -> Result<()>) -> Result<()> {
         let dev = self.require_device()?;
         match f(&mut self.api, Some(&dev)) {
@@ -223,7 +233,7 @@ impl Worker {
             }
             other => other?,
         }
-        self.settle_and_poll()
+        Ok(())
     }
 
     fn load(&mut self, list: List, offset: usize) -> Result<()> {

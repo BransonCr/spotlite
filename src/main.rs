@@ -2,14 +2,22 @@ mod api;
 mod app;
 mod auth;
 mod config;
+mod control;
+mod folders;
+mod images;
 mod theme;
 mod ui;
+mod viz;
 mod worker;
 
 use anyhow::{bail, Result};
 use api::Spotify;
 use config::Config;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event, KeyEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui_image::picker::Picker;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
@@ -20,6 +28,7 @@ usage:
   spotlite            open the terminal UI
   spotlite auth       log in to Spotify (once)
   spotlite devices    list Spotify Connect devices
+  spotlite folders    show your playlist folders
   spotlite toggle     play/pause
   spotlite next       next track
   spotlite prev       previous track";
@@ -58,6 +67,23 @@ fn main() -> Result<()> {
                 },
             }
         }
+        Some("folders") => {
+            let tree = folders::fetch()?;
+            folders::save_cache(&tree)?;
+            fn show(entries: &[folders::Entry], depth: usize) {
+                for e in entries {
+                    match e {
+                        folders::Entry::Folder { name, children } => {
+                            println!("{:indent$}▸ {name} ({} playlists)", "", e.playlist_count(), indent = depth * 2);
+                            show(children, depth + 1);
+                        }
+                        folders::Entry::Playlist(uri) => println!("{:indent$}{uri}", "", indent = depth * 2),
+                    }
+                }
+            }
+            show(&tree, 0);
+            Ok(())
+        }
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
@@ -68,10 +94,44 @@ fn main() -> Result<()> {
 
 fn run_tui() -> Result<()> {
     let api = Spotify::new(Config::load()?)?;
+    start_spotifyd();
     let can_like = api.has_scope("user-library-modify");
-    let (tx, rx) = worker::spawn(api);
-    let mut app = app::App::new(tx, can_like);
+    let device_name = api.config().device_name.clone();
+    let (tx, msg_tx, rx) = worker::spawn(api);
     let mut terminal = ratatui::init();
+    // ratatui's panic hook restores the screen; also give the mouse back to the terminal.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
+        hook(info);
+    }));
+    execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
+    // Ask the terminal which graphics protocol it speaks (kitty in ghostty); half blocks if none.
+    let images = if std::env::var_os("SPOTLITE_NO_IMAGES").is_some() {
+        images::Images::disabled()
+    } else {
+        images::Images::new(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()))
+    };
+    let mut app = app::App::new(tx.clone(), can_like, images);
+    app.viz_on = std::env::var_os("SPOTLITE_VIZ").is_some();
+    if let Some(tree) = folders::load_cached() {
+        app.set_folders(tree);
+    }
+    // Refresh the folder tree in the background; the cached one shows meanwhile.
+    if cfg!(feature = "folders") {
+        let folder_tx = msg_tx.clone();
+        std::thread::Builder::new().name("spotlite-folders".into()).spawn(move || {
+            if let Ok(tree) = folders::fetch() {
+                let _ = folders::save_cache(&tree);
+                let _ = folder_tx.send(worker::Msg::Folders(tree));
+            }
+        })?;
+    }
+    if control::available() {
+        app = app.with_control(control::spawn(msg_tx.clone(), tx), device_name);
+    }
+    let fps: u64 = std::env::var("SPOTLITE_VIZ_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let viz_frame = Duration::from_millis(1000 / fps.clamp(1, 60));
     let result = (|| -> Result<()> {
         while !app.quit {
             loop {
@@ -81,20 +141,56 @@ fn run_tui() -> Result<()> {
                     Err(TryRecvError::Disconnected) => anyhow::bail!("the API thread stopped"),
                 }
             }
+            app.images.poll();
             app.tick();
             terminal.draw(|f| ui::draw(f, &mut app))?;
-            // Idle: wake once a second to move the progress bar. While a request is
-            // open, wake often so its reply shows at once. Keys always wake us.
-            let wait = if app.busy() { Duration::from_millis(30) } else { Duration::from_secs(1) };
+            // Idle: wake once a second to move the progress bar. While a request or a picture
+            // is open, wake often so its result shows at once; the visualizer runs at 20 fps.
+            // Input always wakes us.
+            let wait = if app.busy() {
+                Duration::from_millis(30)
+            } else if app.animating() {
+                viz_frame
+            } else {
+                Duration::from_secs(1)
+            };
             if event::poll(wait)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Event::Mouse(m) => app.on_mouse(m),
+                    Event::FocusGained => app.focused = true,
+                    Event::FocusLost => app.focused = false,
                     _ => {}
                 }
             }
         }
         Ok(())
     })();
+    app.viz.stop();
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
+    if app.stop_services {
+        stop_spotifyd();
+    }
     result
+}
+
+/// Starts the spotifyd user service if it is not running (after `Q` stopped it). Does not wait.
+fn start_spotifyd() {
+    let running = std::process::Command::new("systemctl")
+        .args(["--user", "--quiet", "is-active", "spotifyd"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !running {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "--no-block", "start", "spotifyd"])
+            .status();
+    }
+}
+
+/// `Q`: stop spotifyd too, so no part of spotlite keeps running or playing.
+fn stop_spotifyd() {
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "stop", "spotifyd"])
+        .status();
 }
