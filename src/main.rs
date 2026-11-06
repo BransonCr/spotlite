@@ -32,7 +32,7 @@ usage:
   spotlite auth       log in to Spotify (once)
   spotlite devices    list Spotify Connect devices
   spotlite folders    show your playlist folders
-  spotlite radio URI  list song radio for a track (spotify:track:...)
+  spotlite radio URI  list the radio for a song or artist (spotify:track:... or spotify:artist:...)
   spotlite toggle     play/pause
   spotlite next       next track
   spotlite prev       previous track";
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("radio") => {
-            let seed = std::env::args().nth(2).ok_or_else(|| anyhow::anyhow!("usage: spotlite radio <track-uri>"))?;
+            let seed = std::env::args().nth(2).ok_or_else(|| anyhow::anyhow!("usage: spotlite radio <track-or-artist-uri>"))?;
             let (seed, tracks) = radio::fetch(&seed)?;
             if let Some(img) = seed.images.first() {
                 println!("cover: {} ({:?} px)", img.url, img.width);

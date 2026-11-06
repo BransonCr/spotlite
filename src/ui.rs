@@ -178,19 +178,27 @@ fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
     let block = panel().title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let [head, _, list] =
-        Layout::vertical([Constraint::Length(5), Constraint::Length(1), Constraint::Min(2)]).areas(inner);
+    // No gap under the header: the first section title has a blank line of its own.
+    let [head, list] = Layout::vertical([Constraint::Length(5), Constraint::Min(2)]).areas(inner);
 
     let Some(Page::Artist(page)) = app.pages.last_mut() else { return };
-    let tracks = page.rows.items.iter().filter(|r| matches!(r, ArtistRow::Track(_))).count();
-    let albums = page.rows.items.len() - tracks;
+    let tracks = page.count(|r| matches!(r, ArtistRow::Track(_)));
+    let singles = page.count(|r| matches!(r, ArtistRow::Album(a) if a.album_type.as_deref() == Some("single")));
+    let albums = page.count(|r| matches!(r, ArtistRow::Album(_))) - singles;
     let cover = page.artist.as_ref().map(|a| a.images.clone()).unwrap_or_default();
     let summary = if let Some(e) = &page.error {
         format!("Could not load: {e}")
     } else if page.rows.loading {
         "Loading…".to_owned()
     } else {
-        format!("{tracks} popular songs · {albums} albums and singles")
+        let mut parts = vec![format!("{tracks} popular songs")];
+        if albums > 0 {
+            parts.push(format!("{albums} {}", if albums == 1 { "album" } else { "albums" }));
+        }
+        if singles > 0 {
+            parts.push(format!("{singles} singles and EPs"));
+        }
+        parts.join(" · ")
     };
     draw_page_header(
         f,
@@ -200,7 +208,7 @@ fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
         vec![
             Line::from(Span::styled(name.clone(), theme::bright())),
             Line::from(Span::styled(summary, theme::muted())),
-            Line::from(Span::styled("⏎ play or open · o radio · . more", theme::faint())),
+            Line::from(Span::styled("⏎ play or open · tab next section · o radio · . more", theme::faint())),
         ],
     );
 
@@ -212,21 +220,48 @@ fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
     let thumb = app.images.square_cols(PLAYLIST_ROW);
     let widths = [Constraint::Length(thumb), Constraint::Fill(1), Constraint::Length(8)];
     let cols = column_widths(list.width, &widths);
+    let section_w = list.width.saturating_sub(2) as usize;
+    let mut rank = 0;
     let rows = page.rows.items.iter().map(|r| {
         let (name, sub, right, is_playing) = match r {
-            ArtistRow::Track(t) => (
-                t.name.as_str(),
-                format!("Popular · {}", t.album_name()),
-                format_ms(t.duration_ms),
-                playing.as_deref() == Some(t.uri.as_str()),
-            ),
-            ArtistRow::Album(a) => (a.name.as_str(), a.summary(), String::new(), false),
+            ArtistRow::Header(title) => {
+                // A blank line above, then the title and a faint rule to the edge.
+                let rule = "─".repeat(section_w.saturating_sub(title.width() + 1));
+                return Row::new(vec![
+                    Cell::from(""),
+                    Cell::from(Text::from(vec![
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled(title.to_string(), theme::accent().add_modifier(Modifier::BOLD)),
+                            Span::styled(format!(" {rule}"), theme::faint()),
+                        ]),
+                    ])),
+                    Cell::from(""),
+                ])
+                .height(PLAYLIST_ROW);
+            }
+            ArtistRow::Track(t) => {
+                rank += 1;
+                (
+                    t.name.clone(),
+                    format!("{rank:>2} · {}", t.album_name()),
+                    format_ms(t.duration_ms),
+                    playing.as_deref() == Some(t.uri.as_str()),
+                )
+            }
+            ArtistRow::Radio(t) if t.uri.starts_with("spotify:artist:") => {
+                (format!("{} Radio", t.name), "Artist radio · songs like this artist's".to_owned(), "radio".to_owned(), false)
+            }
+            ArtistRow::Radio(t) => {
+                (format!("{} Radio", t.name), format!("Song radio · from {}", t.album_name()), "radio".to_owned(), false)
+            }
+            ArtistRow::Album(a) => (a.name.clone(), a.summary(), String::new(), false),
         };
         let style = if is_playing { theme::accent() } else { theme::text() };
         Row::new(vec![
             Cell::from(""),
             Cell::from(Text::from(vec![
-                Line::from(Span::styled(fit(name, cols[1]), style)),
+                Line::from(Span::styled(fit(&name, cols[1]), style)),
                 Line::from(Span::styled(fit(&sub, cols[1]), theme::faint())),
             ])),
             Cell::from(Line::from(Span::styled(right, theme::faint())).right_aligned()),
@@ -242,7 +277,8 @@ fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
     for (n, r) in page.rows.items.iter().skip(offset).take(visible).enumerate() {
         let rect = Rect::new(list.x + 1, list.y + n as u16 * PLAYLIST_ROW, thumb, PLAYLIST_ROW);
         let images = match r {
-            ArtistRow::Track(t) => t.images(),
+            ArtistRow::Header(_) => continue,
+            ArtistRow::Track(t) | ArtistRow::Radio(t) => t.images(),
             ArtistRow::Album(a) => &a.images,
         };
         if rect.right() <= list.right() && rect.bottom() <= list.bottom() {
@@ -291,6 +327,7 @@ fn album_artists(app: &App) -> String {
 fn draw_radio(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(Page::Radio(page)) = app.pages.last() else { return };
     let seed = page.seed.clone();
+    let artist_seed = seed.uri.starts_with("spotify:artist:");
     let filters = crate::pages::active_filters(&page.filters);
     let (kept, total, error) = (page.tracks.items.len(), page.total(), page.error.clone());
     let [head, list] = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).areas(area);
@@ -312,8 +349,18 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: Rect) {
         inner,
         seed.images(),
         vec![
-            Line::from(vec![Span::styled("Song radio  ", theme::muted()), Span::styled(seed.name.clone(), theme::bright())]),
-            Line::from(Span::styled(format!("Similar to {} · picked by Spotify for you", seed.artist_names()), theme::muted())),
+            Line::from(vec![
+                Span::styled(if artist_seed { "Artist radio  " } else { "Song radio  " }, theme::muted()),
+                Span::styled(seed.name.clone(), theme::bright()),
+            ]),
+            Line::from(Span::styled(
+                if artist_seed {
+                    "Songs like this artist's · picked by Spotify for you".to_owned()
+                } else {
+                    format!("Similar to {} · picked by Spotify for you", seed.artist_names())
+                },
+                theme::muted(),
+            )),
             filter_line,
         ],
     );
@@ -1070,7 +1117,7 @@ fn hints(app: &App) -> &'static [(&'static str, &'static str)] {
         View::Playlists => &[("⏎", "open"), ("P", "play all"), ("esc", "up"), ("␣", "pause"), ("?", "help")],
         View::Playlist => &[("⏎", "play"), (".", "actions"), ("e", "add to…"), ("D", "remove"), ("esc", "back"), ("?", "help")],
         View::Liked => &[("⏎", "play"), (".", "actions"), ("i", "artist"), ("o", "radio"), ("c", "playing"), ("?", "help")],
-        View::Artist => &[("⏎", "play / open"), (".", "actions"), ("o", "radio"), ("esc", "back"), ("?", "help")],
+        View::Artist => &[("⏎", "play / open"), ("tab", "section"), ("o", "radio"), ("esc", "back"), ("?", "help")],
         View::Album => &[("⏎", "play"), ("P", "play album"), (".", "actions"), ("esc", "back"), ("?", "help")],
         View::Radio => &[("⏎", "play"), ("F", "filters"), (".", "actions"), ("esc", "back"), ("?", "help")],
     }
@@ -1105,6 +1152,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 const HELP: &[(&str, &[(&str, &str)])] = &[
     ("Move", &[
         ("1 2 3, tab", "switch tab"),
+        ("tab", "next section (artist page)"),
         ("j k, ↑ ↓", "move"),
         ("g G, ^d ^u", "top, bottom, page"),
         ("esc, h", "back"),
@@ -1123,7 +1171,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         (".", "all actions (or right-click)"),
         ("a", "add to queue"),
         ("i  b", "go to artist, album"),
-        ("o", "song radio"),
+        ("o", "song radio (or artist)"),
         ("e  D", "add to playlist, remove"),
         ("f", "like the playing song"),
     ]),

@@ -640,7 +640,7 @@ impl App {
         if let Some(Page::Artist(a)) = self.pages.last() {
             return match a.rows.current()? {
                 ArtistRow::Track(t) => Some(t.clone()),
-                ArtistRow::Album(_) => None,
+                _ => None,
             };
         }
         self.tracks()?.current().cloned()
@@ -1015,8 +1015,8 @@ impl App {
             self.error("Song radio needs the `client` feature.");
             return;
         }
-        if !seed.uri.starts_with("spotify:track:") {
-            self.info("Radio works for songs only.");
+        if !seed.uri.starts_with("spotify:track:") && !seed.uri.starts_with("spotify:artist:") {
+            self.info("Radio works for songs and artists only.");
             return;
         }
         self.typing = false;
@@ -1246,6 +1246,10 @@ impl App {
                         let album = album.clone();
                         self.open_album(album);
                     }
+                    Some(ArtistRow::Radio(seed)) => {
+                        let seed = seed.clone();
+                        self.start_radio(seed);
+                    }
                     Some(ArtistRow::Track(t)) => {
                         let top = a.top_tracks();
                         let offset = top.iter().position(|x| x.uri == t.uri).unwrap_or(0);
@@ -1253,7 +1257,7 @@ impl App {
                         self.send(Cmd::Play(Play::Tracks { uris, offset }));
                         self.poll_soon();
                     }
-                    None => {}
+                    Some(ArtistRow::Header(_)) | None => {}
                 }
             }
             View::Search => {
@@ -1461,7 +1465,7 @@ impl App {
 
     fn move_selection(&mut self, delta: isize) {
         if let Some(a) = self.artist_page_mut() {
-            a.rows.move_by(delta);
+            a.move_by(delta);
         } else if self.view() == View::Playlists && self.foldered() {
             self.rows.move_by(delta);
         } else if self.view() == View::Playlists {
@@ -1484,7 +1488,7 @@ impl App {
 
     fn select(&mut self, i: usize) {
         if let Some(a) = self.artist_page_mut() {
-            a.rows.state.select(Some(i));
+            a.select(i);
         } else if self.view() == View::Playlists && self.foldered() {
             self.rows.state.select(Some(i));
         } else if self.view() == View::Playlists {
@@ -1748,6 +1752,16 @@ impl App {
                 self.tab = Tab::Search;
                 self.typing = true;
             }
+            KeyCode::Tab if self.view() == View::Artist => {
+                if let Some(a) = self.artist_page_mut() {
+                    a.jump_section(1);
+                }
+            }
+            KeyCode::BackTab if self.view() == View::Artist => {
+                if let Some(a) = self.artist_page_mut() {
+                    a.jump_section(-1);
+                }
+            }
             KeyCode::Tab => self.switch_tab(Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()]),
             KeyCode::BackTab => {
                 self.switch_tab(Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()])
@@ -1768,7 +1782,16 @@ impl App {
                 }
             }
             KeyCode::Char('o') => {
-                if let Some(t) = self.target_track() {
+                let radio_row = match self.pages.last() {
+                    Some(Page::Artist(a)) => match a.rows.current() {
+                        Some(ArtistRow::Radio(seed)) => Some(seed.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(seed) = radio_row {
+                    self.start_radio(seed);
+                } else if let Some(t) = self.target_track() {
                     self.start_radio(t);
                 }
             }
@@ -2132,10 +2155,36 @@ mod tests {
             albums: vec![serde_json::from_value(serde_json::json!({"name": "Low", "id": "al1", "uri": "spotify:album:al1"})).unwrap()],
         });
         let Some(Page::Artist(a)) = app.pages.last() else { panic!() };
-        assert_eq!((a.name.as_str(), a.rows.items.len()), ("David Bowie", 2));
+        // Popular: 1 song; Radio: artist + 1 song radio; Albums: 1. Each section has a title row.
+        assert_eq!((a.name.as_str(), a.rows.items.len()), ("David Bowie", 7));
+        assert_eq!(a.rows.selected(), 1, "the cursor starts on the first song, not a title");
 
-        // Second row is the album: Enter opens it, and its tracks load.
+        // j skips the "Radio" title; Tab jumps to the next section.
         app.move_selection(1);
+        let Some(Page::Artist(a)) = app.pages.last() else { panic!() };
+        assert!(matches!(a.rows.current(), Some(ArtistRow::Radio(t)) if t.uri == "spotify:artist:ar1"));
+        app.move_selection(-1);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        let Some(Page::Artist(a)) = app.pages.last() else { panic!() };
+        assert_eq!(a.rows.selected(), 3);
+
+        // Enter on the artist radio opens it.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.view(), View::Radio);
+        if crate::client::AVAILABLE {
+            assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Radio(u) if u == "spotify:artist:ar1")));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.view(), View::Artist);
+        drain(&rx);
+
+        // Tab again: the album section. Enter opens the album, and its tracks load.
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::BackTab));
+        let Some(Page::Artist(a)) = app.pages.last() else { panic!() };
+        assert_eq!(a.rows.selected(), 3, "shift+tab goes back one section");
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Tab));
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.view(), View::Album);
         app.tick();

@@ -70,7 +70,8 @@ selected song, so you do not need to remember the keys below.
 | `.` | Action menu for the selected song |
 | `a` | Add the selected song to the queue |
 | `i` / `b` | Go to the song's artist / album |
-| `o` | Song radio from the selected song |
+| `o` | Song radio from the selected song (or the selected radio on an artist page) |
+| `Tab` / `Shift+Tab` | Next / previous section on an artist page |
 | `F` | Radio filters (on a radio page) |
 | `e` | Add the selected song to one of your playlists |
 | `D` | Remove the selected song from the open playlist (asks first) |
@@ -89,13 +90,15 @@ selected song, so you do not need to remember the keys below.
 
 ### Artists, albums, radio
 
-- **Artist page** (`i`): picture, 10 popular songs and up to 30 albums and singles.
-  The 2026 dev-mode API has no top-tracks, related-artists or genres, so the popular
-  songs come from a search for the artist's tracks.
+- **Artist page** (`i`): picture, then sections: **Popular** (10 songs), **Radio** (the
+  artist's radio and song radios from the top 3 songs), **Albums**, **Singles and EPs**
+  (up to 30 releases). `Tab` / `Shift+Tab` jump between sections. The 2026 dev-mode API
+  has no top-tracks, related-artists or genres, so the popular songs come from a search
+  for the artist's tracks.
 - **Album page** (`b`, or Enter on an album): cover, year, tracks; Enter plays the album
   from that song, `P` plays it from the start.
 - **Song radio** (`o`): Spotify's own "song radio" (about 50 songs), read over the client
-  protocol like the folders. Spotify shapes it by your listening, and no API offers a
+  protocol like the folders. The artist page also has the artist's radio. Spotify shapes it by your listening, and no API offers a
   neutral radio any more, so the filters (`F`) are how to step outside your taste:
   hide songs or artists already in Liked Songs, hide explicit songs, hide the seed's
   artist, at most 1 or 2 songs per artist, songs from near the seed's year, popular

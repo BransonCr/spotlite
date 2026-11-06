@@ -138,7 +138,8 @@ pub fn apply(tracks: &[RadioTrack], seed: &RadioTrack, filters: &Filters, librar
         .collect()
 }
 
-/// Seed track and radio tracks. Blocks; run it on its own thread.
+/// Seed and radio tracks. The seed is a track (song radio) or an artist (artist radio).
+/// Blocks; run it on its own thread.
 #[cfg(feature = "client")]
 pub fn fetch(seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
     use anyhow::{anyhow, Context};
@@ -146,6 +147,7 @@ pub fn fetch(seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
     use librespot_protocol::playlist4_external::SelectedListContent;
     use protobuf::Message;
 
+    let is_track = seed_uri.starts_with("spotify:track:");
     let (rt, session) = crate::client::connect()?;
     let result = rt.block_on(async {
         let sp = session.spclient();
@@ -154,19 +156,42 @@ pub fn fetch(seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
         let playlist = json["mediaItems"][0]["uri"]
             .as_str()
             .and_then(|u| u.strip_prefix("spotify:playlist:"))
-            .context("Spotify returned no radio for this song")?;
+            .context("Spotify returned no radio for this seed")?;
         let id = SpotifyId::from_base62(playlist).map_err(|e| anyhow!("bad radio id: {e}"))?;
         let list = SelectedListContent::parse_from_bytes(&sp.get_playlist(&id).await?)?;
         let uris: Vec<String> = list.contents.items.iter().map(|i| i.uri().to_owned()).collect();
-        let mut all = vec![seed_uri.to_owned()];
+        // A track seed comes first, so one request also gives its metadata (for the filters).
+        let mut all = if is_track { vec![seed_uri.to_owned()] } else { Vec::new() };
         all.extend(uris.into_iter().filter(|u| u.starts_with("spotify:track:")));
         let meta = metadata(&session, &all).await?;
         session.shutdown();
         anyhow::Ok(meta)
     })?;
     let mut tracks = result.into_iter();
-    let seed = tracks.next().ok_or_else(|| anyhow!("no metadata for the seed song"))?;
+    let seed = if is_track {
+        tracks.next().ok_or_else(|| anyhow!("no metadata for the seed song"))?
+    } else {
+        artist_seed(seed_uri)
+    };
     Ok((seed, tracks.collect()))
+}
+
+/// The seed of an artist radio: only the artist, so "hide the seed's artist" works and the
+/// era filter lets everything through.
+pub fn artist_seed(uri: &str) -> RadioTrack {
+    RadioTrack {
+        uri: uri.to_owned(),
+        name: String::new(),
+        artists: Vec::new(),
+        artist_uris: vec![uri.to_owned()],
+        album: String::new(),
+        year: None,
+        duration_ms: 0,
+        popularity: 0,
+        explicit: false,
+        album_uri: None,
+        images: Vec::new(),
+    }
 }
 
 #[cfg(not(feature = "client"))]

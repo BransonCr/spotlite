@@ -1,14 +1,29 @@
 //! Pages that open on top of the tabs: an artist, an album, a song radio. Esc goes back.
 
-use crate::api::{Album, Artist, Track};
+use crate::api::{Album, Artist, Named, Track};
 use crate::app::Listing;
 use crate::radio::{self, Era, Fame, Filters, Library, RadioTrack};
 
 pub enum ArtistRow {
+    /// A section title ("Popular", "Radio", "Albums", ...). The cursor skips it.
+    Header(&'static str),
     /// One of the artist's popular songs.
     Track(Track),
+    /// A radio to start: the artist's own radio, or a song radio from a popular song.
+    Radio(Track),
     Album(Album),
 }
+
+impl ArtistRow {
+    pub fn selectable(&self) -> bool {
+        !matches!(self, ArtistRow::Header(_))
+    }
+}
+
+/// Song radios offered on an artist page, from its most popular songs.
+const SONG_RADIOS: usize = 3;
+/// Popular songs shown on an artist page (Spotify's own page shows 5, then 10).
+const POPULAR: usize = 10;
 
 pub struct ArtistPage {
     pub id: String,
@@ -25,15 +40,108 @@ impl ArtistPage {
         ArtistPage { id, name, artist: None, rows, error: None }
     }
 
-    pub fn fill(&mut self, artist: Artist, top: Vec<Track>, albums: Vec<Album>) {
+    /// The seed of the artist radio, as a track-like row (the radio page shows its name).
+    pub fn radio_seed(&self) -> Track {
+        let uri = format!("spotify:artist:{}", self.id);
+        Track {
+            uri: uri.clone(),
+            name: self.name.clone(),
+            duration_ms: 0,
+            artists: vec![Named { name: self.name.clone(), uri: Some(uri) }],
+            album: None,
+            show: None,
+            images: self.artist.as_ref().map(|a| a.images.clone()).unwrap_or_default(),
+        }
+    }
+
+    pub fn fill(&mut self, artist: Artist, mut top: Vec<Track>, albums: Vec<Album>) {
+        top.truncate(POPULAR);
         self.name = artist.name.clone();
         self.artist = Some(artist);
-        let mut rows: Vec<ArtistRow> = top.into_iter().map(ArtistRow::Track).collect();
-        rows.extend(albums.into_iter().map(ArtistRow::Album));
+        let mut rows = Vec::new();
+        if !top.is_empty() {
+            rows.push(ArtistRow::Header("Popular"));
+        }
+        let radios: Vec<Track> = top.iter().take(SONG_RADIOS).cloned().collect();
+        rows.extend(top.into_iter().map(ArtistRow::Track));
+        rows.push(ArtistRow::Header("Radio"));
+        rows.push(ArtistRow::Radio(self.radio_seed()));
+        rows.extend(radios.into_iter().map(ArtistRow::Radio));
+        let kind = |a: &Album| match a.album_type.as_deref() {
+            Some("single") => 1,
+            Some("compilation") => 2,
+            _ => 0,
+        };
+        for (k, title) in [(0, "Albums"), (1, "Singles and EPs"), (2, "Compilations")] {
+            let group: Vec<&Album> = albums.iter().filter(|a| kind(a) == k).collect();
+            if !group.is_empty() {
+                rows.push(ArtistRow::Header(title));
+                rows.extend(group.into_iter().cloned().map(ArtistRow::Album));
+            }
+        }
         self.rows.total = Some(rows.len());
         self.rows.items = rows;
         self.rows.loading = false;
-        self.rows.state.select((!self.rows.items.is_empty()).then_some(0));
+        self.rows.state.select(self.rows.items.iter().position(ArtistRow::selectable));
+    }
+
+    /// Moves the cursor by `delta` rows, over the section titles.
+    pub fn move_by(&mut self, delta: isize) {
+        let items = &self.rows.items;
+        if items.is_empty() {
+            return;
+        }
+        let mut i = self.rows.selected() as isize;
+        let step = delta.signum();
+        let mut left = delta.abs();
+        let mut best = i;
+        while left > 0 {
+            i += step;
+            if i < 0 || i >= items.len() as isize {
+                break;
+            }
+            if items[i as usize].selectable() {
+                best = i;
+                left -= 1;
+            }
+        }
+        self.rows.state.select(Some(best as usize));
+        // Keep a title in view when its first row is selected.
+        if best > 0 && !items[best as usize - 1].selectable() && self.rows.state.offset() == best as usize {
+            *self.rows.state.offset_mut() = best as usize - 1;
+        }
+    }
+
+    /// Selects row `i`, or the next selectable row after a title.
+    pub fn select(&mut self, i: usize) {
+        if let Some(j) = self.rows.items.iter().skip(i).position(ArtistRow::selectable) {
+            self.rows.state.select(Some(i + j));
+        }
+    }
+
+    /// Jumps to the first row of the next (`1`) or previous (`-1`) section.
+    pub fn jump_section(&mut self, dir: isize) {
+        let items = &self.rows.items;
+        let starts: Vec<usize> = (1..items.len())
+            .filter(|&i| !items[i - 1].selectable() && items[i].selectable())
+            .collect();
+        let cur = self.rows.selected();
+        let target = if dir > 0 {
+            starts.iter().copied().find(|&s| s > cur)
+        } else {
+            starts.iter().copied().rev().find(|&s| s < cur).map(|s| {
+                // From inside a section, go to its start first.
+                let own = starts.iter().copied().rev().find(|&s| s <= cur);
+                match own {
+                    Some(o) if o < cur => o,
+                    _ => s,
+                }
+            })
+        };
+        if let Some(t) = target {
+            self.rows.state.select(Some(t));
+            *self.rows.state.offset_mut() = self.rows.state.offset().min(t - 1);
+        }
     }
 
     /// The popular songs, in order (to play them as a list).
@@ -43,9 +151,13 @@ impl ArtistPage {
             .iter()
             .filter_map(|r| match r {
                 ArtistRow::Track(t) => Some(t),
-                ArtistRow::Album(_) => None,
+                _ => None,
             })
             .collect()
+    }
+
+    pub fn count(&self, f: impl Fn(&ArtistRow) -> bool) -> usize {
+        self.rows.items.iter().filter(|r| f(r)).count()
     }
 }
 
