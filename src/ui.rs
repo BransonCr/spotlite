@@ -152,28 +152,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         body = list;
         draw_stage(f, app, side);
     }
-    // The visualizer needs empty rows. A long list leaves none, so it gets a strip of its
-    // own under the list; a short list leaves room inside the panel.
-    let mut viz_area = body.inner(Margin::new(1, 1));
-    if app.animating() && t.viz != theme::Viz::None {
-        let strip = (body.height / 4).clamp(4, 10);
-        let row_h: u16 = match app.view() {
-            View::Playlists | View::Artist => 2,
-            View::Search if app.search_kind != SearchKind::Songs => 2,
-            _ => 1,
-        };
-        let header: u16 = match app.view() {
-            View::Search => 6,
-            View::Artist | View::Album | View::Radio => 9,
-            _ => 3,
-        };
-        let need = (app.list_len() as u16).saturating_mul(row_h).saturating_add(header);
-        if body.height < need + strip && body.height > strip + 8 {
-            let [list, band] = Layout::vertical([Constraint::Min(8), Constraint::Length(strip)]).areas(body);
-            body = list;
-            viz_area = Rect { x: band.x + 1, width: band.width.saturating_sub(2), ..band };
-        }
-    }
+    // The visualizer is drawn under the list: in the empty cells of the main panel.
+    let viz_area = body.inner(Margin::new(1, 1));
 
     draw_header(f, app, header);
     match app.view() {
@@ -209,7 +189,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_now_playing(f, app, now);
     draw_footer(f, app, footer);
     if app.viz_on {
-        // In the empty rows at the bottom of the main panel, or in its own strip.
+        // Under the list, in the cells that nothing else uses.
         draw_visualizer(f.buffer_mut(), viz_area, &app.viz.frame());
     }
     if app.menu.is_some() {
@@ -716,10 +696,6 @@ pub fn draw_visualizer(buf: &mut Buffer, area: Rect, frame: &viz::Frame) {
     if area.height == 0 || frame.levels.iter().all(|&l| l < 0.01) {
         return;
     }
-    let area = empty_band(buf, area);
-    if area.height < 3 {
-        return;
-    }
     match theme::c().viz {
         theme::Viz::None => return,
         theme::Viz::Bars => return draw_viz_bars(buf, area, frame),
@@ -755,16 +731,6 @@ pub fn draw_visualizer(buf: &mut Buffer, area: Rect, frame: &viz::Frame) {
 fn viz_free(buf: &Buffer, x: u16, y: u16) -> bool {
     let cell = &buf[(x, y)];
     !cell.skip && cell.bg == Color::Reset && cell.symbol() == " "
-}
-
-/// The empty space at the bottom of `area`: the rows under the last row with anything on it.
-/// The visualizer draws only there, so it never shows in pieces between the words of a list.
-fn empty_band(buf: &Buffer, area: Rect) -> Rect {
-    let mut top = area.bottom();
-    while top > area.top() && (area.left()..area.right()).all(|x| viz_free(buf, x, top - 1)) {
-        top -= 1;
-    }
-    Rect { y: top, height: area.bottom() - top, ..area }
 }
 
 /// Separate chunky bars (2 cells wide, 1 apart), shaded upward and tinted across the screen
@@ -2241,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn long_lists_leave_a_strip_for_the_visualizer() {
+    fn the_visualizer_never_changes_the_list_size() {
         let (mut app, _rx) = test_app();
         app.typing = false;
         app.searched = "x".into();
@@ -2249,14 +2215,10 @@ mod tests {
         app.on_msg(Msg::Tracks { list: List::Search("x".into()), offset: 0, page: Page { items: songs.clone(), raw: 60, total: 60 } });
         app.on_msg(playing(&songs[0]));
         screen(&mut app, 120, 40);
-        let full = app.hits.list.height;
+        let off = app.hits.list;
         app.viz_on = true;
         screen(&mut app, 120, 40);
-        assert!(app.hits.list.height + 4 <= full, "the list gives up rows: {} -> {}", full, app.hits.list.height);
-        // A short list keeps its size: the visualizer uses the empty rows inside it.
-        app.on_msg(Msg::Tracks { list: List::Search("x".into()), offset: 0, page: Page { items: songs[..3].to_vec(), raw: 3, total: 3 } });
-        screen(&mut app, 120, 40);
-        assert_eq!(app.hits.list.height, full);
+        assert_eq!(app.hits.list, off, "it is drawn under the list, not beside it");
     }
 
     #[test]
@@ -2345,30 +2307,25 @@ mod tests {
 
     #[test]
     fn visualizer_draws_smooth_bars_in_empty_cells_only() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 11));
-        // A row of text on top: the visualizer keeps to the empty rows under it.
-        buf.set_string(0, 0, "TEXT", Style::new());
-        buf[(5, 0)].set_bg(theme::c().selected);
-        buf[(6, 0)].skip = true;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
+        buf.set_string(0, 9, "TEXT", Style::new());
+        buf[(5, 9)].set_bg(theme::c().selected);
+        buf[(6, 9)].skip = true;
         let frame = viz::Frame { levels: [0.5; viz::BANDS] };
         let area = buf.area;
         draw_visualizer(&mut buf, area, &frame);
-        // The band is rows 1..11 (10 rows): 0.5 * VIZ_MAX * 10 = 4 full cells, then a partial top.
+        // Under the text: 0.5 * VIZ_MAX * 10 rows = 4 full cells, then a partial top.
         let height = 0.5 * VIZ_MAX * 10.0;
         let full = height.floor() as u16;
-        assert_eq!(buf[(10, 10)].symbol(), "█");
-        assert_eq!(buf[(10, 11 - full)].symbol(), "█");
+        assert_eq!(buf[(10, 9)].symbol(), "█", "it fills the empty cells of a row with text");
+        assert_eq!(buf[(10, 10 - full)].symbol(), "█");
         let part = ((height - full as f32) * 8.0).round() as usize;
-        assert_eq!(buf[(10, 10 - full)].symbol(), EIGHTHS[part]);
-        assert!(
-            (1..11).any(|y| buf[(10, y)].fg == theme::c().viz_line),
-            "the line is drawn over the bars"
-        );
-        assert_eq!(buf[(0, 0)].symbol(), "T", "text is kept");
-        assert!((0..20).all(|x| buf[(x, 0)].bg == Color::Reset || x == 5), "the text row is not drawn on");
-        assert_eq!(buf[(5, 0)].bg, theme::c().selected, "selection untouched");
-        assert_eq!(buf[(6, 0)].symbol(), " ", "skipped (picture) cell untouched");
-        assert!((7..20).all(|x| buf[(x, 0)].symbol() == " "), "nothing between the words of a text row");
+        assert_eq!(buf[(10, 9 - full)].symbol(), EIGHTHS[part]);
+        assert!((0..10).any(|y| buf[(10, y)].fg == theme::c().viz_line), "the line is drawn over the bars");
+        assert_eq!(buf[(0, 9)].symbol(), "T", "text is kept");
+        assert_eq!(buf[(0, 9)].bg, Color::Reset, "and not changed");
+        assert_eq!(buf[(5, 9)].bg, theme::c().selected, "selection untouched");
+        assert_eq!(buf[(6, 9)].symbol(), " ", "skipped (picture) cell untouched");
 
         let mut quiet = Buffer::empty(Rect::new(0, 0, 20, 10));
         let area = quiet.area;
