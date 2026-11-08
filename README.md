@@ -89,6 +89,7 @@ selected song, so you do not need to remember the keys below.
 | `r` | Repeat: off, all, one |
 | `f` | Like / unlike the selected song (else the playing one) |
 | `T` | Theme picker (moving previews, Enter keeps, Esc goes back) |
+| `:`, `Ctrl+P` | Command palette: type what you want to do, Enter runs it |
 | `v` | Sound visualizer on / off |
 | `R` | Reload the list |
 | `q` | Quit (music keeps playing) |
@@ -148,17 +149,41 @@ saved in `~/.local/state/spotlite/state.json`.
 
 ### Themes
 
-`T` opens the theme picker. Seven themes are built in: **amber** (the default),
-**rose-pine**, **gruvbox**, **nord**, **catppuccin**, **tokyo-night** and **mono**. Each one
-sets the colours, a second accent for the gradient on the progress bar and the logo, the
-panel corners, the mark on the selected row, the logo character and the progress-bar
-characters. The background is always your terminal's own.
+`T` opens the theme picker: moving previews, Enter keeps, Esc goes back. Each of the seven
+built-in themes is a different design, not only different colours:
 
-A theme is one commented TOML file (see [`themes/`](themes/)). Your own themes go in
-`~/.config/spotlite/themes/<name>.toml`; a file with the name of a built-in theme replaces
-it. Keys you leave out take the amber value, and a typo or a bad value is reported, not
-ignored. A running spotlite reloads the theme when you save its file, so you can edit a
-theme and watch it change.
+| Theme | Idea | What makes it different |
+|-------|------|-------------------------|
+| **amber** (default) | Analog studio console | rounded panels, a knob on the progress bar, a VU-meter volume, a smooth wave visualizer |
+| **rose-pine** | Dreamy, floating | no lines at all, lowercase titles, pill tabs, star-dust visualizer, a drifting `∿` wave bar |
+| **gruvbox** | Retro 8-bit hardware | player on top, thick frames, UPPERCASE `[BRACKET]` tabs, inverse selection, chunky equalizer bars |
+| **nord** | Calm, minimal | thin rules instead of boxes, a big cover column on wide terminals, `❯` selection, a mirrored aurora |
+| **catppuccin** | Playful pastel | frames with a mauve-to-pink gradient, pill tabs, rainbow equalizer bars, a pulsing mark |
+| **tokyo-night** | Neon cyberpunk | glowing frames, powerline tabs, S P A C E D titles, a big cover column, a neon horizon |
+| **mono** | Paper and print | newspaper double rules, inverse selection, dotted track-list leaders, no visualizer, no motion |
+
+Animations (the playing mark, the glow, the moving wave) run only while music plays, at 4
+frames a second. `motion = false` in a theme, or `SPOTLITE_NO_MOTION=1`, turns them off.
+
+A theme is one commented TOML file (see [`themes/`](themes/)); every key has a comment with
+its choices. Your own themes go in `~/.config/spotlite/themes/<name>.toml`; a file with the
+name of a built-in theme replaces it. Keys you leave out take the amber value, and a typo or
+a bad value is an error that names the choices. A running spotlite reloads the theme when
+you save its file, so you can edit a theme and watch it change.
+
+| Key | Choices |
+|-----|---------|
+| `text` `bright` `muted` `faint` `border` `selected` `accent` `accent2` `red` `green` `viz_low` `viz_high` `viz_line` | colours, `"#rrggbb"` |
+| `layout` | `classic` (player at the bottom), `stage` (big cover column on terminals 140+ wide), `top` (player on top) |
+| `frame` / `frame_fx` / `corners` | `full`, `rule`, `none` / `plain`, `gradient`, `glow` / `rounded`, `plain`, `thick`, `double` |
+| `titles` | `normal`, `lower`, `upper`, `spaced` |
+| `header` / `nerd` | `plain`, `pills`, `brackets`, `powerline` / `true` for Nerd Font arrows |
+| `select` / `marker` | `bar`, `block`, `underline`, `arrow` / one character |
+| `viz` | `wave`, `bars`, `mirror`, `dots`, `none` |
+| `progress` / `bar` | `line`, `knob`, `blocks`, `wave` / two characters, filled then empty |
+| `volume` | `bar`, `leds` |
+| `playing` / `logo` / `bullet` | `eq`, `spin`, `pulse`, `logo` / one character / one character |
+| `leaders` / `motion` | `true` or `false` |
 
 The same from a shell, for scripts and AI agents:
 
@@ -168,16 +193,7 @@ spotlite theme set nord          use nord (a running spotlite changes within a s
 spotlite theme file nord         print nord's file, copying the built-in one there first
 spotlite theme new dusk nord     make "dusk" from nord, print its file
 spotlite theme check dusk        report mistakes in a theme file
-```
-
-```toml
-# ~/.config/spotlite/themes/dusk.toml (part)
-accent   = "#88c0d0"  # highlights, focused panel, start of the progress gradient
-accent2  = "#b48ead"  # end of the progress gradient
-corners  = "rounded"  # rounded, plain, thick or double
-marker   = "▍"        # one character before the selected row
-logo     = "◆"        # one character before "spotlite" and the playing song
-bar      = "━─"       # filled and empty parts of the progress bar
+SPOTLITE_THEME=gruvbox spotlite  try a theme for one run (this run saves no tabs or theme)
 ```
 
 ### Playlist folders

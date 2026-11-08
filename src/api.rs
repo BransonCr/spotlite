@@ -634,6 +634,12 @@ impl Spotify {
         self.send("PUT", "/me/player/repeat", &Self::with_device(device_id, vec![("state", state)]), None)
     }
 
+    /// The first song in the play queue (what plays next), if Spotify says.
+    pub fn up_next(&mut self) -> Result<Option<Track>> {
+        let v: Option<Value> = self.get("/me/player/queue", &[])?;
+        Ok(v.and_then(|mut v| v["queue"][0].take().pipe_track()))
+    }
+
     pub fn queue(&mut self, device_id: Option<&str>, uri: &str) -> Result<()> {
         self.send("POST", "/me/player/queue", &Self::with_device(device_id, vec![("uri", uri)]), None)
     }
@@ -656,6 +662,20 @@ impl Spotify {
     pub fn set_saved(&mut self, uri: &str, saved: bool) -> Result<()> {
         let method = if saved { "PUT" } else { "DELETE" };
         self.send(method, "/me/library", &[("uris", uri)], None)
+    }
+}
+
+trait PipeTrack {
+    fn pipe_track(self) -> Option<Track>;
+}
+
+impl PipeTrack for Value {
+    /// A queue entry as a track; an episode or null gives None.
+    fn pipe_track(self) -> Option<Track> {
+        if self.is_null() {
+            return None;
+        }
+        serde_json::from_value(self).ok()
     }
 }
 

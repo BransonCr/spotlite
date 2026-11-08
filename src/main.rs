@@ -7,6 +7,7 @@ mod control;
 mod folders;
 mod images;
 mod pages;
+mod palette;
 mod radio;
 mod state;
 mod theme;
@@ -195,6 +196,7 @@ fn run_tui() -> Result<()> {
     start_spotifyd();
     let can_like = api.has_scope("user-library-modify");
     let can_edit = api.has_scope("playlist-modify-private");
+    let can_taste = api.has_scope("user-top-read") && api.has_scope("user-read-recently-played");
     let device_name = api.config().device_name.clone();
     let (tx, msg_tx, rx) = worker::spawn(api);
     let mut terminal = ratatui::init();
@@ -218,12 +220,17 @@ fn run_tui() -> Result<()> {
         app.set_folders(tree);
     }
     let saved = state::load();
-    if let Some(name) = &saved.theme {
+    // SPOTLITE_THEME tries a theme for this run only (it is not saved).
+    let wanted = theme::env_override().or(saved.theme.clone());
+    if let Some(name) = &wanted {
         if let Err(e) = theme::apply(name) {
             app.error(e);
         }
     }
     app.restore(saved);
+    if !can_taste {
+        app.info("Run `spotlite auth` again to turn on Recent and a stronger discover.");
+    }
     // Refresh the folder tree in the background; the cached one shows meanwhile.
     if client::AVAILABLE {
         let folder_tx = msg_tx.clone();
@@ -258,6 +265,8 @@ fn run_tui() -> Result<()> {
                 Duration::from_millis(30)
             } else if app.animating() {
                 viz_frame
+            } else if app.moving() {
+                Duration::from_millis(250)
             } else {
                 Duration::from_secs(1)
             };
@@ -274,8 +283,11 @@ fn run_tui() -> Result<()> {
     app.viz.stop();
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
-    if let Err(e) = state::save(&app.saved_state()) {
-        eprintln!("spotlite: could not save the open tabs: {e:#}");
+    // A trial run (SPOTLITE_THEME) saves nothing, so it never replaces your tabs or theme.
+    if theme::env_override().is_none() {
+        if let Err(e) = state::save(&app.saved_state()) {
+            eprintln!("spotlite: could not save the open tabs: {e:#}");
+        }
     }
     if app.stop_services {
         stop_spotifyd();

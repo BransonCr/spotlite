@@ -1,26 +1,41 @@
-# spotlite theme “mono”: Monochrome: greys only, white for the accent, double lines.
+# spotlite theme “mono”: Paper and print: black and white, rules like a newspaper, inverse selection, dotted track-list leaders, stillness.
 #
 # Edit and save: a running spotlite shows the change within a second.
-# Colours are "#rrggbb". A key you leave out takes the value of the amber theme.
+# Check it: spotlite theme check mono   ·   Use it: spotlite theme set mono
+# A key you leave out takes the value of amber. A typo or a bad value is an error.
 # The background is your terminal's own (its opacity shows through).
 
-# Colours
+# Colours ("#rrggbb")
 text     = "#d0d0d0"  # song names, normal text
 bright   = "#ffffff"  # titles, the selected row
 muted    = "#8a8a8a"  # second lines, artists
-faint    = "#5a5a5a"  # hints, numbers, rules
-border   = "#3a3a3a"  # panel borders
-selected = "#262626"  # background of the selected row
-accent   = "#ffffff"  # highlights, focused panel, start of the progress gradient
-accent2  = "#8a8a8a"  # end of the progress gradient
-red      = "#c86464"  # errors, remove actions
+faint    = "#5a5a5a"  # hints, numbers
+border   = "#3a3a3a"  # panel lines
+selected = "#262626"  # selected row and pill background
+accent   = "#ffffff"  # highlights; start of gradients
+accent2  = "#8a8a8a"  # end of gradients (progress bar, logo, borders)
+red      = "#c86464"  # errors, remove, the top of the volume LEDs
 green    = "#a0a0a0"  # liked songs, the active device
-viz_low  = "#101010"  # visualizer bars, bottom shade
-viz_high = "#202020"  # visualizer bars, top shade
-viz_line = "#505050"  # visualizer line over the bars
+viz_low  = "#101010"  # visualizer, bottom shade; dark text on accent
+viz_high = "#202020"  # visualizer, top shade
+viz_line = "#505050"  # visualizer line and dots
 
-# Style
-corners  = "double"  # panel corners and lines: rounded, plain, thick or double
-marker   = "▌"  # one character before the selected row
-logo     = "♪"  # one character before "spotlite" and the playing song
-bar      = "■·"  # two characters: the filled and the empty part of the progress bar
+# Look and feel
+layout   = "classic"   # classic (player at the bottom) | stage (big cover column on wide terminals) | top (player at the top)
+frame    = "rule"      # full (four sides) | rule (a top line with the title) | none (space only)
+frame_fx = "plain"     # plain | gradient (lines run accent → accent2) | glow (lines breathe while music plays)
+corners  = "double"    # rounded | plain | thick | double
+titles   = "upper"     # normal | lower | upper | spaced (L I K E D)
+header   = "brackets"  # plain | pills | brackets | powerline
+nerd     = false       # true: Nerd Font glyphs (powerline arrows); ghostty and kitty have them built in
+select   = "block"     # bar (marker + soft background) | block (inverse) | underline | arrow (❯)
+marker   = "▌"         # one character before the selected row (select = bar or underline)
+viz      = "none"      # wave | bars | mirror | dots | none
+progress = "line"      # line | knob (●) | blocks (stepped gradient) | wave (moving ∿)
+bar      = "■·"        # two characters: filled and empty part of the progress and volume bars
+volume   = "bar"       # bar | leds (VU meter: green, accent, red)
+playing  = "logo"      # eq (▁▃▅▇) | spin (◐◓◑◒) | pulse (·•●) | logo (still)
+logo     = "¶"         # one character before "spotlite", in empty lists, and when paused
+bullet   = "—"         # one character between "artist · album" and the footer hints
+leaders  = true        # true: dots from each song title to the next column, like a printed track list
+motion   = false       # false: no animation (also: SPOTLITE_NO_MOTION=1)

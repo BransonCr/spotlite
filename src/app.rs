@@ -367,6 +367,9 @@ pub struct App {
     theme_watch: (Instant, Option<std::time::SystemTime>, Option<std::time::SystemTime>),
     pub menu: Option<Menu>,
     pub picker: Option<Picker>,
+    pub palette: Option<crate::palette::Palette>,
+    /// The song after the playing one, when Spotify said.
+    pub up_next: Option<Track>,
     pub confirm: Option<Confirm>,
     /// Liked Songs index for the radio filters; asked for once, when a radio opens.
     pub library: Option<Library>,
@@ -431,6 +434,8 @@ impl App {
             theme_watch: (Instant::now(), None, None),
             menu: None,
             picker: None,
+            palette: None,
+            up_next: None,
             confirm: None,
             library: None,
             library_asked: false,
@@ -646,18 +651,17 @@ impl App {
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
-        self.toast = Some(Toast {
-            text: text.into(),
-            error: false,
-            until: Instant::now() + Duration::from_secs(3),
-        });
+        let text = text.into();
+        // Long messages stay longer: about 4 s, plus a second for each 20 characters.
+        let secs = 4 + (text.chars().count() as u64 / 20).min(6);
+        self.toast = Some(Toast { text, error: false, until: Instant::now() + Duration::from_secs(secs) });
     }
 
     pub fn error(&mut self, text: impl Into<String>) {
         self.toast = Some(Toast {
             text: text.into(),
             error: true,
-            until: Instant::now() + Duration::from_secs(6),
+            until: Instant::now() + Duration::from_secs(8),
         });
     }
 
@@ -814,6 +818,17 @@ impl App {
         }
         self.load_more();
         self.watch_theme();
+        // The Liked index (♥ marks, radio filters) loads once the first lists are in, so it
+        // does not hold up what is on screen.
+        if !self.library_asked && self.user_id.is_some() && self.in_flight == 0 && !cfg!(test) {
+            self.library_asked = true;
+            self.send(Cmd::Library);
+        }
+    }
+
+    /// Music is playing and the theme moves: the loop wakes 4 times a second.
+    pub fn moving(&self) -> bool {
+        crate::theme::motion() && self.playback.as_ref().is_some_and(|pb| pb.is_playing && pb.item.is_some())
     }
 
     fn load_more(&mut self) {
@@ -936,6 +951,9 @@ impl App {
                         if uri.starts_with("spotify:track:") {
                             self.send(Cmd::CheckSaved(uri));
                         }
+                        // A new song: ask what comes after it.
+                        self.up_next = None;
+                        self.send(Cmd::UpNext);
                     }
                     Some(_) => {}
                     None => self.saved = None,
@@ -1045,6 +1063,7 @@ impl App {
                     o.tracks.state.select((len > 0).then_some(sel));
                 }
             }
+            Msg::UpNext(next) => self.up_next = next,
             Msg::Created => {
                 self.playlists.reset();
                 self.rebuild_rows();
@@ -1197,7 +1216,9 @@ impl App {
                 Page::Radio(r) => SavedTab::Radio { seed: r.seed.clone() },
             })
             .collect();
-        State { theme: Some(crate::theme::name()), tabs, active: self.active }
+        // A theme tried with SPOTLITE_THEME is not saved.
+        let theme = if crate::theme::env_override().is_some() { crate::state::load().theme } else { Some(crate::theme::name()) };
+        State { theme, tabs, active: self.active }
     }
 
     /// Opens the tabs of the last run. Nothing loads until a tab is shown.
@@ -1456,7 +1477,7 @@ impl App {
         match crate::theme::apply(name) {
             Ok(()) if keep => {
                 self.theme_before = None;
-                if !cfg!(test) {
+                if !cfg!(test) && crate::theme::env_override().is_none() {
                     let _ = crate::state::save(&self.saved_state());
                 }
                 self.theme_watch.2 = None;
@@ -1478,7 +1499,11 @@ impl App {
     /// Live reload, once a second: the theme file changed (an edit), or the saved theme name
     /// changed (`spotlite theme set`, from a shell or an AI agent).
     fn watch_theme(&mut self) {
-        if cfg!(test) || self.theme_watch.0.elapsed() < Duration::from_secs(1) || self.theme_before.is_some() {
+        if cfg!(test)
+            || self.theme_watch.0.elapsed() < Duration::from_secs(1)
+            || self.theme_before.is_some()
+            || crate::theme::env_override().is_some()
+        {
             return;
         }
         self.theme_watch.0 = Instant::now();
@@ -1645,6 +1670,28 @@ impl App {
             }
         } else if let Some(p) = self.picker.as_mut() {
             p.cursor = step(p.cursor.min(len - 1));
+        }
+    }
+
+    /// The palette's entries for its query (what the palette lists).
+    pub fn palette_entries(&self) -> Vec<crate::palette::Entry> {
+        let q = self.palette.as_ref().map(|p| p.query.clone()).unwrap_or_default();
+        crate::palette::filter(crate::palette::entries(self), &q)
+    }
+
+    fn move_palette(&mut self, delta: isize) {
+        let len = self.palette_entries().len();
+        if let Some(p) = self.palette.as_mut().filter(|_| len > 0) {
+            p.cursor = (p.cursor.min(len - 1) as isize + delta).rem_euclid(len as isize) as usize;
+        }
+    }
+
+    /// Runs the palette entry under the cursor: the palette closes, then its key runs.
+    pub fn run_palette(&mut self) {
+        let entries = self.palette_entries();
+        let Some(p) = self.palette.take() else { return };
+        if let Some(e) = entries.get(p.cursor.min(entries.len().saturating_sub(1))) {
+            self.on_key(e.event);
         }
     }
 
@@ -2047,11 +2094,17 @@ impl App {
             return;
         }
         // Pop-ups take the mouse while they are open; a click outside closes them.
-        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() {
+        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.palette.is_some() {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     let hit = self.hits.popup_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i);
                     match hit {
+                        Some(i) if self.palette.is_some() => {
+                            if let Some(p) = self.palette.as_mut() {
+                                p.cursor = i;
+                            }
+                            self.run_palette();
+                        }
                         Some(i) if self.menu.is_some() => {
                             if let Some(menu) = self.menu.as_mut() {
                                 menu.cursor = i;
@@ -2071,6 +2124,7 @@ impl App {
                         }
                         _ if !self.hits.popup.contains(pos) || self.confirm.is_some() => {
                             self.close_menu();
+                            self.palette = None;
                             self.picker = None;
                             self.confirm = None;
                         }
@@ -2207,6 +2261,30 @@ impl App {
             }
             return;
         }
+        if self.palette.is_some() {
+            match key.code {
+                KeyCode::Esc => self.palette = None,
+                KeyCode::Enter => self.run_palette(),
+                KeyCode::Down => self.move_palette(1),
+                KeyCode::Up => self.move_palette(-1),
+                KeyCode::Char('n') if ctrl => self.move_palette(1),
+                KeyCode::Char('p') if ctrl => self.move_palette(-1),
+                KeyCode::Backspace => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.query.pop();
+                        p.cursor = 0;
+                    }
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.query.push(c);
+                        p.cursor = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.picker.is_some() {
             match key.code {
                 KeyCode::Esc => self.picker = None,
@@ -2272,6 +2350,10 @@ impl App {
             return;
         }
         let page = 10;
+        if crate::palette::opens(&key) {
+            self.palette = Some(Default::default());
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('v') => {
@@ -2827,6 +2909,26 @@ mod tests {
         assert_eq!(crate::theme::name(), "gruvbox");
         assert_eq!(app.saved_state().theme.as_deref(), Some("gruvbox"));
         crate::theme::apply("amber").unwrap();
+    }
+
+    #[test]
+    fn palette_finds_and_runs_actions() {
+        let (mut app, _rx) = test_app();
+        app.on_key(KeyEvent::from(KeyCode::Char(':')));
+        assert!(app.palette.is_some());
+        for c in "liked".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(app.palette_entries()[0].label, "Go to Liked");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.palette.is_none());
+        assert_eq!(app.view(), View::Liked);
+        // Ctrl+P opens it too; Esc closes it and does nothing.
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.palette.is_some());
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.palette.is_none());
+        assert_eq!(app.view(), View::Liked);
     }
 
     #[test]

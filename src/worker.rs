@@ -38,6 +38,8 @@ pub enum Cmd {
     Queue { uri: String, name: String },
     CheckSaved(String),
     SetSaved { uri: String, saved: bool },
+    /// What plays next (for the player's "next" line).
+    UpNext,
     /// Likes a song, or unlikes it if it is liked (asks Spotify which first).
     ToggleSaved(String),
     /// A new private playlist with these songs.
@@ -84,6 +86,7 @@ pub enum Msg {
     Removed { playlist_id: String, uri: String },
     /// A track was added to a playlist.
     Added { playlist_id: String },
+    UpNext(Option<Track>),
     /// A playlist was created: the Playlists tab loads again.
     Created,
     /// Sent after every command.
@@ -210,9 +213,17 @@ impl Worker {
             Cmd::Volume(pct) => self.player(|api, dev| api.set_volume(dev, pct)),
             Cmd::Shuffle(on) => self.player(|api, dev| api.set_shuffle(dev, on)),
             Cmd::Repeat(state) => self.player(|api, dev| api.set_repeat(dev, state)),
+            Cmd::UpNext => {
+                let next = self.api.up_next()?;
+                self.send(Msg::UpNext(next));
+                Ok(())
+            }
             Cmd::Queue { uri, name } => {
                 self.player(|api, dev| api.queue(dev, &uri))?;
                 self.send(Msg::Info(format!("Added to queue: {name}")));
+                if let Ok(next) = self.api.up_next() {
+                    self.send(Msg::UpNext(next));
+                }
                 Ok(())
             }
             Cmd::CheckSaved(uri) => {

@@ -1,26 +1,41 @@
-# spotlite theme “tokyo-night”: Tokyo Night: deep navy, electric blue that shifts to purple, neon bars.
+# spotlite theme “tokyo-night”: Neon cyberpunk: glowing frames, powerline tabs, S P A C E D titles, a cover on stage, a neon horizon.
 #
 # Edit and save: a running spotlite shows the change within a second.
-# Colours are "#rrggbb". A key you leave out takes the value of the amber theme.
+# Check it: spotlite theme check tokyo-night   ·   Use it: spotlite theme set tokyo-night
+# A key you leave out takes the value of amber. A typo or a bad value is an error.
 # The background is your terminal's own (its opacity shows through).
 
-# Colours
+# Colours ("#rrggbb")
 text     = "#c0caf5"  # song names, normal text
 bright   = "#e0e6ff"  # titles, the selected row
 muted    = "#9aa5ce"  # second lines, artists
-faint    = "#565f89"  # hints, numbers, rules
-border   = "#292e42"  # panel borders
-selected = "#24283b"  # background of the selected row
-accent   = "#7aa2f7"  # highlights, focused panel, start of the progress gradient
-accent2  = "#bb9af7"  # end of the progress gradient
-red      = "#f7768e"  # errors, remove actions
+faint    = "#565f89"  # hints, numbers
+border   = "#292e42"  # panel lines
+selected = "#24283b"  # selected row and pill background
+accent   = "#7aa2f7"  # highlights; start of gradients
+accent2  = "#bb9af7"  # end of gradients (progress bar, logo, borders)
+red      = "#f7768e"  # errors, remove, the top of the volume LEDs
 green    = "#9ece6a"  # liked songs, the active device
-viz_low  = "#16161e"  # visualizer bars, bottom shade
-viz_high = "#24283b"  # visualizer bars, top shade
-viz_line = "#3d59a1"  # visualizer line over the bars
+viz_low  = "#16161e"  # visualizer, bottom shade; dark text on accent
+viz_high = "#24283b"  # visualizer, top shade
+viz_line = "#7dcfff"  # visualizer line and dots
 
-# Style
-corners  = "rounded"  # panel corners and lines: rounded, plain, thick or double
-marker   = "┃"  # one character before the selected row
-logo     = "★"  # one character before "spotlite" and the playing song
-bar      = "▰▱"  # two characters: the filled and the empty part of the progress bar
+# Look and feel
+layout   = "stage"     # classic (player at the bottom) | stage (big cover column on wide terminals) | top (player at the top)
+frame    = "full"      # full (four sides) | rule (a top line with the title) | none (space only)
+frame_fx = "glow"      # plain | gradient (lines run accent → accent2) | glow (lines breathe while music plays)
+corners  = "rounded"   # rounded | plain | thick | double
+titles   = "spaced"    # normal | lower | upper | spaced (L I K E D)
+header   = "powerline" # plain | pills | brackets | powerline
+nerd     = true        # true: Nerd Font glyphs (powerline arrows); ghostty and kitty have them built in
+select   = "arrow"     # bar (marker + soft background) | block (inverse) | underline | arrow (❯)
+marker   = "┃"         # one character before the selected row (select = bar or underline)
+viz      = "mirror"    # wave | bars | mirror | dots | none
+progress = "blocks"    # line | knob (●) | blocks (stepped gradient) | wave (moving ∿)
+bar      = "▰▱"        # two characters: filled and empty part of the progress and volume bars
+volume   = "leds"      # bar | leds (VU meter: green, accent, red)
+playing  = "spin"      # eq (▁▃▅▇) | spin (◐◓◑◒) | pulse (·•●) | logo (still)
+logo     = "★"         # one character before "spotlite", in empty lists, and when paused
+bullet   = "╱"         # one character between "artist · album" and the footer hints
+leaders  = false       # true: dots from each song title to the next column, like a printed track list
+motion   = true        # false: no animation (also: SPOTLITE_NO_MOTION=1)
