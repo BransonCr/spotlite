@@ -1596,7 +1596,7 @@ impl App {
                     let _ = crate::state::save(&self.saved_state());
                 }
                 self.theme_watch.2 = None;
-                self.info(format!("Theme {name}. To change it: spotlite theme file {name}"));
+                self.info(format!("Theme: {name}"));
             }
             Ok(()) => {}
             Err(e) => self.error(e),

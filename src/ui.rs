@@ -129,21 +129,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let (header, mut body, now, footer) = if t.layout == theme::Layout::Top {
         let [header, _, now, body, footer] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1 - gap()),
             Constraint::Length(player),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
+        .spacing(gap())
         .areas(full);
         (header, body, now, footer)
     } else {
         let [header, _, body, now, footer] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1 - gap()),
             Constraint::Min(5),
             Constraint::Length(player),
             Constraint::Length(1),
         ])
+        .spacing(gap())
         .areas(full);
         (header, body, now, footer)
     };
@@ -230,15 +232,23 @@ fn fit_line(line: Line<'static>, width: usize) -> Line<'static> {
 }
 
 /// " ‹ Name " for a page title; records the back button.
-fn page_title(app: &mut App, area: Rect, name: &str, kind: &str) -> Line<'static> {
-    let room = (area.width as usize).saturating_sub(kind.width() + 18);
+/// The title of a page's list: "‹ Back · Radio". The name is in the page header above, so it
+/// is not repeated here. The whole title is the back button.
+fn page_title(app: &mut App, area: Rect, kind: &str) -> Line<'static> {
+    let t = theme::c();
     let line = Line::from(vec![
         Span::styled(" ‹ ", theme::accent()),
-        Span::styled(format!("{} ", theme::title(kind)), theme::muted()),
-        Span::styled(format!("{} ", fit(name, room)), theme::bright()),
+        Span::styled(theme::title("Back"), theme::muted()),
+        Span::styled(format!(" {} ", t.bullet), theme::faint()),
+        Span::styled(format!("{} ", theme::title(kind)), theme::bright()),
     ]);
     app.hits.back = span_rect(area, title_x(area), line.width() as u16);
     line
+}
+
+/// Rows between parts of the screen: one when panels have no lines (else they run together).
+fn gap() -> u16 {
+    u16::from(theme::c().frame == theme::Frame::None)
 }
 
 /// Where a panel's title starts: after the left line, if the frame has one.
@@ -261,7 +271,7 @@ fn draw_page_header(f: &mut Frame, images: &mut Images, area: Rect, cover: &[Ima
 fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(Page::Artist(page)) = app.page() else { return };
     let name = page.name.clone();
-    let title = page_title(app, area, &name, "Artist");
+    let title = page_title(app, area, "Artist");
     let block = panel().title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -382,7 +392,7 @@ fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_album(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(Page::Album(page)) = app.page() else { return };
     let album = page.album.clone();
-    let [head, list] = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).areas(area);
+    let [head, list] = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).spacing(gap()).areas(area);
     let block = panel();
     let inner = block.inner(head);
     f.render_widget(block, head);
@@ -398,7 +408,7 @@ fn draw_album(f: &mut Frame, app: &mut App, area: Rect) {
             Line::from(Span::styled("⏎ play from a song · P play the album · . more", theme::faint())),
         ],
     );
-    let title = page_title(app, list, &album.name, "Album");
+    let title = page_title(app, list, "Album songs");
     draw_tracks(f, app, list, title, "This album has no songs.");
 }
 
@@ -418,7 +428,7 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: Rect) {
     let artist_seed = seed.uri.starts_with("spotify:artist:");
     let filters = crate::pages::active_filters(&page.filters);
     let (kept, total, error) = (page.tracks.items.len(), page.total(), page.error.clone());
-    let [head, list] = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).areas(area);
+    let [head, list] = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).spacing(gap()).areas(area);
     let block = panel();
     let inner = block.inner(head);
     f.render_widget(block, head);
@@ -467,7 +477,7 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: Rect) {
             filter_line,
         ],
     );
-    let title = page_title(app, list, &seed.name, "Radio:");
+    let title = page_title(app, list, if artist_seed { "Artist radio" } else { "Song radio" });
     let empty = match &error {
         Some(e) => format!("Spotify gave no radio: {e}"),
         None if discover && digging => "Finding new songs…".into(),
@@ -972,9 +982,12 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
 /// One tab in the header, in the theme's header style. `key` is its number key (faint).
 fn tab_chip(key: Option<usize>, glyph: Option<char>, label: &str, count: Option<usize>, active: bool) -> Vec<Span<'static>> {
     let t = theme::c();
-    let label = match t.titles {
-        theme::Titles::Spaced => label.to_uppercase(),
-        _ => theme::title(label),
+    // spotlite's own tab names take the theme's letter case; a page's name (a song, an
+    // artist) is shown as written.
+    let label = match (glyph, t.titles) {
+        (Some(_), _) => label.to_owned(),
+        (None, theme::Titles::Spaced) => label.to_uppercase(),
+        (None, _) => theme::title(label),
     };
     let count = count.map(|n| format!(" {n}")).unwrap_or_default();
     let glyph = glyph.map(|g| format!("{g} ")).unwrap_or_default();
@@ -1441,7 +1454,8 @@ fn draw_table(
                     theme::Select::Block => {
                         cell.set_fg(t.viz_low);
                     }
-                    theme::Select::Underline if cell.symbol() != " " && x > inner.x + 1 => {
+                    // Only the name (text-coloured cells), not the number, artist or time.
+                    theme::Select::Underline if x > inner.x && (cell.fg == t.text || cell.fg == t.accent) => {
                         cell.set_fg(t.bright);
                         cell.modifier.insert(Modifier::UNDERLINED);
                     }
