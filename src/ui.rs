@@ -1,5 +1,5 @@
 use crate::api::{pick_image, ImageRef, Playlist, Track};
-use crate::app::{Action, App, Hits, Listing, Row as PlRow, Tab, View};
+use crate::app::{Action, App, Hits, Listing, Loc, Row as PlRow, Tab, View};
 use crate::pages::{ArtistRow, Page};
 use crate::images::Images;
 use crate::viz;
@@ -172,7 +172,7 @@ fn draw_page_header(f: &mut Frame, images: &mut Images, area: Rect, cover: &[Ima
 }
 
 fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
-    let Some(Page::Artist(page)) = app.pages.last() else { return };
+    let Some(Page::Artist(page)) = app.page() else { return };
     let name = page.name.clone();
     let title = page_title(app, area, &name, "Artist");
     let block = panel().title(title);
@@ -181,7 +181,7 @@ fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
     // No gap under the header: the first section title has a blank line of its own.
     let [head, list] = Layout::vertical([Constraint::Length(5), Constraint::Min(2)]).areas(inner);
 
-    let Some(Page::Artist(page)) = app.pages.last_mut() else { return };
+    let Some(Page::Artist(page)) = app.active.and_then(|i| app.pages.get_mut(i)) else { return };
     let tracks = page.count(|r| matches!(r, ArtistRow::Track(_)));
     let singles = page.count(|r| matches!(r, ArtistRow::Album(a) if a.album_type.as_deref() == Some("single")));
     let albums = page.count(|r| matches!(r, ArtistRow::Album(_))) - singles;
@@ -292,7 +292,7 @@ fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_album(f: &mut Frame, app: &mut App, area: Rect) {
-    let Some(Page::Album(page)) = app.pages.last() else { return };
+    let Some(Page::Album(page)) = app.page() else { return };
     let album = page.album.clone();
     let [head, list] = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).areas(area);
     let block = panel();
@@ -316,7 +316,7 @@ fn draw_album(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// "Artist · " for the album page (from its first track), or nothing.
 fn album_artists(app: &App) -> String {
-    let Some(Page::Album(page)) = app.pages.last() else { return String::new() };
+    let Some(Page::Album(page)) = app.page() else { return String::new() };
     page.tracks
         .items
         .first()
@@ -325,7 +325,7 @@ fn album_artists(app: &App) -> String {
 }
 
 fn draw_radio(f: &mut Frame, app: &mut App, area: Rect) {
-    let Some(Page::Radio(page)) = app.pages.last() else { return };
+    let Some(Page::Radio(page)) = app.page() else { return };
     let seed = page.seed.clone();
     let artist_seed = seed.uri.starts_with("spotify:artist:");
     let filters = crate::pages::active_filters(&page.filters);
@@ -334,6 +334,7 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: Rect) {
     let block = panel();
     let inner = block.inner(head);
     f.render_widget(block, head);
+    let (discover, round, digging) = (page.filters.discover, page.round, page.digging);
     let filter_line = if filters.is_empty() {
         Line::from(vec![Span::styled("No filters", theme::faint()), Span::styled("  ·  F to filter", theme::faint())])
     } else {
@@ -353,20 +354,36 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(if artist_seed { "Artist radio  " } else { "Song radio  " }, theme::muted()),
                 Span::styled(seed.name.clone(), theme::bright()),
             ]),
-            Line::from(Span::styled(
-                if artist_seed {
-                    "Songs like this artist's · picked by Spotify for you".to_owned()
-                } else {
-                    format!("Similar to {} · picked by Spotify for you", seed.artist_names())
-                },
-                theme::muted(),
-            )),
+            if discover {
+                Line::from(vec![
+                    Span::styled(format!("Discover · round {round}"), theme::accent().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        if digging {
+                            "  ·  finding new songs…".to_owned()
+                        } else {
+                            "  ·  nothing from your Liked Songs, shuffled  ·  d for new songs".to_owned()
+                        },
+                        theme::muted(),
+                    ),
+                ])
+            } else {
+                Line::from(Span::styled(
+                    if artist_seed {
+                        "Songs like this artist's · picked by Spotify for you  ·  d to discover".to_owned()
+                    } else {
+                        format!("Similar to {} · picked by Spotify for you  ·  d to discover", seed.artist_names())
+                    },
+                    theme::muted(),
+                ))
+            },
             filter_line,
         ],
     );
     let title = page_title(app, list, &seed.name, "Radio:");
     let empty = match &error {
         Some(e) => format!("Spotify gave no radio: {e}"),
+        None if discover && digging => "Finding new songs…".into(),
+        None if discover => "No new songs left. Press d for another round, or F to change the filters.".into(),
         None if total > 0 => "No songs pass the filters. Press F to change them.".into(),
         None => "Asking Spotify for the radio…".into(),
     };
@@ -611,23 +628,44 @@ fn count_label<T>(l: &Listing<T>) -> String {
 fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     let mut left = vec![Span::styled("♪ spotlite", theme::accent().add_modifier(Modifier::BOLD)), Span::raw("   ")];
     let mut x = area.x + Line::from(left.clone()).width() as u16;
+    let on = Style::new().fg(BRIGHT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     for tab in Tab::ALL {
         let count = match tab {
             Tab::Search => None,
             Tab::Playlists => app.playlists.total,
             Tab::Liked => app.liked.total,
         };
-        let style = if tab == app.tab {
-            Style::new().fg(BRIGHT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            theme::muted()
-        };
+        let style = if app.active.is_none() && tab == app.tab { on } else { theme::muted() };
         let mut spans = vec![Span::styled(tab.title(), style)];
         if let Some(n) = count {
             spans.push(Span::styled(format!(" {n}"), theme::faint()));
         }
         let w = Line::from(spans.clone()).width() as u16;
-        app.hits.tabs.push((span_rect(area, x, w), tab));
+        app.hits.tabs.push((span_rect(area, x, w), Loc::Base(tab)));
+        x += w + 3;
+        left.extend(spans);
+        left.push(Span::raw("   "));
+    }
+    // Open pages, after a rule. Those that do not fit show as "+N" (keys and H/L still reach them).
+    if !app.pages.is_empty() {
+        left.push(Span::styled("│  ", theme::faint()));
+        x += 3;
+    }
+    // Room for the device dot.
+    let end = area.x + area.width.saturating_sub(3);
+    let n = app.pages.len();
+    for i in 0..n {
+        let (kind, name) = app.pages[i].title();
+        let name = if name.is_empty() { "…".to_owned() } else { fit(name, 18) };
+        let style = if app.active == Some(i) { on } else { theme::muted() };
+        let spans = vec![Span::styled(format!("{kind} "), theme::faint()), Span::styled(name, style)];
+        let w = Line::from(spans.clone()).width() as u16;
+        let more = n - i;
+        if x + w + if more > 1 { 5 } else { 0 } > end {
+            left.push(Span::styled(format!("+{more}"), theme::faint()));
+            break;
+        }
+        app.hits.tabs.push((span_rect(area, x, w), Loc::Page(app.pages[i].key())));
         x += w + 3;
         left.extend(spans);
         left.push(Span::raw("   "));
@@ -714,7 +752,7 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
         View::Search => Some(&mut app.search),
         View::Liked => Some(&mut app.liked),
         View::Playlist => app.open.as_mut().map(|o| &mut o.tracks),
-        View::Album | View::Radio => match app.pages.last_mut() {
+        View::Album | View::Radio => match app.active.and_then(|i| app.pages.get_mut(i)) {
             Some(Page::Album(a)) => Some(&mut a.tracks),
             Some(Page::Radio(r)) => Some(&mut r.tracks),
             _ => None,
@@ -1117,9 +1155,9 @@ fn hints(app: &App) -> &'static [(&'static str, &'static str)] {
         View::Playlists => &[("⏎", "open"), ("P", "play all"), ("esc", "up"), ("␣", "pause"), ("?", "help")],
         View::Playlist => &[("⏎", "play"), (".", "actions"), ("e", "add to…"), ("D", "remove"), ("esc", "back"), ("?", "help")],
         View::Liked => &[("⏎", "play"), (".", "actions"), ("i", "artist"), ("o", "radio"), ("c", "playing"), ("?", "help")],
-        View::Artist => &[("⏎", "play / open"), ("tab", "section"), ("o", "radio"), ("esc", "back"), ("?", "help")],
-        View::Album => &[("⏎", "play"), ("P", "play album"), (".", "actions"), ("esc", "back"), ("?", "help")],
-        View::Radio => &[("⏎", "play"), ("F", "filters"), (".", "actions"), ("esc", "back"), ("?", "help")],
+        View::Artist => &[("⏎", "play / open"), ("tab", "section"), ("H L", "tabs"), ("x", "close"), ("esc", "back"), ("?", "help")],
+        View::Album => &[("⏎", "play"), ("P", "play album"), (".", "actions"), ("x", "close"), ("esc", "back"), ("?", "help")],
+        View::Radio => &[("⏎", "play"), ("d", "discover"), ("F", "filters"), ("x", "close"), ("esc", "back"), ("?", "help")],
     }
 }
 
@@ -1151,11 +1189,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 /// Help, in sections; drawn in two columns.
 const HELP: &[(&str, &[(&str, &str)])] = &[
     ("Move", &[
-        ("1 2 3, tab", "switch tab"),
+        ("1-9, tab", "go to tab"),
+        ("H L", "previous, next tab"),
+        ("x", "close an artist, album, radio tab"),
         ("tab", "next section (artist page)"),
         ("j k, ↑ ↓", "move"),
         ("g G, ^d ^u", "top, bottom, page"),
-        ("esc, h", "back"),
+        ("esc, h", "back to the last tab"),
         ("c", "jump to the playing song"),
         ("/", "search"),
     ]),
@@ -1177,7 +1217,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("Other", &[
         ("+ -  m", "volume, mute"),
-        ("F", "radio filters"),
+        ("F  d", "radio filters, discover"),
         ("v", "sound visualizer"),
         ("R", "reload the list"),
         ("q  Q", "quit, quit + stop spotifyd"),

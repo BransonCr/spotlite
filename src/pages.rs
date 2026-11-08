@@ -1,8 +1,12 @@
-//! Pages that open on top of the tabs: an artist, an album, a song radio. Esc goes back.
+//! Pages that open in their own tabs: an artist, an album, a song radio. Esc goes back to the
+//! tab you came from; the page stays open until you close it (`x`).
 
 use crate::api::{Album, Artist, Named, Track};
 use crate::app::Listing;
 use crate::radio::{self, Era, Fame, Filters, Library, RadioTrack};
+use rand::seq::SliceRandom;
+use rand::Rng;
+use std::collections::{HashMap, HashSet};
 
 pub enum ArtistRow {
     /// A section title ("Popular", "Radio", "Albums", ...). The cursor skips it.
@@ -185,19 +189,101 @@ pub struct RadioPage {
     pub filters: Filters,
     /// The radio tracks that pass the filters.
     pub tracks: Listing<Track>,
+    /// Discover mode: songs from the radios of songs it found (added to the pool each round).
+    pub extra: Vec<RadioTrack>,
+    /// Songs shown in earlier rounds; a new round leaves them out.
+    pub seen: HashSet<String>,
+    /// Shuffled place of each pool song in the discover list.
+    pub rank: HashMap<String, u32>,
+    pub round: u32,
+    /// A round is waiting for Spotify.
+    pub digging: bool,
 }
+
+/// Songs whose radios a discover round adds.
+const DIG_SEEDS: usize = 4;
 
 impl RadioPage {
     pub fn new(seed: Track) -> Self {
         let mut tracks = Listing::default();
         tracks.loading = true;
-        RadioPage { seed, radio: None, error: None, filters: Filters::default(), tracks }
+        RadioPage {
+            seed,
+            radio: None,
+            error: None,
+            filters: Filters::default(),
+            tracks,
+            extra: Vec::new(),
+            seen: HashSet::new(),
+            rank: HashMap::new(),
+            round: 0,
+            digging: false,
+        }
+    }
+
+    /// Starts a discover round: the songs on screen now count as heard, the pool is shuffled
+    /// again, and the songs whose radios to add come back (none until the radio has loaded).
+    pub fn next_round(&mut self, library: &Library) -> Vec<String> {
+        let Some((seed, all)) = &self.radio else { return Vec::new() };
+        let mut rng = rand::thread_rng();
+        let shown: Vec<String> = self.tracks.items.iter().map(|t| t.uri.clone()).collect();
+        // Dig from songs you do not know; on the first round the plain radio is on screen.
+        let mut seeds: Vec<String> = if self.filters.discover {
+            shown.clone()
+        } else {
+            radio::discover(all, seed, &self.filters, library, &self.seen, &HashMap::new())
+                .into_iter()
+                .map(|t| t.uri)
+                .collect()
+        };
+        if self.filters.discover {
+            self.seen.extend(shown);
+        }
+        seeds.shuffle(&mut rng);
+        seeds.truncate(DIG_SEEDS);
+        self.filters.discover = true;
+        self.round += 1;
+        self.digging = !seeds.is_empty();
+        self.reshuffle();
+        self.refilter(library);
+        seeds
+    }
+
+    /// Adds songs that a round's radios brought.
+    pub fn add_found(&mut self, found: Vec<RadioTrack>, library: &Library) {
+        self.digging = false;
+        let mut have: HashSet<String> = self.extra.iter().map(|t| t.uri.clone()).collect();
+        if let Some((_, all)) = &self.radio {
+            have.extend(all.iter().map(|t| t.uri.clone()));
+        }
+        self.extra.extend(found.into_iter().filter(|t| have.insert(t.uri.clone())));
+        self.reshuffle();
+        self.refilter(library);
+    }
+
+    /// Ends discover mode: back to the plain radio.
+    pub fn stop_discover(&mut self) {
+        self.filters.discover = false;
+        self.seen.clear();
+        self.round = 0;
+        self.digging = false;
+    }
+
+    fn reshuffle(&mut self) {
+        let mut rng = rand::thread_rng();
+        let pool = self.radio.iter().flat_map(|(_, all)| all.iter()).chain(self.extra.iter());
+        self.rank = pool.map(|t| (t.uri.clone(), rng.gen())).collect();
     }
 
     /// Applies the filters again (after a filter change or when Liked Songs arrive).
     pub fn refilter(&mut self, library: &Library) {
         let Some((seed, all)) = &self.radio else { return };
-        let kept = radio::apply(all, seed, &self.filters, library);
+        let kept = if self.filters.discover {
+            let pool: Vec<RadioTrack> = all.iter().chain(self.extra.iter()).cloned().collect();
+            radio::discover(&pool, seed, &self.filters, library, &self.seen, &self.rank)
+        } else {
+            radio::apply(all, seed, &self.filters, library)
+        };
         let sel = self.tracks.selected();
         self.tracks.items = kept.iter().map(RadioTrack::to_track).collect();
         self.tracks.total = Some(self.tracks.items.len());
@@ -206,14 +292,17 @@ impl RadioPage {
         self.tracks.state.select((len > 0).then_some(sel.min(len.saturating_sub(1))));
     }
 
+    /// Songs in the pool: the radio, and in discover mode the songs its rounds found.
     pub fn total(&self) -> usize {
-        self.radio.as_ref().map_or(0, |(_, all)| all.len())
+        let extra = if self.filters.discover { self.extra.len() } else { 0 };
+        self.radio.as_ref().map_or(0, |(_, all)| all.len()) + extra
     }
 }
 
 /// The radio filter menu: one entry per filter, with its current state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterItem {
+    Discover,
     NewOnly,
     NewArtists,
     NoExplicit,
@@ -225,7 +314,8 @@ pub enum FilterItem {
 }
 
 impl FilterItem {
-    pub const ALL: [FilterItem; 8] = [
+    pub const ALL: [FilterItem; 9] = [
+        FilterItem::Discover,
         FilterItem::NewOnly,
         FilterItem::NewArtists,
         FilterItem::NoExplicit,
@@ -240,6 +330,7 @@ impl FilterItem {
     pub fn describe(self, f: &Filters) -> (&'static str, String) {
         let on = |b: bool| if b { "on" } else { "off" }.to_owned();
         match self {
+            FilterItem::Discover => ("Discover new music", if f.discover { "on · again" } else { "off" }.into()),
             FilterItem::NewOnly => ("Hide songs in Liked Songs", on(f.new_only)),
             FilterItem::NewArtists => ("Hide artists in Liked Songs", on(f.new_artists)),
             FilterItem::NoExplicit => ("Hide explicit songs", on(f.no_explicit)),
@@ -270,9 +361,10 @@ impl FilterItem {
         }
     }
 
-    /// Changes the filter to its next value.
+    /// Changes the filter to its next value. (Discover runs a round instead: see RadioPage.)
     pub fn step(self, f: &mut Filters) {
         match self {
+            FilterItem::Discover => f.discover = true,
             FilterItem::NewOnly => f.new_only = !f.new_only,
             FilterItem::NewArtists => f.new_artists = !f.new_artists,
             FilterItem::NoExplicit => f.no_explicit = !f.no_explicit,
@@ -311,6 +403,7 @@ pub fn active_filters(f: &Filters) -> Vec<String> {
             let (label, value) = i.describe(f);
             let (_, default) = i.describe(&Filters::default());
             (value != default).then(|| match i {
+                FilterItem::Discover => "discover".to_owned(),
                 FilterItem::NewOnly => "new songs".to_owned(),
                 FilterItem::NewArtists => "new artists".to_owned(),
                 FilterItem::NoExplicit => "clean".to_owned(),
@@ -321,11 +414,31 @@ pub fn active_filters(f: &Filters) -> Vec<String> {
         .collect()
 }
 
-/// A page on top of the tabs.
+/// A page in its own tab.
 pub enum Page {
     Artist(ArtistPage),
     Album(AlbumPage),
     Radio(Box<RadioPage>),
+}
+
+impl Page {
+    /// One tab per artist, album and radio seed: opening it again goes to the open tab.
+    pub fn key(&self) -> String {
+        match self {
+            Page::Artist(a) => format!("artist:{}", a.id),
+            Page::Album(a) => format!("album:{}", a.id),
+            Page::Radio(r) => format!("radio:{}", r.seed.uri),
+        }
+    }
+
+    /// Kind and name, for the tab bar.
+    pub fn title(&self) -> (&'static str, &str) {
+        match self {
+            Page::Artist(a) => ("Artist", &a.name),
+            Page::Album(a) => ("Album", &a.album.name),
+            Page::Radio(r) => ("Radio", &r.seed.name),
+        }
+    }
 }
 
 #[cfg(test)]

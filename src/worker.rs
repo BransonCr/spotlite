@@ -41,6 +41,8 @@ pub enum Cmd {
     Album(String),
     /// Song radio for a track URI (runs on its own thread: it takes about 2 s).
     Radio(String),
+    /// Discover mode: the radios of `seeds` together, for the radio of `radio`.
+    RadioMore { radio: String, seeds: Vec<String> },
     /// Every Liked Songs track and artist, for the radio filters.
     Library,
     AddToPlaylist { playlist_id: String, playlist: String, uris: Vec<String>, what: String },
@@ -66,6 +68,7 @@ pub enum Msg {
     Artist { artist: Artist, top: Vec<Track>, albums: Vec<Album> },
     Album(Album),
     Radio { seed: String, result: Result<(RadioTrack, Vec<RadioTrack>), String> },
+    RadioMore { radio: String, result: Result<Vec<RadioTrack>, String> },
     Library(Library),
     /// Loading a page (artist id, album id or radio seed) failed; it shows the error.
     PageFailed { id: String, error: String },
@@ -236,6 +239,14 @@ impl Worker {
                 thread::Builder::new().name("spotlite-radio".into()).spawn(move || {
                     let result = crate::radio::fetch(&seed).map_err(|e| format!("{e:#}"));
                     let _ = tx.send(Msg::Radio { seed, result });
+                })?;
+                Ok(())
+            }
+            Cmd::RadioMore { radio, seeds } => {
+                let tx = self.tx.clone();
+                thread::Builder::new().name("spotlite-radio".into()).spawn(move || {
+                    let result = crate::radio::fetch_more(&seeds).map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::RadioMore { radio, result });
                 })?;
                 Ok(())
             }

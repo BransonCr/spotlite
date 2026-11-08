@@ -47,10 +47,6 @@ impl Tab {
             Tab::Liked => "Liked",
         }
     }
-
-    fn index(self) -> usize {
-        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
-    }
 }
 
 /// A paged list with its own selection and scroll position.
@@ -142,6 +138,18 @@ pub struct OpenPlaylist {
     pub tracks: Listing<Track>,
 }
 
+/// A place in the tab bar: a fixed tab, or an open page (by its key).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Loc {
+    Base(Tab),
+    Page(String),
+}
+
+/// Open page tabs at most; opening one more closes the oldest.
+pub const MAX_PAGES: usize = 8;
+/// Back steps kept.
+const HISTORY: usize = 50;
+
 /// What the main panel shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -194,7 +202,7 @@ pub struct Confirm {
 /// Where clickable things were drawn in the last frame (filled by ui::draw).
 #[derive(Default, Debug)]
 pub struct Hits {
-    pub tabs: Vec<(Rect, Tab)>,
+    pub tabs: Vec<(Rect, Loc)>,
     pub search_box: Rect,
     /// Rows of the current list (header excluded).
     pub list: Rect,
@@ -294,8 +302,12 @@ pub struct App {
     seek_hold: Option<Instant>,
     /// A poll was asked for while one was already running.
     repoll: bool,
-    /// Artist, album and radio pages opened on top of the tabs (Esc goes back).
+    /// Artist, album and radio pages, each in its own tab after Search, Playlists and Liked.
     pub pages: Vec<Page>,
+    /// The page tab shown; None shows `tab`.
+    pub active: Option<usize>,
+    /// Where you were before, for Esc (newest last).
+    history: Vec<Loc>,
     pub menu: Option<Menu>,
     pub picker: Option<Picker>,
     pub confirm: Option<Confirm>,
@@ -352,6 +364,8 @@ impl App {
             seek_hold: None,
             repoll: false,
             pages: Vec::new(),
+            active: None,
+            history: Vec::new(),
             menu: None,
             picker: None,
             confirm: None,
@@ -585,7 +599,7 @@ impl App {
     }
 
     pub fn view(&self) -> View {
-        match self.pages.last() {
+        match self.page() {
             Some(Page::Artist(_)) => return View::Artist,
             Some(Page::Album(_)) => return View::Album,
             Some(Page::Radio(_)) => return View::Radio,
@@ -601,7 +615,7 @@ impl App {
 
     /// Track list of the current view, if it shows tracks.
     pub fn tracks(&self) -> Option<&Listing<Track>> {
-        match (self.view(), self.pages.last()) {
+        match (self.view(), self.page()) {
             (View::Album, Some(Page::Album(a))) => Some(&a.tracks),
             (View::Radio, Some(Page::Radio(r))) => Some(&r.tracks),
             (View::Search, _) => Some(&self.search),
@@ -616,11 +630,11 @@ impl App {
             View::Search => Some(&mut self.search),
             View::Liked => Some(&mut self.liked),
             View::Playlist => self.open.as_mut().map(|o| &mut o.tracks),
-            View::Album => match self.pages.last_mut() {
+            View::Album => match self.page_mut() {
                 Some(Page::Album(a)) => Some(&mut a.tracks),
                 _ => None,
             },
-            View::Radio => match self.pages.last_mut() {
+            View::Radio => match self.page_mut() {
                 Some(Page::Radio(r)) => Some(&mut r.tracks),
                 _ => None,
             },
@@ -629,7 +643,7 @@ impl App {
     }
 
     fn artist_page_mut(&mut self) -> Option<&mut ArtistPage> {
-        match self.pages.last_mut() {
+        match self.page_mut() {
             Some(Page::Artist(a)) => Some(a),
             _ => None,
         }
@@ -637,7 +651,7 @@ impl App {
 
     /// The track under the cursor, in any view that lists tracks.
     pub fn selected_track(&self) -> Option<Track> {
-        if let Some(Page::Artist(a)) = self.pages.last() {
+        if let Some(Page::Artist(a)) = self.page() {
             return match a.rows.current()? {
                 ArtistRow::Track(t) => Some(t.clone()),
                 _ => None,
@@ -753,7 +767,7 @@ impl App {
                     .wants_page()
                     .map(|off| (List::Playlist(o.playlist.id.clone()), off))
             }),
-            View::Album => match self.pages.last() {
+            View::Album => match self.page() {
                 Some(Page::Album(a)) => a.tracks.wants_page().map(|off| (List::Album(a.id.clone()), off)),
                 _ => None,
             },
@@ -919,6 +933,25 @@ impl App {
                     self.error(e);
                 }
             }
+            Msg::RadioMore { radio, result } => {
+                let library = self.library.clone().unwrap_or_default();
+                let mut found = 0;
+                for p in self.pages.iter_mut() {
+                    if let Page::Radio(r) = p {
+                        if r.seed.uri == radio {
+                            match &result {
+                                Ok(tracks) => r.add_found(tracks.clone(), &library),
+                                Err(_) => r.digging = false,
+                            }
+                            found = r.tracks.items.len();
+                        }
+                    }
+                }
+                match result {
+                    Ok(_) => self.info(format!("Discover: {found} songs you have not liked")),
+                    Err(e) => self.error(e),
+                }
+            }
             Msg::Library(library) => {
                 for p in self.pages.iter_mut() {
                     if let Page::Radio(r) = p {
@@ -975,26 +1008,133 @@ impl App {
         }
     }
 
-    fn switch_tab(&mut self, tab: Tab) {
-        self.tab = tab;
-        self.typing = false;
-        self.pages.clear();
+    /// The page shown, if a page tab is active.
+    pub fn page(&self) -> Option<&Page> {
+        self.pages.get(self.active?)
     }
 
-    /// Back one step: close a page, then an open playlist, then a folder.
+    pub fn page_mut(&mut self) -> Option<&mut Page> {
+        let i = self.active?;
+        self.pages.get_mut(i)
+    }
+
+    pub fn loc(&self) -> Loc {
+        match self.page() {
+            Some(p) => Loc::Page(p.key()),
+            None => Loc::Base(self.tab),
+        }
+    }
+
+    /// Every tab in bar order: the fixed ones, then the open pages.
+    pub fn locs(&self) -> Vec<Loc> {
+        Tab::ALL.iter().map(|t| Loc::Base(*t)).chain(self.pages.iter().map(|p| Loc::Page(p.key()))).collect()
+    }
+
+    fn exists(&self, loc: &Loc) -> bool {
+        match loc {
+            Loc::Base(_) => true,
+            Loc::Page(k) => self.pages.iter().any(|p| p.key() == *k),
+        }
+    }
+
+    /// Shows a tab without a back step.
+    fn show(&mut self, loc: Loc) {
+        self.typing = false;
+        match loc {
+            Loc::Base(t) => {
+                self.tab = t;
+                self.active = None;
+            }
+            Loc::Page(k) => self.active = self.pages.iter().position(|p| p.key() == k),
+        }
+    }
+
+    /// Goes to a tab; Esc comes back here.
+    pub fn go(&mut self, loc: Loc) {
+        let cur = self.loc();
+        if cur != loc {
+            self.history.push(cur);
+            if self.history.len() > HISTORY {
+                self.history.remove(0);
+            }
+        }
+        self.show(loc);
+    }
+
+    fn switch_tab(&mut self, tab: Tab) {
+        self.go(Loc::Base(tab));
+    }
+
+    /// The next (`1`) or previous (`-1`) tab in the bar, pages included.
+    fn cycle_tab(&mut self, dir: isize) {
+        let locs = self.locs();
+        let cur = self.loc();
+        let i = locs.iter().position(|l| *l == cur).unwrap_or(0) as isize;
+        let n = locs.len() as isize;
+        self.go(locs[(i + dir).rem_euclid(n) as usize].clone());
+    }
+
+    /// Back one step: close an open playlist or folder, else go to the tab you were on before.
+    /// Pages stay open.
     fn back(&mut self) {
-        if self.pages.pop().is_some() {
+        if self.active.is_none() && (self.open.take().is_some() || self.close_folder()) {
             return;
         }
-        if self.open.take().is_none() {
-            self.close_folder();
+        let cur = self.loc();
+        while let Some(loc) = self.history.pop() {
+            if loc != cur && self.exists(&loc) {
+                self.show(loc);
+                return;
+            }
         }
+        if self.active.is_some() {
+            self.show(Loc::Base(self.tab));
+        }
+    }
+
+    /// Closes the page tab shown and goes back.
+    fn close_page(&mut self) {
+        let Some(i) = self.active else {
+            self.info("Only artist, album and radio tabs close.");
+            return;
+        };
+        let key = self.pages.remove(i).key();
+        self.active = None;
+        self.history.retain(|l| *l != Loc::Page(key.clone()));
+        while let Some(loc) = self.history.pop() {
+            if self.exists(&loc) {
+                self.show(loc);
+                return;
+            }
+        }
+        self.show(Loc::Base(self.tab));
+    }
+
+    /// Opens a page in a new tab, or goes to its tab if it is open. True for a new tab.
+    fn open_page(&mut self, page: Page) -> bool {
+        let key = page.key();
+        let cur = self.loc();
+        let fresh = !self.exists(&Loc::Page(key.clone()));
+        if fresh {
+            self.pages.push(page);
+            if self.pages.len() > MAX_PAGES {
+                let old = self.pages.remove(0).key();
+                self.history.retain(|l| *l != Loc::Page(old.clone()));
+                self.active = None;
+            }
+        }
+        // `cur` may be the tab just closed; Esc skips it.
+        if cur != Loc::Page(key.clone()) {
+            self.history.push(cur);
+        }
+        self.show(Loc::Page(key));
+        fresh
     }
 
     pub fn open_artist(&mut self, id: String, name: String) {
-        self.typing = false;
-        self.pages.push(Page::Artist(ArtistPage::new(id.clone(), name)));
-        self.send(Cmd::Artist(id));
+        if self.open_page(Page::Artist(ArtistPage::new(id.clone(), name))) {
+            self.send(Cmd::Artist(id));
+        }
     }
 
     pub fn open_album(&mut self, album: Album) {
@@ -1002,10 +1142,8 @@ impl App {
             self.info("This song has no album page.");
             return;
         };
-        self.typing = false;
         let details = album.release_date.is_none() || album.images.is_empty();
-        self.pages.push(Page::Album(AlbumPage { id: id.clone(), album, tracks: Listing::default() }));
-        if details {
+        if self.open_page(Page::Album(AlbumPage { id: id.clone(), album, tracks: Listing::default() })) && details {
             self.send(Cmd::Album(id));
         }
     }
@@ -1019,13 +1157,15 @@ impl App {
             self.info("Radio works for songs and artists only.");
             return;
         }
-        self.typing = false;
-        self.send(Cmd::Radio(seed.uri.clone()));
+        let uri = seed.uri.clone();
+        if !self.open_page(Page::Radio(Box::new(RadioPage::new(seed)))) {
+            return;
+        }
+        self.send(Cmd::Radio(uri));
         if !self.library_asked {
             self.library_asked = true;
             self.send(Cmd::Library);
         }
-        self.pages.push(Page::Radio(Box::new(RadioPage::new(seed))));
     }
 
     fn go_to_artist(&mut self, track: &Track) {
@@ -1086,7 +1226,7 @@ impl App {
     }
 
     fn filter_menu_items(&self) -> Vec<(&'static str, String, Action)> {
-        let Some(Page::Radio(r)) = self.pages.last() else { return Vec::new() };
+        let Some(Page::Radio(r)) = self.page() else { return Vec::new() };
         FilterItem::ALL
             .iter()
             .map(|i| {
@@ -1095,6 +1235,28 @@ impl App {
                 ("", text, Action::Filter(*i))
             })
             .collect()
+    }
+
+    /// Discover mode, one round: new shuffle, fresh songs from more radios, old ones gone.
+    fn discover_round(&mut self) {
+        let library = self.library.clone().unwrap_or_default();
+        let Some(Page::Radio(r)) = self.page_mut() else { return };
+        if r.radio.is_none() {
+            self.info("Wait for the radio to load first.");
+            return;
+        }
+        if r.digging {
+            self.info("Still finding songs…");
+            return;
+        }
+        let seeds = r.next_round(&library);
+        let (radio, round) = (r.seed.uri.clone(), r.round);
+        if seeds.is_empty() {
+            self.info("Discover: no new songs left to dig from. Press F, then Reset.");
+        } else {
+            self.send(Cmd::RadioMore { radio, seeds });
+            self.info(format!("Discover round {round}: finding new songs…"));
+        }
     }
 
     fn open_filters(&mut self) {
@@ -1112,10 +1274,17 @@ impl App {
         let track = menu.track.clone();
         if let Action::Filter(item) = action {
             // Filters stay open: change, see the list update, change again.
-            let library = self.library.clone().unwrap_or_default();
-            if let Some(Page::Radio(r)) = self.pages.last_mut() {
-                item.step(&mut r.filters);
-                r.refilter(&library);
+            if item == FilterItem::Discover {
+                self.discover_round();
+            } else {
+                let library = self.library.clone().unwrap_or_default();
+                if let Some(Page::Radio(r)) = self.page_mut() {
+                    if item == FilterItem::Reset {
+                        r.stop_discover();
+                    }
+                    item.step(&mut r.filters);
+                    r.refilter(&library);
+                }
             }
             let items = self.filter_menu_items();
             if let Some(m) = self.menu.as_mut() {
@@ -1224,14 +1393,14 @@ impl App {
     fn play_selected(&mut self) {
         match self.view() {
             View::Album => {
-                let Some(Page::Album(a)) = self.pages.last() else { return };
+                let Some(Page::Album(a)) = self.page() else { return };
                 let Some(t) = a.tracks.current() else { return };
                 let uri = a.album.uri.clone().unwrap_or_else(|| format!("spotify:album:{}", a.id));
                 self.send(Cmd::Play(Play::Context { uri, from: Some(t.uri.clone()) }));
                 self.poll_soon();
             }
             View::Radio => {
-                let Some(Page::Radio(r)) = self.pages.last() else { return };
+                let Some(Page::Radio(r)) = self.page() else { return };
                 let uris: Vec<String> = r.tracks.items.iter().map(|t| t.uri.clone()).collect();
                 if !uris.is_empty() {
                     let offset = r.tracks.selected();
@@ -1240,7 +1409,7 @@ impl App {
                 }
             }
             View::Artist => {
-                let Some(Page::Artist(a)) = self.pages.last() else { return };
+                let Some(Page::Artist(a)) = self.page() else { return };
                 match a.rows.current() {
                     Some(ArtistRow::Album(album)) => {
                         let album = album.clone();
@@ -1312,7 +1481,7 @@ impl App {
     }
 
     fn play_whole_playlist(&mut self) {
-        if let Some(Page::Album(a)) = self.pages.last() {
+        if let Some(Page::Album(a)) = self.page() {
             let uri = a.album.uri.clone().unwrap_or_else(|| format!("spotify:album:{}", a.id));
             self.info(format!("Playing {}", a.album.name));
             self.send(Cmd::Play(Play::Context { uri, from: None }));
@@ -1476,7 +1645,7 @@ impl App {
     }
 
     fn list_len(&self) -> usize {
-        if let Some(Page::Artist(a)) = self.pages.last() {
+        if let Some(Page::Artist(a)) = self.page() {
             return a.rows.items.len();
         }
         match self.view() {
@@ -1604,10 +1773,11 @@ impl App {
 
     fn on_click(&mut self, pos: Position) {
         let h = &self.hits;
-        if let Some(&(_, tab)) = h.tabs.iter().find(|(r, _)| r.contains(pos)) {
-            self.switch_tab(tab);
+        if let Some((_, loc)) = h.tabs.iter().find(|(r, _)| r.contains(pos)) {
+            let loc = loc.clone();
+            self.go(loc);
         } else if h.search_box.contains(pos) {
-            self.tab = Tab::Search;
+            self.switch_tab(Tab::Search);
             self.typing = true;
         } else if h.back.contains(pos) {
             self.back();
@@ -1749,7 +1919,7 @@ impl App {
             }
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('/') => {
-                self.tab = Tab::Search;
+                self.switch_tab(Tab::Search);
                 self.typing = true;
             }
             KeyCode::Tab if self.view() == View::Artist => {
@@ -1762,13 +1932,15 @@ impl App {
                     a.jump_section(-1);
                 }
             }
-            KeyCode::Tab => self.switch_tab(Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()]),
-            KeyCode::BackTab => {
-                self.switch_tab(Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()])
+            KeyCode::Tab | KeyCode::Char('L') => self.cycle_tab(1),
+            KeyCode::BackTab | KeyCode::Char('H') => self.cycle_tab(-1),
+            KeyCode::Char(c @ '1'..='9') => {
+                if let Some(loc) = self.locs().get(c as usize - '1' as usize).cloned() {
+                    self.go(loc);
+                }
             }
-            KeyCode::Char('1') => self.switch_tab(Tab::Search),
-            KeyCode::Char('2') => self.switch_tab(Tab::Playlists),
-            KeyCode::Char('3') => self.switch_tab(Tab::Liked),
+            KeyCode::Char('x') => self.close_page(),
+            KeyCode::Char('d') if !ctrl && self.view() == View::Radio => self.discover_round(),
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => self.back(),
             KeyCode::Char('.') => self.open_menu(),
             KeyCode::Char('i') => {
@@ -1782,7 +1954,7 @@ impl App {
                 }
             }
             KeyCode::Char('o') => {
-                let radio_row = match self.pages.last() {
+                let radio_row = match self.page() {
                     Some(Page::Artist(a)) => match a.rows.current() {
                         Some(ArtistRow::Radio(seed)) => Some(seed.clone()),
                         _ => None,
@@ -2154,18 +2326,18 @@ mod tests {
             top: vec![track_by("9", ("ar1", "Bowie"), ("al2", "Heroes"))],
             albums: vec![serde_json::from_value(serde_json::json!({"name": "Low", "id": "al1", "uri": "spotify:album:al1"})).unwrap()],
         });
-        let Some(Page::Artist(a)) = app.pages.last() else { panic!() };
+        let Some(Page::Artist(a)) = app.page() else { panic!() };
         // Popular: 1 song; Radio: artist + 1 song radio; Albums: 1. Each section has a title row.
         assert_eq!((a.name.as_str(), a.rows.items.len()), ("David Bowie", 7));
         assert_eq!(a.rows.selected(), 1, "the cursor starts on the first song, not a title");
 
         // j skips the "Radio" title; Tab jumps to the next section.
         app.move_selection(1);
-        let Some(Page::Artist(a)) = app.pages.last() else { panic!() };
+        let Some(Page::Artist(a)) = app.page() else { panic!() };
         assert!(matches!(a.rows.current(), Some(ArtistRow::Radio(t)) if t.uri == "spotify:artist:ar1"));
         app.move_selection(-1);
         app.on_key(KeyEvent::from(KeyCode::Tab));
-        let Some(Page::Artist(a)) = app.pages.last() else { panic!() };
+        let Some(Page::Artist(a)) = app.page() else { panic!() };
         assert_eq!(a.rows.selected(), 3);
 
         // Enter on the artist radio opens it.
@@ -2181,7 +2353,7 @@ mod tests {
         // Tab again: the album section. Enter opens the album, and its tracks load.
         app.on_key(KeyEvent::from(KeyCode::Tab));
         app.on_key(KeyEvent::from(KeyCode::BackTab));
-        let Some(Page::Artist(a)) = app.pages.last() else { panic!() };
+        let Some(Page::Artist(a)) = app.page() else { panic!() };
         assert_eq!(a.rows.selected(), 3, "shift+tab goes back one section");
         app.on_key(KeyEvent::from(KeyCode::Tab));
         app.on_key(KeyEvent::from(KeyCode::Tab));
@@ -2207,6 +2379,45 @@ mod tests {
         assert_eq!(app.view(), View::Artist);
         app.on_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(app.view(), View::Liked);
+
+        // Esc went back, but the artist, radio and album tabs stay open.
+        let keys: Vec<String> = app.pages.iter().map(Page::key).collect();
+        assert_eq!(keys, ["artist:ar1", "radio:spotify:artist:ar1", "album:al1"]);
+        // 5 is the second page tab (after Search, Playlists, Liked).
+        app.on_key(KeyEvent::from(KeyCode::Char('5')));
+        assert_eq!(app.view(), View::Radio);
+        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        assert_eq!(app.view(), View::Playlists);
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.view(), View::Radio, "Esc goes back to the radio tab");
+        // Opening the artist again goes to its tab, without a new load.
+        drain(&rx);
+        app.open_artist("ar1".into(), "Bowie".into());
+        assert_eq!((app.view(), app.pages.len()), (View::Artist, 3));
+        assert!(drain(&rx).is_empty());
+        // L and H walk the tab bar; x closes the tab and goes back.
+        app.on_key(KeyEvent::from(KeyCode::Char('L')));
+        assert_eq!(app.view(), View::Radio);
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.pages.len(), 2);
+        assert_eq!(app.view(), View::Artist);
+        app.on_key(KeyEvent::from(KeyCode::Char('H')));
+        assert_eq!(app.view(), View::Liked);
+    }
+
+    #[test]
+    fn page_tabs_are_capped() {
+        let (mut app, _rx) = test_app();
+        for i in 0..MAX_PAGES + 2 {
+            app.open_artist(format!("a{i}"), format!("A{i}"));
+        }
+        assert_eq!(app.pages.len(), MAX_PAGES);
+        assert_eq!(app.pages[0].key(), "artist:a2", "the oldest tabs closed");
+        assert_eq!(app.page().map(Page::key).as_deref(), Some("artist:a9"));
+        for _ in 0..20 {
+            app.on_key(KeyEvent::from(KeyCode::Esc));
+        }
+        assert_eq!(app.view(), View::Search);
     }
 
     #[test]
@@ -2242,12 +2453,12 @@ mod tests {
         assert_eq!(app.tracks().unwrap().items.len(), 3);
 
         app.on_key(KeyEvent::from(KeyCode::Char('F')));
-        // Third entry: hide explicit songs; the menu stays open and the list updates.
-        app.move_popup(2);
+        // Fourth entry (after Discover): hide explicit songs; the menu stays open and the list updates.
+        app.move_popup(3);
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.menu.is_some());
         assert_eq!(app.tracks().unwrap().items.len(), 2);
-        assert!(app.menu.as_ref().unwrap().items[2].1.ends_with(": on"));
+        assert!(app.menu.as_ref().unwrap().items[3].1.ends_with(": on"));
         // Songs per artist: at most 2, then at most 1.
         app.move_popup(2);
         app.on_key(KeyEvent::from(KeyCode::Enter));
@@ -2259,6 +2470,74 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Enter));
         let cmds = drain(&rx);
         assert!(cmds.iter().any(|c| matches!(c, Cmd::Play(Play::Tracks { uris, .. }) if uris == &["spotify:track:2"])), "{cmds:?}");
+    }
+
+    #[test]
+    fn discover_rounds_bring_new_songs() {
+        use crate::radio::{Library, RadioTrack};
+        let (mut app, rx) = test_app();
+        let rt = |id: &str, artist: &str| RadioTrack {
+            uri: format!("spotify:track:{id}"),
+            name: id.into(),
+            artists: vec![artist.into()],
+            artist_uris: vec![format!("spotify:artist:{artist}")],
+            album: String::new(),
+            year: Some(2000),
+            duration_ms: 1000,
+            popularity: 50,
+            explicit: false,
+            album_uri: None,
+            images: Vec::new(),
+        };
+        app.start_radio(track_by("s", ("ar1", "A"), ("al1", "X")));
+        drain(&rx);
+        // Before the radio loads, d only says to wait.
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(drain(&rx).is_empty());
+        app.on_msg(Msg::Library(Library {
+            tracks: ["spotify:track:1".to_owned()].into(),
+            artists: ["spotify:artist:liked".to_owned()].into(),
+        }));
+        let radio = vec![rt("1", "x"), rt("2", "liked"), rt("3", "ar1"), rt("4", "y"), rt("5", "z")];
+        app.on_msg(Msg::Radio { seed: "spotify:track:s".into(), result: Ok((rt("s", "ar1"), radio)) });
+        assert_eq!(app.tracks().unwrap().items.len(), 5);
+
+        // Round 1: only songs you do not know, and their radios are asked for.
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        let uris = |app: &App| {
+            let mut u: Vec<String> = app.tracks().unwrap().items.iter().map(|t| t.uri.clone()).collect();
+            u.sort();
+            u
+        };
+        assert_eq!(uris(&app), ["spotify:track:4", "spotify:track:5"]);
+        let cmds = drain(&rx);
+        let Some(Cmd::RadioMore { radio, seeds }) = cmds.iter().find(|c| matches!(c, Cmd::RadioMore { .. })) else {
+            panic!("{cmds:?}")
+        };
+        assert_eq!(radio, "spotify:track:s");
+        let mut seeds = seeds.clone();
+        seeds.sort();
+        assert_eq!(seeds, ["spotify:track:4", "spotify:track:5"]);
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(drain(&rx).is_empty(), "one round at a time");
+        let found = vec![rt("4", "y"), rt("6", "liked"), rt("7", "w"), rt("8", "v")];
+        app.on_msg(Msg::RadioMore { radio: "spotify:track:s".into(), result: Ok(found) });
+        assert_eq!(uris(&app), ["spotify:track:4", "spotify:track:5", "spotify:track:7", "spotify:track:8"]);
+
+        // Round 2: the songs of round 1 go.
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(app.tracks().unwrap().items.is_empty());
+        app.on_msg(Msg::RadioMore { radio: "spotify:track:s".into(), result: Ok(vec![rt("9", "u")]) });
+        assert_eq!(uris(&app), ["spotify:track:9"]);
+        let Some(Page::Radio(r)) = app.page() else { panic!() };
+        assert_eq!(r.round, 2);
+
+        // Reset goes back to the plain radio.
+        app.on_key(KeyEvent::from(KeyCode::Char('F')));
+        let reset = app.menu.as_ref().unwrap().items.len() - 1;
+        app.move_popup(reset as isize);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.tracks().unwrap().items.len(), 5);
     }
 
     #[test]

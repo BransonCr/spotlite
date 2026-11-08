@@ -6,6 +6,9 @@
 //! the filters (new songs only, new artists only, ...) are the way to step outside your taste.
 //! One batched metadata request gives each track's artist, year, length, popularity and
 //! explicit flag, which the filters use.
+//!
+//! Discover mode goes further: it hides everything near your Liked Songs, pulls in the radios of
+//! a few songs it found, and shuffles. Each new round drops the songs of the round before.
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RadioTrack {
@@ -82,11 +85,14 @@ pub struct Filters {
     pub per_artist: u8,
     pub era: Era,
     pub fame: Fame,
+    /// Discover mode (see the module docs); the rounds live on the radio page.
+    pub discover: bool,
 }
 
 impl Default for Filters {
     fn default() -> Self {
         Filters {
+            discover: false,
             new_only: false,
             new_artists: false,
             no_explicit: false,
@@ -138,31 +144,93 @@ pub fn apply(tracks: &[RadioTrack], seed: &RadioTrack, filters: &Filters, librar
         .collect()
 }
 
-/// Seed and radio tracks. The seed is a track (song radio) or an artist (artist radio).
-/// Blocks; run it on its own thread.
+/// Songs one discover round shows.
+pub const DISCOVER_SIZE: usize = 50;
+
+/// The discover list: songs of the radio pool that are not near your Liked Songs (not liked,
+/// no liked artist, not the seed's artist) and that no earlier round showed, in `rank` order.
+pub fn discover(
+    pool: &[RadioTrack],
+    seed: &RadioTrack,
+    filters: &Filters,
+    library: &Library,
+    seen: &std::collections::HashSet<String>,
+    rank: &std::collections::HashMap<String, u32>,
+) -> Vec<RadioTrack> {
+    let strict = Filters { new_only: true, new_artists: true, other_artists: true, ..*filters };
+    let mut kept: Vec<RadioTrack> = apply(pool, seed, &strict, library)
+        .into_iter()
+        .filter(|t| !seen.contains(&t.uri))
+        .collect();
+    kept.sort_by_key(|t| rank.get(&t.uri).copied().unwrap_or(u32::MAX));
+    kept.truncate(DISCOVER_SIZE);
+    kept
+}
+
+/// The radio playlist of one seed, as track URIs.
 #[cfg(feature = "client")]
-pub fn fetch(seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
+async fn radio_uris(sp: &librespot_core::spclient::SpClient, seed_uri: &str) -> anyhow::Result<Vec<String>> {
     use anyhow::{anyhow, Context};
     use librespot_core::{SpotifyId, SpotifyUri};
     use librespot_protocol::playlist4_external::SelectedListContent;
     use protobuf::Message;
 
-    let is_track = seed_uri.starts_with("spotify:track:");
+    let seed = SpotifyUri::from_uri(seed_uri).map_err(|e| anyhow!("bad seed: {e}"))?;
+    let json: serde_json::Value = serde_json::from_slice(&sp.get_radio_for_track(&seed).await?)?;
+    let playlist = json["mediaItems"][0]["uri"]
+        .as_str()
+        .and_then(|u| u.strip_prefix("spotify:playlist:"))
+        .context("Spotify returned no radio for this seed")?;
+    let id = SpotifyId::from_base62(playlist).map_err(|e| anyhow!("bad radio id: {e}"))?;
+    let list = SelectedListContent::parse_from_bytes(&sp.get_playlist(&id).await?)?;
+    Ok(list
+        .contents
+        .items
+        .iter()
+        .map(|i| i.uri().to_owned())
+        .filter(|u| u.starts_with("spotify:track:"))
+        .collect())
+}
+
+/// Radio tracks of several seeds together (for discover mode); seeds with no radio are skipped.
+/// Blocks; run it on its own thread.
+#[cfg(feature = "client")]
+pub fn fetch_more(seeds: &[String]) -> anyhow::Result<Vec<RadioTrack>> {
     let (rt, session) = crate::client::connect()?;
     let result = rt.block_on(async {
         let sp = session.spclient();
-        let seed = SpotifyUri::from_uri(seed_uri).map_err(|e| anyhow!("bad track: {e}"))?;
-        let json: serde_json::Value = serde_json::from_slice(&sp.get_radio_for_track(&seed).await?)?;
-        let playlist = json["mediaItems"][0]["uri"]
-            .as_str()
-            .and_then(|u| u.strip_prefix("spotify:playlist:"))
-            .context("Spotify returned no radio for this seed")?;
-        let id = SpotifyId::from_base62(playlist).map_err(|e| anyhow!("bad radio id: {e}"))?;
-        let list = SelectedListContent::parse_from_bytes(&sp.get_playlist(&id).await?)?;
-        let uris: Vec<String> = list.contents.items.iter().map(|i| i.uri().to_owned()).collect();
+        let mut all: Vec<String> = Vec::new();
+        for seed in seeds {
+            if let Ok(uris) = radio_uris(sp, seed).await {
+                all.extend(uris.into_iter().filter(|u| !all.contains(u)).collect::<Vec<_>>());
+            }
+        }
+        anyhow::ensure!(!all.is_empty(), "Spotify returned no radio for these songs");
+        let meta = metadata(&session, &all).await?;
+        session.shutdown();
+        anyhow::Ok(meta)
+    })?;
+    Ok(result)
+}
+
+#[cfg(not(feature = "client"))]
+pub fn fetch_more(_seeds: &[String]) -> anyhow::Result<Vec<RadioTrack>> {
+    anyhow::bail!("song radio needs the `client` feature")
+}
+
+/// Seed and radio tracks. The seed is a track (song radio) or an artist (artist radio).
+/// Blocks; run it on its own thread.
+#[cfg(feature = "client")]
+pub fn fetch(seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
+    use anyhow::anyhow;
+
+    let is_track = seed_uri.starts_with("spotify:track:");
+    let (rt, session) = crate::client::connect()?;
+    let result = rt.block_on(async {
+        let uris = radio_uris(session.spclient(), seed_uri).await?;
         // A track seed comes first, so one request also gives its metadata (for the filters).
         let mut all = if is_track { vec![seed_uri.to_owned()] } else { Vec::new() };
-        all.extend(uris.into_iter().filter(|u| u.starts_with("spotify:track:")));
+        all.extend(uris);
         let meta = metadata(&session, &all).await?;
         session.shutdown();
         anyhow::Ok(meta)
@@ -311,5 +379,33 @@ mod tests {
         assert_eq!(ids(Filters { era: Era::NearSeed, ..Default::default() }), ["1", "3", "4", "5"]);
         assert_eq!(ids(Filters { fame: Fame::Popular, ..Default::default() }), ["1", "5"]);
         assert_eq!(ids(Filters { fame: Fame::DeepCuts, ..Default::default() }), ["2", "4"]);
+    }
+
+    #[test]
+    fn discover_hides_your_taste_and_old_rounds() {
+        let seed = t("seed", "a", 1995, 70, false);
+        let pool = vec![
+            t("1", "a", 1996, 80, false), // the seed's artist
+            t("2", "b", 2020, 30, false), // a liked artist
+            t("3", "c", 1990, 50, false), // a liked song
+            t("4", "d", 1999, 20, false),
+            t("5", "e", 1994, 60, false),
+            t("6", "f", 1994, 60, true),
+        ];
+        let library = Library {
+            tracks: ["spotify:track:3".to_owned()].into(),
+            artists: ["spotify:artist:b".to_owned()].into(),
+        };
+        let rank: std::collections::HashMap<String, u32> =
+            [("spotify:track:6", 0), ("spotify:track:5", 1), ("spotify:track:4", 2)].map(|(u, r)| (u.to_owned(), r)).into();
+        let mut seen = std::collections::HashSet::new();
+        let ids = |f: &Filters, seen: &std::collections::HashSet<String>| {
+            discover(&pool, &seed, f, &library, seen, &rank).iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+        };
+        let f = Filters { discover: true, ..Default::default() };
+        assert_eq!(ids(&f, &seen), ["6", "5", "4"], "shuffled order, nothing you know");
+        assert_eq!(ids(&Filters { no_explicit: true, ..f }, &seen), ["5", "4"], "other filters still apply");
+        seen.insert("spotify:track:6".to_owned());
+        assert_eq!(ids(&f, &seen), ["5", "4"], "an old round's songs are gone");
     }
 }

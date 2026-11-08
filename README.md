@@ -61,9 +61,11 @@ selected song, so you do not need to remember the keys below.
 | Key | Action |
 |-----|--------|
 | `/` | Search (Enter to run, Esc to stop typing, `Ctrl+U` to clear) |
-| `1` `2` `3`, `Tab` | Search / Playlists / Liked |
+| `1` … `9`, `Tab` | Go to a tab: Search / Playlists / Liked, then the open pages |
+| `H` / `L` | Previous / next tab |
+| `x` | Close the artist, album or radio tab you are on |
 | `j` `k`, arrows, `g` `G`, `Ctrl+D` `Ctrl+U` | Move (more pages load as you scroll) |
-| `Esc`, `h` | Back: close a page, a playlist, or go up a folder |
+| `Esc`, `h` | Back: close a playlist or go up a folder, else go to the tab you were on before |
 | `c` | Jump to the playing song in the list |
 | `Enter` | Play the selected song, or open a playlist, album or folder |
 | `P` | Play the whole playlist or album |
@@ -73,6 +75,7 @@ selected song, so you do not need to remember the keys below.
 | `o` | Song radio from the selected song (or the selected radio on an artist page) |
 | `Tab` / `Shift+Tab` | Next / previous section on an artist page |
 | `F` | Radio filters (on a radio page) |
+| `d` | Discover: new songs outside your taste (on a radio page; again for a new round) |
 | `e` | Add the selected song to one of your playlists |
 | `D` | Remove the selected song from the open playlist (asks first) |
 | `Space` | Play / pause (starts spotifyd if nothing is active) |
@@ -90,6 +93,10 @@ selected song, so you do not need to remember the keys below.
 
 ### Artists, albums, radio
 
+Each artist, album and radio opens in its own tab, after Search, Playlists and Liked. Go
+to Liked and back with `Esc`, and the radio is still there. Opening the same one again goes
+to its tab. `x` closes a tab; with more than 8 open, the oldest closes.
+
 - **Artist page** (`i`): picture, then sections: **Popular** (10 songs), **Radio** (the
   artist's radio and song radios from the top 3 songs), **Albums**, **Singles and EPs**
   (up to 30 releases). `Tab` / `Shift+Tab` jump between sections. The 2026 dev-mode API
@@ -103,13 +110,17 @@ selected song, so you do not need to remember the keys below.
   hide songs or artists already in Liked Songs, hide explicit songs, hide the seed's
   artist, at most 1 or 2 songs per artist, songs from near the seed's year, popular
   songs only or deep cuts only. The list updates as you change a filter.
+- **Discover** (`d`, or the first entry in `F`): hides every song in your Liked Songs,
+  every artist in it, and the seed's artist; adds the radios of 4 songs it found; and
+  shuffles. Press `d` again for a new round: the songs you saw go, the radios of 4 new
+  finds come in, and it shuffles again. `F`, then Reset, goes back to the plain radio.
 - **Playlists**: `e` adds a song to one of your playlists (type to narrow the list);
   `D` removes it from the open playlist. These need the `playlist-modify-*` permissions:
   if you logged in with an older spotlite, run `spotlite auth` again.
 
 ### Mouse
 
-- Click a tab, the search box, `‹` (back), or a player button (`◀◀ ▶ ▶▶`, `⇄`, `↻`, `♥`).
+- Click a tab (an open page too), the search box, `‹` (back), or a player button (`◀◀ ▶ ▶▶`, `⇄`, `↻`, `♥`).
 - In the player, click the artist name to open the artist, or the cover to open the album.
 - Right-click a row for its action menu.
 - Click a row to select it; double-click to play it or open the playlist.
