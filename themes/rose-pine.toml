@@ -1,4 +1,4 @@
-# spotlite theme “rose-pine”: Dreamy and floating: no lines at all, soft lowercase, star-dust visualizer, a wave that drifts.
+# spotlite theme “rose-pine”: Dreamy and soft: rounded boxes in muted violet, lowercase labels, star-dust visualizer, a wave that drifts.
 #
 # Edit and save: a running spotlite shows the change within a second.
 # Check it: spotlite theme check rose-pine   ·   Use it: spotlite theme set rose-pine
@@ -10,7 +10,7 @@ text     = "#e0def4"  # song names, normal text
 bright   = "#f4f1ff"  # titles, the selected row
 muted    = "#908caa"  # second lines, artists
 faint    = "#6e6a86"  # hints, numbers
-border   = "#403d52"  # panel lines
+border   = "#6e6a86"  # panel lines
 selected = "#26233a"  # selected row and pill background
 accent   = "#ebbcba"  # highlights; start of gradients
 accent2  = "#c4a7e7"  # end of gradients (progress bar, logo, borders)
@@ -23,17 +23,17 @@ viz_line = "#c4a7e7"  # visualizer line and dots
 
 # Look and feel
 layout   = "classic"   # classic (player at the bottom) | stage (big cover column on wide terminals) | top (player at the top)
-frame    = "none"      # full (four sides) | rule (a top line with the title) | none (space only)
+frame    = "full"      # full (four sides) | rule (a top line with the title) | none (space only)
 frame_fx = "plain"     # plain | gradient (lines run accent → accent2) | glow (lines breathe while music plays)
 corners  = "rounded"   # rounded | plain | thick | double
 titles   = "lower"     # normal | lower | upper | spaced (L I K E D)
 header   = "pills"     # plain | pills | brackets | powerline
 nerd     = true        # Nerd Font glyphs (powerline arrows, the like heart); false if your terminal lacks them
-select   = "underline" # bar (marker + soft background) | block (inverse) | underline | arrow (❯)
+select   = "bar"       # bar (marker + soft background) | block (inverse) | underline | arrow (❯)
 marker   = "▎"         # one character before the selected row (select = bar or underline)
 viz      = "dots"      # wave | bars | mirror | dots | none
 progress = "wave"      # line | knob (●) | blocks (stepped gradient) | wave (moving ∿)
-bar      = "∿┈"        # two characters: filled and empty part of the progress and volume bars
+bar      = "━┈"        # two characters: filled and empty part of the progress and volume bars
 volume   = "bar"       # bar | leds (VU meter: green, accent, red)
 playing  = "pulse"     # eq (▁▃▅▇) | spin (◐◓◑◒) | pulse (·•●) | logo (still)
 logo     = "✦"         # one character before "spotlite", in empty lists, and when paused

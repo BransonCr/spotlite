@@ -127,9 +127,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // column shows the song, so the player is only the controls, progress and volume.
     let player = if stage { 3 } else if f.area().height < 24 { 4 } else { PLAYER_HEIGHT };
     let (header, mut body, now, footer) = if t.layout == theme::Layout::Top {
-        let [header, _, now, body, footer] = Layout::vertical([
+        let [header, now, body, footer] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(1 - gap()),
             Constraint::Length(player),
             Constraint::Min(5),
             Constraint::Length(1),
@@ -138,9 +137,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .areas(full);
         (header, body, now, footer)
     } else {
-        let [header, _, body, now, footer] = Layout::vertical([
+        let [header, body, now, footer] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(1 - gap()),
             Constraint::Min(5),
             Constraint::Length(player),
             Constraint::Length(1),
@@ -246,9 +244,9 @@ fn page_title(app: &mut App, area: Rect, kind: &str) -> Line<'static> {
     line
 }
 
-/// Rows between parts of the screen: one when panels have no lines (else they run together).
+/// Rows between parts of the screen, so boxes never touch.
 fn gap() -> u16 {
-    u16::from(theme::c().frame == theme::Frame::None)
+    1
 }
 
 /// Where a panel's title starts: after the left line, if the frame has one.
@@ -276,7 +274,8 @@ fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     // No gap under the header: the first section title has a blank line of its own.
-    let [head, list] = Layout::vertical([Constraint::Length(5), Constraint::Min(2)]).areas(inner);
+    // One empty row under the top line, so the picture does not touch it.
+    let [_, head, list] = Layout::vertical([Constraint::Length(1), Constraint::Length(5), Constraint::Min(2)]).areas(inner);
 
     let Some(Page::Artist(page)) = app.active.and_then(|i| app.pages.get_mut(i)) else { return };
     let tracks = page.count(|r| matches!(r, ArtistRow::Track(_)));
@@ -1048,7 +1047,7 @@ fn tab_chip(key: Option<usize>, glyph: Option<char>, label: &str, count: Option<
 }
 
 fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
-    let [input, list] = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).areas(area);
+    let [input, list] = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).spacing(gap()).areas(area);
     app.hits.search_box = input;
     let block = panel()
         .border_style(theme::border(app.typing))
