@@ -1,5 +1,7 @@
-//! What spotlite remembers between runs: the open artist, album and radio tabs, and the
-//! theme. Saved as JSON in ~/.local/state/spotlite/state.json when spotlite quits.
+//! What spotlite remembers between runs: the open tabs and the tab shown, the search, the
+//! theme, the visualizer, and what was playing (song, position, shuffle, repeat, volume).
+//! Saved as JSON in ~/.local/state/spotlite/state.json every few seconds when something
+//! changed, and when spotlite quits or its window closes.
 
 use crate::api::{Album, Track};
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,32 @@ pub struct State {
     /// The tab shown at quit: an index into `tabs`, or None for Search / Playlists / Liked.
     #[serde(default)]
     pub active: Option<usize>,
+    /// Search, Playlists, Liked or Recent (shown when no page tab is).
+    #[serde(default)]
+    pub tab: Option<crate::app::Tab>,
+    #[serde(default)]
+    pub search: String,
+    #[serde(default)]
+    pub search_kind: Option<crate::app::SearchKind>,
+    #[serde(default)]
+    pub viz_on: bool,
+    #[serde(default)]
+    pub playback: Option<SavedPlayback>,
+}
+
+/// What was playing, to start it again when nothing plays at the next start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedPlayback {
+    pub track: String,
+    pub name: String,
+    /// Playlist, album or Liked Songs it played from (None: a plain list of songs).
+    pub context: Option<String>,
+    pub position_ms: u64,
+    pub playing: bool,
+    pub shuffle: bool,
+    /// "off", "context" or "track".
+    pub repeat: String,
+    pub volume: Option<u8>,
 }
 
 /// An open page, with what is needed to load it again.

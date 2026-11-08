@@ -23,6 +23,8 @@ pub struct Theme {
     pub accent2: Color,
     pub red: Color,
     pub green: Color,
+    /// The like heart.
+    pub love: Color,
     pub viz_low: Color,
     pub viz_high: Color,
     pub viz_line: Color,
@@ -170,6 +172,7 @@ const AMBER: Theme = Theme {
     accent2: Color::Rgb(0xd9, 0x67, 0x5e),
     red: Color::Rgb(0xd9, 0x67, 0x5e),
     green: Color::Rgb(0x94, 0xb4, 0x79),
+    love: Color::Rgb(0xff, 0x5f, 0x7e),
     viz_low: Color::Rgb(0x0b, 0x10, 0x16),
     viz_high: Color::Rgb(0x1b, 0x27, 0x36),
     viz_line: Color::Rgb(0x4d, 0x61, 0x76),
@@ -185,7 +188,7 @@ const AMBER: Theme = Theme {
     frame_fx: FrameFx::Plain,
     titles: Titles::Normal,
     header: Header::Plain,
-    nerd: false,
+    nerd: true,
     select: Select::Bar,
     viz: Viz::Wave,
     progress: Progress::Line,
@@ -400,6 +403,7 @@ pub fn parse(text: &str) -> Result<Theme, String> {
             "accent2" => &mut t.accent2,
             "red" => &mut t.red,
             "green" => &mut t.green,
+            "love" => &mut t.love,
             "viz_low" => &mut t.viz_low,
             "viz_high" => &mut t.viz_high,
             "viz_line" => &mut t.viz_line,
@@ -479,6 +483,17 @@ pub fn viz_shades() -> [Color; 5] {
 pub fn dim() -> Color {
     let t = c();
     blend(t.border, t.faint, 0.3)
+}
+
+/// The like heart, filled or outline: Nerd Font hearts fill the cell (ghostty and kitty have
+/// them built in); `nerd = false` uses ♥ / ♡.
+pub fn heart(filled: bool) -> &'static str {
+    match (c().nerd, filled) {
+        (true, true) => "\u{f004}",
+        (true, false) => "\u{f08a}",
+        (false, true) => "♥",
+        (false, false) => "♡",
+    }
 }
 
 /// The mark before the selected row, by `select` style.

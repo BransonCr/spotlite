@@ -587,12 +587,23 @@ impl Spotify {
     }
 
     pub fn play(&mut self, device_id: Option<&str>, what: Option<&Play>) -> Result<()> {
-        let body = what.map(|what| match what {
-            Play::Context { uri, from: Some(track) } => {
-                json!({ "context_uri": uri, "offset": { "uri": track } })
+        self.play_at(device_id, what, 0)
+    }
+
+    /// Like `play`, starting `position_ms` into the first song.
+    pub fn play_at(&mut self, device_id: Option<&str>, what: Option<&Play>, position_ms: u64) -> Result<()> {
+        let body = what.map(|what| {
+            let mut body = match what {
+                Play::Context { uri, from: Some(track) } => {
+                    json!({ "context_uri": uri, "offset": { "uri": track } })
+                }
+                Play::Context { uri, from: None } => json!({ "context_uri": uri }),
+                Play::Tracks { uris, offset } => json!({ "uris": uris, "offset": { "position": offset } }),
+            };
+            if position_ms > 0 {
+                body["position_ms"] = json!(position_ms);
             }
-            Play::Context { uri, from: None } => json!({ "context_uri": uri }),
-            Play::Tracks { uris, offset } => json!({ "uris": uris, "offset": { "position": offset } }),
+            body
         });
         self.send("PUT", "/me/player/play", &Self::with_device(device_id, vec![]), body)
     }

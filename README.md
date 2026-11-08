@@ -108,9 +108,13 @@ API lists songs only of your own playlists).
 
 Each artist, album and radio opens in its own tab, after Search, Playlists, Liked and
 Recent. Go to Liked and back with `Esc`, and the radio is still there. Opening the same one
-again goes to its tab. `x` closes a tab; with more than 8 open, the oldest closes. The open
-tabs come back the next time spotlite starts (each one loads when you go to it); they are
-saved in `~/.local/state/spotlite/state.json`.
+again goes to its tab. `x` closes a tab; with more than 8 open, the oldest closes. Everything comes back the next time spotlite starts: the open tabs (each one loads when
+you go to it), the tab you were on, the last search, the visualizer, and what was playing.
+If nothing plays when spotlite starts (for example after `Q` or a reboot), it starts the
+same song again at the same point, from the same playlist or album, with the same shuffle,
+repeat and volume (paused, if it was paused). The state is saved in
+`~/.local/state/spotlite/state.json` every few seconds when it changes, and when spotlite
+quits or its window closes.
 
 - **Artist page** (`i`): picture, then sections: **Popular** (10 songs), **Radio** (the
   artist's radio and song radios from the top 3 songs), **Albums**, **Singles and EPs**
@@ -142,7 +146,8 @@ saved in `~/.local/state/spotlite/state.json`.
 
 - Click a tab (an open page too), the search box, `‹` (back), or a player button (`◀◀ ▶ ▶▶`, `⇄`, `↻`, `♥`).
 - In the player, click the artist name to open the artist, or the cover to open the album.
-- Right-click a row for its action menu.
+- Right-click a row for its action menu; it opens at the mouse.
+- Click the heart in the player to like or unlike the playing song.
 - Click a row to select it; double-click to play it or open the playlist.
 - Wheel scrolls the list. Over the progress or volume bar, the wheel seeks or changes the volume.
 - Click or drag the progress bar to seek, and the volume slider to set the volume.
@@ -173,11 +178,11 @@ you save its file, so you can edit a theme and watch it change.
 
 | Key | Choices |
 |-----|---------|
-| `text` `bright` `muted` `faint` `border` `selected` `accent` `accent2` `red` `green` `viz_low` `viz_high` `viz_line` | colours, `"#rrggbb"` |
+| `text` `bright` `muted` `faint` `border` `selected` `accent` `accent2` `red` `green` `love` `viz_low` `viz_high` `viz_line` | colours, `"#rrggbb"` (`love` is the like heart) |
 | `layout` | `classic` (player at the bottom), `stage` (big cover column on terminals 140+ wide), `top` (player on top) |
 | `frame` / `frame_fx` / `corners` | `full`, `rule`, `none` / `plain`, `gradient`, `glow` / `rounded`, `plain`, `thick`, `double` |
 | `titles` | `normal`, `lower`, `upper`, `spaced` |
-| `header` / `nerd` | `plain`, `pills`, `brackets`, `powerline` / `true` for Nerd Font arrows |
+| `header` / `nerd` | `plain`, `pills`, `brackets`, `powerline` / `true` (default): Nerd Font arrows and hearts, built into ghostty and kitty; `false` for plain `▌` and `♥` |
 | `select` / `marker` | `bar`, `block`, `underline`, `arrow` / one character |
 | `viz` | `wave`, `bars`, `mirror`, `dots`, `none` |
 | `progress` / `bar` | `line`, `knob`, `blocks`, `wave` / two characters, filled then empty |

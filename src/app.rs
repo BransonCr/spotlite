@@ -4,7 +4,7 @@ use crate::folders::Entry;
 use crate::images::Images;
 use crate::pages::{AlbumPage, ArtistPage, ArtistRow, FilterItem, Page, RadioPage};
 use crate::radio::Library;
-use crate::state::{SavedTab, State};
+use crate::state::{SavedPlayback, SavedTab, State};
 use crate::viz::Visualizer;
 use crate::worker::{Cmd, Kind, List, Msg};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -14,6 +14,8 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 /// How often to ask Spotify for the player state. Progress is interpolated between polls.
+/// How long the like animation runs.
+pub const LIKE_BURST: Duration = Duration::from_millis(720);
 const POLL_EVERY: Duration = Duration::from_secs(5);
 const VOLUME_STEP: u8 = 5;
 const SEEK_STEP_MS: u64 = 10_000;
@@ -31,7 +33,7 @@ const WHEEL_ROWS: isize = 3;
 /// Load the next page when the selection is this close to the end of what is loaded.
 const PREFETCH: usize = 8;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
     Search,
     Playlists,
@@ -154,7 +156,7 @@ pub const MAX_PAGES: usize = 8;
 const HISTORY: usize = 50;
 
 /// What the search lists.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SearchKind {
     Songs,
     Artists,
@@ -223,6 +225,8 @@ pub struct Menu {
     pub cursor: usize,
     /// The track the actions apply to (None for the filter and theme menus).
     pub track: Option<Track>,
+    /// Where the right-click was: the menu opens there (None: in the middle).
+    pub at: Option<Position>,
 }
 
 impl Menu {
@@ -350,6 +354,9 @@ pub struct App {
     control: Option<(Sender<Ctl>, String)>,
     /// Play state set locally, kept until a poll agrees or the hold ends.
     play_hold: Option<(bool, Instant)>,
+    /// Shuffle and repeat set locally, kept until a poll agrees or the hold ends.
+    shuffle_hold: Option<(bool, Instant)>,
+    repeat_hold: Option<(&'static str, Instant)>,
     seek_hold: Option<Instant>,
     /// A poll was asked for while one was already running.
     repoll: bool,
@@ -370,6 +377,16 @@ pub struct App {
     pub palette: Option<crate::palette::Palette>,
     /// The song after the playing one, when Spotify said.
     pub up_next: Option<Track>,
+    /// What played last (kept when playback stops), saved for the next start.
+    pub last_playback: Option<SavedPlayback>,
+    /// What to start again if nothing plays at start, and when spotlite started.
+    resume: Option<(SavedPlayback, Instant)>,
+    /// The first player state has arrived.
+    polled_once: bool,
+    /// The heart's animation: when it started, and whether the song became liked.
+    pub like_burst: Option<(Instant, bool)>,
+    /// A like asked for without knowing the state: the animation waits for Spotify's answer.
+    like_pending: Option<String>,
     pub confirm: Option<Confirm>,
     /// Liked Songs index for the radio filters; asked for once, when a radio opens.
     pub library: Option<Library>,
@@ -424,6 +441,8 @@ impl App {
             rows: Listing::default(),
             control: None,
             play_hold: None,
+            shuffle_hold: None,
+            repeat_hold: None,
             seek_hold: None,
             repoll: false,
             pages: Vec::new(),
@@ -436,6 +455,11 @@ impl App {
             picker: None,
             palette: None,
             up_next: None,
+            last_playback: None,
+            resume: None,
+            polled_once: false,
+            like_burst: None,
+            like_pending: None,
             confirm: None,
             library: None,
             library_asked: false,
@@ -647,7 +671,7 @@ impl App {
 
     /// True while the API thread has work, so the UI should check for replies often.
     pub fn busy(&self) -> bool {
-        self.in_flight > 0 || self.vol_target.is_some() || self.images.busy()
+        self.in_flight > 0 || self.vol_target.is_some() || self.images.busy() || self.like_animating()
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
@@ -818,11 +842,53 @@ impl App {
         }
         self.load_more();
         self.watch_theme();
+        self.try_resume();
         // The Liked index (♥ marks, radio filters) loads once the first lists are in, so it
         // does not hold up what is on screen.
         if !self.library_asked && self.user_id.is_some() && self.in_flight == 0 && !cfg!(test) {
             self.library_asked = true;
             self.send(Cmd::Library);
+        }
+    }
+
+    /// What plays now, as it would be saved.
+    fn snapshot(&self) -> Option<SavedPlayback> {
+        let pb = self.playback.as_ref()?;
+        let t = pb.item.as_ref()?;
+        Some(SavedPlayback {
+            track: t.uri.clone(),
+            name: t.name.clone(),
+            context: pb.context.as_ref().map(|c| c.uri.clone()),
+            position_ms: self.progress_ms(),
+            playing: pb.is_playing,
+            shuffle: pb.shuffle_state,
+            repeat: pb.repeat_state.clone(),
+            volume: self.volume().filter(|v| *v > 0),
+        })
+    }
+
+    /// Starts again what played at the last quit, if nothing plays now. It waits for the first
+    /// player state and for spotifyd to show up as a device (up to 20 s after start).
+    fn try_resume(&mut self) {
+        let Some((_, since)) = &self.resume else { return };
+        if since.elapsed() > Duration::from_secs(20) {
+            self.resume = None;
+            return;
+        }
+        if !self.polled_once {
+            return;
+        }
+        if self.playback.as_ref().is_some_and(|pb| pb.item.is_some()) {
+            // Something plays already (spotifyd kept going): leave it alone.
+            self.resume = None;
+            return;
+        }
+        if self.device.is_none() {
+            return;
+        }
+        if let Some((sp, _)) = self.resume.take() {
+            self.send(Cmd::Resume(sp));
+            self.poll_soon();
         }
     }
 
@@ -930,6 +996,20 @@ impl App {
                         p.progress_ms = Some(local_now);
                     }
                 }
+                if let (Some((held, at)), Some(p)) = (self.shuffle_hold, pb.as_mut()) {
+                    if p.shuffle_state == held || at.elapsed() >= PLAYER_HOLD {
+                        self.shuffle_hold = None;
+                    } else {
+                        p.shuffle_state = held;
+                    }
+                }
+                if let (Some((held, at)), Some(p)) = (self.repeat_hold, pb.as_mut()) {
+                    if p.repeat_state == held || at.elapsed() >= PLAYER_HOLD {
+                        self.repeat_hold = None;
+                    } else {
+                        p.repeat_state = held.into();
+                    }
+                }
                 if let (Some(at), Some(p)) = (self.seek_hold, pb.as_mut()) {
                     let agrees = p.progress_ms.is_some_and(|ms| ms.abs_diff(local_now) < 1500);
                     if agrees || at.elapsed() >= PLAYER_HOLD {
@@ -939,6 +1019,10 @@ impl App {
                     }
                 }
                 self.playback = pb;
+                self.polled_once = true;
+                if let Some(snap) = self.snapshot() {
+                    self.last_playback = Some(snap);
+                }
                 self.polled_at = Instant::now();
                 self.poll_pending = false;
                 self.next_poll = Instant::now() + if std::mem::take(&mut self.repoll) { CONFIRM_AFTER } else { POLL_EVERY };
@@ -1109,6 +1193,12 @@ impl App {
             Msg::Saved { uri, saved } => {
                 if self.playing_uri() == Some(uri.as_str()) {
                     self.saved = Some((uri.clone(), saved));
+                    if self.like_pending.as_deref() == Some(uri.as_str()) {
+                        self.like_burst = Some((Instant::now(), saved));
+                    }
+                }
+                if self.like_pending.as_deref() == Some(uri.as_str()) {
+                    self.like_pending = None;
                 }
                 if let Some(lib) = self.library.as_mut() {
                     if saved {
@@ -1218,11 +1308,36 @@ impl App {
             .collect();
         // A theme tried with SPOTLITE_THEME is not saved.
         let theme = if crate::theme::env_override().is_some() { crate::state::load().theme } else { Some(crate::theme::name()) };
-        State { theme, tabs, active: self.active }
+        State {
+            theme,
+            tabs,
+            active: self.active,
+            tab: Some(self.tab),
+            search: self.searched.clone(),
+            search_kind: Some(self.search_kind),
+            viz_on: self.viz_on,
+            // The live state (a shuffle just pressed counts), else the last one seen.
+            playback: self.snapshot().or_else(|| self.last_playback.clone()),
+        }
     }
 
     /// Opens the tabs of the last run. Nothing loads until a tab is shown.
     pub fn restore(&mut self, state: State) {
+        if let Some(tab) = state.tab {
+            self.tab = tab;
+        }
+        if !state.search.is_empty() {
+            // The last search is listed again (it loads in tick()).
+            self.query = state.search.clone();
+            self.searched = state.search;
+            self.typing = false;
+        }
+        if let Some(kind) = state.search_kind {
+            self.search_kind = kind;
+        }
+        self.viz_on |= state.viz_on;
+        self.last_playback = state.playback.clone();
+        self.resume = state.playback.map(|p| (p, Instant::now()));
         for tab in state.tabs.into_iter().take(MAX_PAGES) {
             let page = match tab {
                 SavedTab::Artist { id, name } => Page::Artist(ArtistPage::new(id, name)),
@@ -1419,7 +1534,7 @@ impl App {
             None => "Like / unlike",
         };
         items.push(("f", label.into(), Action::Like));
-        self.menu = Some(Menu { title: track.name.clone(), items, cursor: 0, track: Some(track) });
+        self.menu = Some(Menu { title: track.name.clone(), items, cursor: 0, track: Some(track), at: None });
     }
 
     fn filter_menu_items(&self) -> Vec<(&'static str, String, Action)> {
@@ -1469,7 +1584,7 @@ impl App {
             .collect();
         let cursor = items.iter().position(|(_, _, a)| *a == Action::Theme(current.clone())).unwrap_or(0);
         self.theme_before = Some(current);
-        self.menu = Some(Menu { title: "Theme".into(), items, cursor, track: None });
+        self.menu = Some(Menu { title: "Theme".into(), items, cursor, track: None, at: None });
     }
 
     /// Uses the theme under the picker's cursor (as a preview, or for good with `keep`).
@@ -1539,7 +1654,7 @@ impl App {
             return;
         }
         let items = self.filter_menu_items();
-        self.menu = Some(Menu { title: "Radio filters".into(), items, cursor: 0, track: None });
+        self.menu = Some(Menu { title: "Radio filters".into(), items, cursor: 0, track: None, at: None });
     }
 
     /// Runs the menu entry under the cursor.
@@ -1843,12 +1958,23 @@ impl App {
         };
         match &self.saved {
             Some((u, saved)) if *u == track.uri => {
-                let saved = *saved;
-                self.send(Cmd::SetSaved { uri: track.uri, saved: !saved })
+                // The playing song: the heart changes at once (Spotify confirms after).
+                let now = !*saved;
+                self.saved = Some((track.uri.clone(), now));
+                self.like_burst = Some((Instant::now(), now));
+                self.send(Cmd::SetSaved { uri: track.uri, saved: now })
             }
             // Spotify says which it is: the library index may be old.
-            _ => self.send(Cmd::ToggleSaved(track.uri)),
+            _ => {
+                self.like_pending = Some(track.uri.clone());
+                self.send(Cmd::ToggleSaved(track.uri))
+            }
         }
+    }
+
+    /// The heart is animating (the loop wakes often meanwhile).
+    pub fn like_animating(&self) -> bool {
+        self.like_burst.is_some_and(|(at, _)| at.elapsed() < LIKE_BURST)
     }
 
     /// Asks to save the radio list on screen as a new playlist.
@@ -1943,6 +2069,7 @@ impl App {
         if let Some(pb) = self.playback.as_mut() {
             pb.repeat_state = next.into();
         }
+        self.repeat_hold = Some((next, Instant::now()));
         self.info(format!("Repeat {}", match next {
             "context" => "all",
             "track" => "one",
@@ -1956,6 +2083,7 @@ impl App {
         if let Some(pb) = self.playback.as_mut() {
             pb.shuffle_state = on;
         }
+        self.shuffle_hold = Some((on, Instant::now()));
         self.info(format!("Shuffle {}", if on { "on" } else { "off" }));
         self.send(Cmd::Shuffle(on));
     }
@@ -2044,7 +2172,7 @@ impl App {
         }
     }
 
-    fn list_len(&self) -> usize {
+    pub fn list_len(&self) -> usize {
         if let Some(Page::Artist(a)) = self.page() {
             return a.rows.items.len();
         }
@@ -2144,6 +2272,9 @@ impl App {
                 if let Some(i) = self.row_at(pos) {
                     self.select(i);
                     self.open_menu();
+                    if let Some(m) = self.menu.as_mut() {
+                        m.at = Some(pos);
+                    }
                 } else if self.hits.np_artist.contains(pos) || self.hits.np_album.contains(pos) {
                     if let Some(t) = self.playback.as_ref().and_then(|p| p.item.clone()) {
                         let items_track = t;
@@ -2929,6 +3060,64 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(app.palette.is_none());
         assert_eq!(app.view(), View::Liked);
+    }
+
+    #[test]
+    fn shuffle_is_kept_until_spotify_agrees() {
+        let (mut app, _rx) = test_app();
+        app.on_msg(playing(40, 100_000));
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        // A poll that left before the change still says off: the screen keeps on.
+        app.on_msg(playing(40, 100_000));
+        assert!(app.playback.as_ref().unwrap().shuffle_state);
+        assert!(app.saved_state().playback.unwrap().shuffle, "and it is what is saved");
+    }
+
+    #[test]
+    fn everything_comes_back_at_start() {
+        let (mut app, rx) = test_app();
+        app.on_msg(Msg::Playback(Some(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "device": {"id": "d", "name": "spotlite", "is_active": true, "volume_percent": 55},
+                "is_playing": true, "progress_ms": 61_000, "shuffle_state": true, "repeat_state": "context",
+                "context": {"uri": "spotify:playlist:p1"},
+                "item": {"uri": "spotify:track:x", "name": "X", "duration_ms": 200_000}
+            }))
+            .unwrap(),
+        ))));
+        app.query = "bowie".into();
+        app.submit_search();
+        app.on_key(KeyEvent::from(KeyCode::Char('t')));
+        app.on_key(KeyEvent::from(KeyCode::Char('3')));
+        app.viz_on = true;
+        let text = serde_json::to_string(&app.saved_state()).unwrap();
+        drain(&rx);
+
+        // Next start: tab, search, visualizer and the song come back.
+        let (mut app, rx) = test_app();
+        app.restore(serde_json::from_str(&text).unwrap());
+        assert_eq!((app.tab, app.searched.as_str(), app.search_kind, app.viz_on), (Tab::Liked, "bowie", SearchKind::Artists, true));
+        // Nothing plays yet: it waits for the player state and for spotifyd.
+        app.tick();
+        assert!(!drain(&rx).iter().any(|c| matches!(c, Cmd::Resume(_))));
+        app.on_msg(Msg::Playback(None));
+        app.on_msg(Msg::Device(Some("spotlite".into())));
+        app.tick();
+        let cmds = drain(&rx);
+        let Some(Cmd::Resume(sp)) = cmds.iter().find(|c| matches!(c, Cmd::Resume(_))) else { panic!("{cmds:?}") };
+        assert_eq!((sp.track.as_str(), sp.context.as_deref()), ("spotify:track:x", Some("spotify:playlist:p1")));
+        assert!(sp.position_ms >= 61_000 && sp.playing && sp.shuffle && sp.repeat == "context");
+        assert_eq!(sp.volume, Some(55));
+        app.tick();
+        assert!(!drain(&rx).iter().any(|c| matches!(c, Cmd::Resume(_))), "only once");
+
+        // If music already plays at start (spotifyd kept going), it is left alone.
+        let (mut app, rx) = test_app();
+        app.restore(serde_json::from_str(&text).unwrap());
+        app.on_msg(playing(40, 100_000));
+        app.on_msg(Msg::Device(Some("spotlite".into())));
+        app.tick();
+        assert!(!drain(&rx).iter().any(|c| matches!(c, Cmd::Resume(_))));
     }
 
     #[test]

@@ -16,6 +16,7 @@ accent   = "#fabd2f"  # highlights; start of gradients
 accent2  = "#fe8019"  # end of gradients (progress bar, logo, borders)
 red      = "#fb4934"  # errors, remove, the top of the volume LEDs
 green    = "#b8bb26"  # liked songs, the active device
+love     = "#fb4934"  # the like heart (vivid)
 viz_low  = "#1d2021"  # visualizer, bottom shade; dark text on accent
 viz_high = "#282828"  # visualizer, top shade
 viz_line = "#7c6f64"  # visualizer line and dots
@@ -27,7 +28,7 @@ frame_fx = "plain"     # plain | gradient (lines run accent → accent2) | glow 
 corners  = "thick"     # rounded | plain | thick | double
 titles   = "upper"     # normal | lower | upper | spaced (L I K E D)
 header   = "brackets"  # plain | pills | brackets | powerline
-nerd     = false       # true: Nerd Font glyphs (powerline arrows); ghostty and kitty have them built in
+nerd     = true        # Nerd Font glyphs (powerline arrows, the like heart); false if your terminal lacks them
 select   = "block"     # bar (marker + soft background) | block (inverse) | underline | arrow (❯)
 marker   = "█"         # one character before the selected row (select = bar or underline)
 viz      = "bars"      # wave | bars | mirror | dots | none

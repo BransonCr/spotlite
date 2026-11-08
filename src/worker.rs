@@ -38,8 +38,10 @@ pub enum Cmd {
     Queue { uri: String, name: String },
     CheckSaved(String),
     SetSaved { uri: String, saved: bool },
-    /// What plays next (for the player's "next" line).
+    /// What plays next (for the stage column's "Up next").
     UpNext,
+    /// Starts what played at the last quit: the song at its position, shuffle, repeat, volume.
+    Resume(crate::state::SavedPlayback),
     /// Likes a song, or unlikes it if it is liked (asks Spotify which first).
     ToggleSaved(String),
     /// A new private playlist with these songs.
@@ -213,6 +215,25 @@ impl Worker {
             Cmd::Volume(pct) => self.player(|api, dev| api.set_volume(dev, pct)),
             Cmd::Shuffle(on) => self.player(|api, dev| api.set_shuffle(dev, on)),
             Cmd::Repeat(state) => self.player(|api, dev| api.set_repeat(dev, state)),
+            Cmd::Resume(sp) => {
+                let play = match &sp.context {
+                    Some(uri) => Play::Context { uri: uri.clone(), from: Some(sp.track.clone()) },
+                    None => Play::Tracks { uris: vec![sp.track.clone()], offset: 0 },
+                };
+                self.player(|api, dev| api.play_at(dev, Some(&play), sp.position_ms))?;
+                // Shuffle, repeat and volume after play: they need an active device.
+                let _ = self.player(|api, dev| api.set_shuffle(dev, sp.shuffle));
+                let _ = self.player(|api, dev| api.set_repeat(dev, &sp.repeat));
+                if let Some(v) = sp.volume {
+                    let _ = self.player(|api, dev| api.set_volume(dev, v));
+                }
+                if !sp.playing {
+                    let _ = self.player(|api, dev| api.pause(dev));
+                }
+                let how = if sp.playing { "Playing" } else { "Ready" };
+                self.send(Msg::Info(format!("{how} where you left off: {}", sp.name)));
+                Ok(())
+            }
             Cmd::UpNext => {
                 let next = self.api.up_next()?;
                 self.send(Msg::UpNext(next));

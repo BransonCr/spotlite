@@ -123,8 +123,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let full = f.area().inner(Margin::new(1, 0));
     // Stage: a big cover column on wide terminals; the player then needs only two lines.
     let stage = t.layout == theme::Layout::Stage && full.width >= 140 && full.height >= 24;
-    // Short terminals get a 2-line player, so the list keeps its room.
-    let player = if f.area().height < 24 || stage { 4 } else { PLAYER_HEIGHT };
+    // Short terminals get a 2-line player, so the list keeps its room. On stage the big
+    // column shows the song, so the player is only the controls, progress and volume.
+    let player = if stage { 3 } else if f.area().height < 24 { 4 } else { PLAYER_HEIGHT };
     let (header, mut body, now, footer) = if t.layout == theme::Layout::Top {
         let [header, _, now, body, footer] = Layout::vertical([
             Constraint::Length(1),
@@ -151,6 +152,28 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         body = list;
         draw_stage(f, app, side);
     }
+    // The visualizer needs empty rows. A long list leaves none, so it gets a strip of its
+    // own under the list; a short list leaves room inside the panel.
+    let mut viz_area = body.inner(Margin::new(1, 1));
+    if app.animating() && t.viz != theme::Viz::None {
+        let strip = (body.height / 4).clamp(4, 10);
+        let row_h: u16 = match app.view() {
+            View::Playlists | View::Artist => 2,
+            View::Search if app.search_kind != SearchKind::Songs => 2,
+            _ => 1,
+        };
+        let header: u16 = match app.view() {
+            View::Search => 6,
+            View::Artist | View::Album | View::Radio => 9,
+            _ => 3,
+        };
+        let need = (app.list_len() as u16).saturating_mul(row_h).saturating_add(header);
+        if body.height < need + strip && body.height > strip + 8 {
+            let [list, band] = Layout::vertical([Constraint::Min(8), Constraint::Length(strip)]).areas(body);
+            body = list;
+            viz_area = Rect { x: band.x + 1, width: band.width.saturating_sub(2), ..band };
+        }
+    }
 
     draw_header(f, app, header);
     match app.view() {
@@ -176,7 +199,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Span::styled(" ‹ ", theme::accent()),
                 Span::styled(format!("{name} "), theme::bright()),
             ]);
-            app.hits.back = span_rect(body, body.x + 1, title.width() as u16);
+            app.hits.back = span_rect(body, title_x(body), title.width() as u16);
             draw_tracks(f, app, body, title, "This playlist is empty.\ne on any song adds it to a playlist");
         }
         View::Artist => draw_artist(f, app, body),
@@ -186,8 +209,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_now_playing(f, app, now);
     draw_footer(f, app, footer);
     if app.viz_on {
-        // Inside the main panel, rising from its bottom edge: that is where the empty space is.
-        draw_visualizer(f.buffer_mut(), body.inner(Margin::new(1, 1)), &app.viz.frame());
+        // In the empty rows at the bottom of the main panel, or in its own strip.
+        draw_visualizer(f.buffer_mut(), viz_area, &app.viz.frame());
     }
     if app.menu.is_some() {
         draw_menu(f, app);
@@ -234,8 +257,13 @@ fn page_title(app: &mut App, area: Rect, name: &str, kind: &str) -> Line<'static
         Span::styled(format!("{} ", theme::title(kind)), theme::muted()),
         Span::styled(format!("{} ", fit(name, room)), theme::bright()),
     ]);
-    app.hits.back = span_rect(area, area.x + 1, line.width() as u16);
+    app.hits.back = span_rect(area, title_x(area), line.width() as u16);
     line
+}
+
+/// Where a panel's title starts: after the left line, if the frame has one.
+fn title_x(area: Rect) -> u16 {
+    area.x + u16::from(theme::c().frame == theme::Frame::Full)
 }
 
 /// The top part of a page: a cover, then up to three lines of text.
@@ -483,6 +511,15 @@ fn draw_position(f: &mut Frame, area: Rect, selected: usize, len: usize) {
 }
 
 /// A centred pop-up of `w` x `h` cells.
+/// A `w` x `h` pop-up with its top-left corner at the mouse, moved left or up to stay on
+/// screen (it opens above the mouse when there is no room below).
+fn popup_at(screen: Rect, at: Position, w: u16, h: u16) -> Rect {
+    let (w, h) = (w.min(screen.width), h.min(screen.height));
+    let x = at.x.min(screen.right().saturating_sub(w));
+    let y = if at.y + h <= screen.bottom() { at.y } else { (at.y + 1).saturating_sub(h).max(screen.y) };
+    Rect { x, y, width: w, height: h }
+}
+
 fn popup_area(f: &Frame, w: u16, h: u16) -> Rect {
     let area = f.area();
     let [r] = Layout::vertical([Constraint::Length(h.min(area.height))]).flex(Flex::Center).areas(area);
@@ -502,8 +539,12 @@ fn draw_menu(f: &mut Frame, app: &mut App) {
     let Some(menu) = app.menu.as_ref() else { return };
     let filters = menu.track.is_none() && !menu.is_theme();
     let width = menu.items.iter().map(|(_, l, _)| l.width()).max().unwrap_or(10).max(menu.title.width()) as u16 + 12;
-    let area = popup_area(f, width.clamp(30, 64), menu.items.len() as u16 + 4);
-    let block = popup_block(fit(&menu.title, width.saturating_sub(6) as usize)).title_bottom(
+    let (w, h) = (width.clamp(30, 64), menu.items.len() as u16 + 4);
+    let area = match menu.at {
+        Some(at) => popup_at(f.area(), at, w, h),
+        None => popup_area(f, w, h),
+    };
+    let block = popup_block(fit(&menu.title, w.saturating_sub(6) as usize)).title_bottom(
         Line::from(Span::styled(
             if menu.is_theme() {
                 " ⏎ use · esc cancel "
@@ -1050,7 +1091,7 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Title: the result kinds (click one, or t / T), then the query.
     let mut spans = vec![Span::raw(" ")];
-    let mut x = list.x + 2;
+    let mut x = title_x(list) + 1;
     for kind in SearchKind::ALL {
         let on = kind == app.search_kind;
         let style = if on {
@@ -1256,7 +1297,7 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
             cells.push(Cell::from(Span::styled(fit(t.album_name(), cols[4]), theme::faint())));
         }
         cells.push(Cell::from(if liked.contains(&t.uri) {
-            Span::styled("♥", Style::new().fg(theme::c().green))
+            Span::styled(theme::heart(true), Style::new().fg(theme::c().love))
         } else {
             Span::raw("")
         }));
@@ -1322,7 +1363,7 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let title = Line::from(title);
     if !path.is_empty() {
-        app.hits.back = span_rect(area, area.x + 1, title.width() as u16);
+        app.hits.back = span_rect(area, title_x(area), title.width() as u16);
     }
 
     let images = &mut app.images;
@@ -1501,6 +1542,10 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     let block = panel();
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if inner.height < 2 {
+        draw_transport(f, app, inner);
+        return;
+    }
     if inner.height < 4 {
         draw_player_compact(f, app, inner);
         return;
@@ -1539,18 +1584,6 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Line::from(spans), l4);
     // The slider gets what the controls leave; it shrinks, then drops its label, then hides.
     let room = l4.right().saturating_sub(x);
-    // Between the controls and the slider: what plays next, when there is room.
-    if let Some(next) = &app.up_next {
-        let space = room.saturating_sub(VOLUME_BAR + 14) as usize;
-        if space >= 16 {
-            let text = format!("next  {}  {}  {}", next.name, theme::c().bullet, next.artist_names());
-            let line = Line::from(vec![
-                Span::styled("next  ", theme::faint()),
-                Span::styled(fit(&text[6..], space - 6), theme::muted()),
-            ]);
-            f.render_widget(line, Rect { x, width: space as u16, ..l4 });
-        }
-    }
     if let (Some(volume), Some((bar_w, label))) = (app.volume(), volume_fit(room)) {
         let (line, bar) = volume_line(volume, app.muted(), bar_w, label);
         let w = line.width() as u16;
@@ -1585,16 +1618,20 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.repeat = span_rect(modes_area, modes_area.x + 3, 2);
     let liked = matches!(&app.saved, Some((uri, saved)) if *uri == track.uri && *saved);
     let known = matches!(&app.saved, Some((uri, _)) if *uri == track.uri);
-    let room = (title_area.width as usize).saturating_sub(6);
+    let room = (title_area.width as usize).saturating_sub(8);
     let name = fit(&track.name, room);
     let mark = theme::playing_mark(pb.is_playing, anim(250));
     let mut title = vec![Span::styled(format!("{mark} "), theme::accent()), Span::styled(name.clone(), theme::bright())];
+    let heart_x = title_area.x + 2 + name.width() as u16 + 2;
     if known {
         title.push(Span::raw("  "));
-        title.push(Span::styled(if liked { "♥" } else { "♡" }, if liked { theme::accent() } else { theme::faint() }));
-        app.hits.like = span_rect(title_area, title_area.x + 2 + name.width() as u16 + 2, 1);
+        title.extend(heart_button(liked, app.like_burst));
+        app.hits.like = span_rect(title_area, heart_x, 3);
     }
     f.render_widget(Line::from(title), title_area);
+    if known {
+        draw_like_burst(f, app.like_burst, Rect { x: heart_x, width: 3, ..title_area }, title_area);
+    }
     f.render_widget(modes, modes_area);
 
     // Line 2: artist · album, and where it plays from.
@@ -1606,7 +1643,8 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
         .spacing(if from.is_empty() { 0 } else { 3 })
         .areas(l2);
     let mut who = track.artist_names();
-    if !track.album_name().is_empty() {
+    // The album, unless it only repeats the song's name (a single).
+    if !track.album_name().is_empty() && !track.album_name().eq_ignore_ascii_case(&track.name) {
         who = format!("{who}  {}  {}", theme::c().bullet, track.album_name());
     }
     f.render_widget(Line::from(Span::styled(fit(&who, who_area.width as usize), theme::muted())), who_area);
@@ -1644,8 +1682,17 @@ fn draw_stage(f: &mut Frame, app: &mut App, area: Rect) {
     let w = inner.width as usize;
     let mark = theme::playing_mark(pb.is_playing, anim(250));
     let year = track.album.as_ref().and_then(|a| a.year()).map(|y| format!("  {}  {y}", t.bullet)).unwrap_or_default();
+    let known = matches!(&app.saved, Some((uri, _)) if *uri == track.uri);
+    let liked = matches!(&app.saved, Some((uri, true)) if *uri == track.uri);
+    let name = fit(&track.name, w.saturating_sub(if known { 8 } else { 2 }));
+    let mut first = vec![Span::styled(format!("{mark} "), theme::accent()), Span::styled(name.clone(), theme::bright())];
+    if known {
+        first.push(Span::raw("  "));
+        first.extend(heart_button(liked, app.like_burst));
+    }
+    let first_w = Line::from(first.clone()).width() as u16;
     let mut lines = vec![
-        Line::from(vec![Span::styled(format!("{mark} "), theme::accent()), Span::styled(fit(&track.name, w.saturating_sub(2)), theme::bright())]),
+        Line::from(first),
         Line::from(Span::styled(fit(&track.artist_names(), w), Style::new().fg(t.accent))),
         Line::from(Span::styled(fit(&format!("{}{year}", track.album_name()), w), theme::muted())),
     ];
@@ -1656,14 +1703,102 @@ fn draw_stage(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let text_y = cover.bottom() + 1;
     let text = Rect { x: inner.x, y: text_y, width: inner.width, height: inner.bottom().saturating_sub(text_y) };
+    if known && text.height > 0 {
+        // The heart, in the centred first line: after the mark, the name and two spaces.
+        let x0 = text.x + text.width.saturating_sub(first_w) / 2;
+        let heart = Rect { x: x0 + 2 + name.width() as u16 + 2, y: text.y, width: 3, height: 1 };
+        app.hits.like = heart;
+    }
     app.hits.np_artist = Rect { x: text.x, y: text.y + 1, width: track.artist_names().width().min(w) as u16, height: 1 };
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), text);
+    if known && text.height > 0 {
+        draw_like_burst(f, app.like_burst, app.hits.like, Rect { height: 1, ..text });
+    }
     if app.hits.np_artist.y >= text.bottom() {
         app.hits.np_artist = Rect::default();
     } else {
         // Centred text: the artist line starts in the middle.
         let aw = app.hits.np_artist.width;
         app.hits.np_artist.x = text.x + text.width.saturating_sub(aw) / 2;
+    }
+}
+
+/// The like button: a heart on a soft pill, 3 cells wide (easy to click, not squeezed).
+/// Liked: a vivid heart; not liked: an outline. Right after a click the pill flashes.
+fn heart_button(liked: bool, burst: Option<(std::time::Instant, bool)>) -> Vec<Span<'static>> {
+    let t = theme::c();
+    let flash = burst
+        .map(|(at, _)| at.elapsed().as_millis() as f32 / crate::app::LIKE_BURST.as_millis() as f32)
+        .filter(|f| *f < 1.0);
+    let (glyph, fg, bg) = if liked {
+        // While the burst runs the pill starts bright and settles.
+        let glow = flash.map_or(0.0, |f| 1.0 - f);
+        (format!(" {} ", theme::heart(true)), t.love, theme::blend(theme::blend(t.selected, t.love, 0.28), t.love, glow * 0.45))
+    } else {
+        (format!(" {} ", theme::heart(false)), t.muted, t.selected)
+    };
+    let fg = if liked && flash.is_some() { theme::blend(t.love, t.bright, 0.3) } else { fg };
+    vec![Span::styled(glyph, Style::new().fg(fg).bg(bg).add_modifier(Modifier::BOLD))]
+}
+
+/// Sparkles that fly out from the heart after a like (and a short fade after an unlike),
+/// drawn only in empty cells around the button.
+fn draw_like_burst(f: &mut Frame, burst: Option<(std::time::Instant, bool)>, heart: Rect, room: Rect) {
+    let Some((at, liked)) = burst else { return };
+    let total = crate::app::LIKE_BURST.as_millis() as f32;
+    let p = at.elapsed().as_millis() as f32 / total;
+    if p >= 1.0 {
+        return;
+    }
+    let t = theme::c();
+    let colour = theme::blend(if liked { t.love } else { t.muted }, t.faint, p);
+    let frames: &[char] = if liked { &['✦', '✧', '⋆', '·', '·', ' '] } else { &['·', ' '] };
+    let glyph = frames[((p * frames.len() as f32) as usize).min(frames.len() - 1)];
+    // Sparkles move outward: 1 cell away, then 2.
+    let reach = if p < 0.4 { 1 } else { 2 };
+    let buf = f.buffer_mut();
+    let spots = [heart.x.checked_sub(reach), Some(heart.right() + reach - 1)];
+    for x in spots.into_iter().flatten() {
+        if x >= room.x && x < room.right() && buf[(x, heart.y)].symbol() == " " {
+            buf[(x, heart.y)].set_char(glyph).set_fg(colour);
+        }
+    }
+    // A spark above the heart, when the row above is in the same panel.
+    if liked && p < 0.6 && heart.y > room.y.saturating_sub(1) && heart.y > 0 {
+        let (x, y) = (heart.x + 1, heart.y - 1);
+        if buf[(x, y)].symbol() == " " {
+            buf[(x, y)].set_char(if p < 0.3 { '˙' } else { '·' }).set_fg(colour);
+        }
+    }
+}
+
+/// One line under the stage column: ◀◀ ‖ ▶▶, the progress bar, the volume.
+fn draw_transport(f: &mut Frame, app: &mut App, line: Rect) {
+    let pb = app.playback.clone();
+    let Some((pb, track)) = pb.as_ref().and_then(|p| p.item.as_ref().map(|t| (p, t))) else {
+        f.render_widget(Line::from(Span::styled("Nothing playing · Space resumes", theme::muted())), line);
+        return;
+    };
+    let play = if pb.is_playing { "‖" } else { "▶" };
+    app.hits.prev = span_rect(line, line.x, 2);
+    app.hits.play = span_rect(line, line.x + 3, 2);
+    app.hits.next = span_rect(line, line.x + 5, 3);
+    let controls = Line::from(vec![
+        Span::styled("◀◀ ", theme::muted()),
+        Span::styled(play, theme::accent()),
+        Span::styled("  ▶▶", theme::muted()),
+    ]);
+    f.render_widget(controls, Rect { width: 9.min(line.width), ..line });
+    let vol_w = if line.width >= 60 { 16 } else { 0 };
+    let bar_area = Rect { x: line.x + 11, width: line.width.saturating_sub(13 + vol_w), ..line };
+    let (bar, at) = progress_line(app.progress_ms(), track.duration_ms, pb.is_playing, bar_area.width);
+    app.hits.progress = Rect { x: bar_area.x + at.0, width: at.1, ..bar_area };
+    f.render_widget(bar, bar_area);
+    if let (Some(volume), true) = (app.volume(), vol_w > 0) {
+        let (vline, vbar) = volume_line(volume, app.muted(), vol_w - 7, false);
+        let rect = Rect { x: line.right() - vol_w + 1, width: vol_w - 1, ..line };
+        app.hits.volume = Rect { x: rect.x + vbar.0, width: vbar.1, ..rect };
+        f.render_widget(vline, rect);
     }
 }
 
@@ -1680,20 +1815,42 @@ fn draw_player_compact(f: &mut Frame, app: &mut App, inner: Rect) {
         return;
     };
     let mark = theme::playing_mark(pb.is_playing, anim(250));
+    // The like button at the right end of the first line.
+    let known = matches!(&app.saved, Some((uri, _)) if *uri == track.uri);
+    let liked = matches!(&app.saved, Some((uri, true)) if *uri == track.uri);
+    let l1 = if known && l1.width > 20 {
+        let heart = Rect { x: l1.right() - 3, width: 3, ..l1 };
+        f.render_widget(Line::from(heart_button(liked, app.like_burst)), heart);
+        draw_like_burst(f, app.like_burst, heart, l1);
+        app.hits.like = heart;
+        Rect { width: l1.width - 6, ..l1 }
+    } else {
+        l1
+    };
     let who = format!("  {}  {}", theme::c().bullet, track.artist_names());
     let line = Line::from(vec![
         Span::styled(format!("{mark} "), theme::accent()),
         Span::styled(track.name.clone(), theme::bright()),
         Span::styled(who, theme::muted()),
     ]);
-    app.hits.np_artist = span_rect(l1, l1.x + 2 + track.name.width() as u16 + 5, track.artist_names().width() as u16);
+    // In the stage layout the big column has the clickable artist already.
+    if app.hits.np_artist.width == 0 {
+        app.hits.np_artist = span_rect(l1, l1.x + 2 + track.name.width() as u16 + 5, track.artist_names().width() as u16);
+    }
     f.render_widget(fit_line(line, l1.width as usize), l1);
-    // Line 2: ‖ / ▶, then the progress bar, then the volume.
+    // Line 2: ◀◀ ‖ ▶▶, then the progress bar, then the volume.
     let play = if pb.is_playing { "‖" } else { "▶" };
-    app.hits.play = span_rect(l2, l2.x, 1);
-    f.render_widget(Span::styled(play, theme::accent()), Rect { width: 1, ..l2 });
+    app.hits.prev = span_rect(l2, l2.x, 2);
+    app.hits.play = span_rect(l2, l2.x + 3, 2);
+    app.hits.next = span_rect(l2, l2.x + 5, 3);
+    let controls = Line::from(vec![
+        Span::styled("◀◀ ", theme::muted()),
+        Span::styled(play, theme::accent()),
+        Span::styled("  ▶▶", theme::muted()),
+    ]);
+    f.render_widget(controls, Rect { width: 9.min(l2.width), ..l2 });
     let vol_w = if l2.width >= 60 { 14 } else { 0 };
-    let bar_area = Rect { x: l2.x + 3, width: l2.width.saturating_sub(3 + vol_w), ..l2 };
+    let bar_area = Rect { x: l2.x + 10, width: l2.width.saturating_sub(10 + vol_w), ..l2 };
     let (line, bar) = progress_line(app.progress_ms(), track.duration_ms, pb.is_playing, bar_area.width);
     app.hits.progress = Rect { x: bar_area.x + bar.0, width: bar.1, ..bar_area };
     f.render_widget(line, bar_area);
@@ -2034,6 +2191,97 @@ mod tests {
         crate::theme::apply("amber").unwrap();
     }
 
+    fn click(app: &mut App, x: u16, y: u16, button: ratatui::crossterm::event::MouseButton) {
+        use ratatui::crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Down(button), column: x, row: y, modifiers: KeyModifiers::NONE });
+    }
+
+    /// Text on screen under a hit rect.
+    fn under(out: &str, r: Rect) -> String {
+        let line = out.lines().nth(r.y as usize).unwrap_or("");
+        line.chars().skip(r.x as usize).take(r.width as usize).collect()
+    }
+
+    #[test]
+    fn mouse_targets_match_what_is_drawn_in_every_theme() {
+        use ratatui::crossterm::event::MouseButton;
+        for (name, _) in crate::theme::BUILTIN {
+            crate::theme::apply(name).unwrap();
+            let (mut app, _rx) = test_app();
+            app.typing = false;
+            app.searched = "x".into();
+            let songs: Vec<Track> = (0..12).map(|i| track(&format!("Song {i}"), "A", "B")).collect();
+            app.on_msg(Msg::Tracks { list: List::Search("x".into()), offset: 0, page: Page { items: songs.clone(), raw: 12, total: 12 } });
+            app.on_msg(playing(&songs[0]));
+            app.on_msg(Msg::Saved { uri: songs[0].uri.clone(), saved: false });
+            let out = screen(&mut app, 120, 34);
+            // Result kinds in the list title: the click lands on the word.
+            for (r, kind) in app.hits.search_kinds.clone() {
+                let label = crate::theme::title(kind.title());
+                assert_eq!(under(&out, r), label, "{name}: search kind hit");
+            }
+            // Tabs: the number and the name are under the hit.
+            let (r, _) = app.hits.tabs[2].clone();
+            assert!(under(&out, r).to_lowercase().contains("liked"), "{name}: tab hit is “{}”", under(&out, r));
+            // A click on a song's row selects that song.
+            let list = app.hits.list;
+            click(&mut app, list.x + 10, list.y + 4, MouseButton::Left);
+            assert_eq!(app.search.selected(), 4, "{name}: row click");
+            let out = screen(&mut app, 120, 34);
+            let row = out.lines().nth((list.y + 4) as usize).unwrap();
+            assert!(row.contains("Song 4"), "{name}: the clicked row shows Song 4: {row}");
+            // The heart button is 3 cells and a click on any of them likes the song.
+            let like = app.hits.like;
+            assert_eq!((like.width, under(&out, like).trim()), (3, crate::theme::heart(false)), "{name}: heart");
+            click(&mut app, like.x + 2, like.y, MouseButton::Left);
+            assert!(matches!(&app.saved, Some((_, true))), "{name}: liked at once");
+            assert!(app.like_burst.is_some_and(|(_, liked)| liked), "{name}: the animation starts");
+        }
+        crate::theme::apply("amber").unwrap();
+    }
+
+    #[test]
+    fn long_lists_leave_a_strip_for_the_visualizer() {
+        let (mut app, _rx) = test_app();
+        app.typing = false;
+        app.searched = "x".into();
+        let songs: Vec<Track> = (0..60).map(|i| track(&format!("Song {i}"), "A", "B")).collect();
+        app.on_msg(Msg::Tracks { list: List::Search("x".into()), offset: 0, page: Page { items: songs.clone(), raw: 60, total: 60 } });
+        app.on_msg(playing(&songs[0]));
+        screen(&mut app, 120, 40);
+        let full = app.hits.list.height;
+        app.viz_on = true;
+        screen(&mut app, 120, 40);
+        assert!(app.hits.list.height + 4 <= full, "the list gives up rows: {} -> {}", full, app.hits.list.height);
+        // A short list keeps its size: the visualizer uses the empty rows inside it.
+        app.on_msg(Msg::Tracks { list: List::Search("x".into()), offset: 0, page: Page { items: songs[..3].to_vec(), raw: 3, total: 3 } });
+        screen(&mut app, 120, 40);
+        assert_eq!(app.hits.list.height, full);
+    }
+
+    #[test]
+    fn right_click_menu_opens_at_the_mouse() {
+        use ratatui::crossterm::event::MouseButton;
+        let (mut app, _rx) = test_app();
+        app.typing = false;
+        app.searched = "x".into();
+        let songs: Vec<Track> = (0..60).map(|i| track(&format!("Song {i}"), "A", "B")).collect();
+        app.on_msg(Msg::Tracks { list: List::Search("x".into()), offset: 0, page: Page { items: songs, raw: 60, total: 60 } });
+        screen(&mut app, 120, 40);
+        let list = app.hits.list;
+        click(&mut app, 30, list.y + 2, MouseButton::Right);
+        assert_eq!(app.search.selected(), 2);
+        assert_eq!(app.menu.as_ref().unwrap().title, "Song 2");
+        screen(&mut app, 120, 40);
+        assert_eq!((app.hits.popup.x, app.hits.popup.y), (30, list.y + 2), "top-left corner at the mouse");
+        // Near the edges it moves left, and up above the mouse, to stay on screen.
+        let screen = Rect::new(0, 0, 120, 34);
+        assert_eq!(popup_at(screen, Position::new(10, 5), 30, 9), Rect::new(10, 5, 30, 9));
+        assert_eq!(popup_at(screen, Position::new(110, 5), 30, 9), Rect::new(90, 5, 30, 9), "moved left");
+        assert_eq!(popup_at(screen, Position::new(10, 30), 30, 9), Rect::new(10, 22, 30, 9), "above: its last row is the mouse row");
+        assert_eq!(popup_at(screen, Position::new(10, 3), 30, 40), Rect::new(10, 0, 30, 34), "too tall: the whole screen");
+    }
+
     #[test]
     fn renders_results_and_now_playing() {
         let (mut app, _rx) = test_app();
@@ -2056,7 +2304,7 @@ mod tests {
             out.lines().any(|l| ['▁', '▃', '▅', '▇'].iter().any(|m| l.contains(&format!("{m}      Teardrop")))),
             "playing row is marked, with a 2-cell thumbnail before the title: {out}"
         );
-        assert!(out.contains("Teardrop  ♥"), "{out}");
+        assert!(out.contains(&format!("Teardrop   {} ", crate::theme::heart(true))), "the heart is a 3-cell button: {out}");
         assert!(out.contains("1:05 ━"), "{out}");
         assert!(out.contains("◀◀    ‖    ▶▶"), "{out}");
         assert!(out.contains("vol ━━━━━───────  40%"), "{out}");
@@ -2070,7 +2318,7 @@ mod tests {
         };
         assert_eq!(at(h.play), "‖");
         assert_eq!(at(h.prev), "◀◀");
-        assert_eq!(at(h.like), "♥");
+        assert_eq!(at(h.like), format!(" {} ", crate::theme::heart(true)), "the whole button is clickable");
         assert_eq!(at(h.shuffle), "⇄");
         assert_eq!(at(h.volume).chars().count(), VOLUME_BAR as usize);
         assert!(at(h.progress).starts_with('━'));

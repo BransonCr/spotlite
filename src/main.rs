@@ -246,8 +246,27 @@ fn run_tui() -> Result<()> {
     }
     let fps: u64 = std::env::var("SPOTLITE_VIZ_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let viz_frame = Duration::from_millis(1000 / fps.clamp(1, 60));
+    // Closing the terminal window sends SIGHUP (a shutdown, SIGTERM): stop the loop cleanly,
+    // so the state below is saved instead of lost.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGHUP, signal_hook::consts::SIGTERM] {
+        let _ = signal_hook::flag::register(sig, stop.clone());
+    }
+    let trial = theme::env_override().is_some();
+    let mut saved_json = String::new();
+    let mut save_at = std::time::Instant::now();
     let result = (|| -> Result<()> {
-        while !app.quit {
+        while !app.quit && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            // Every 5 s, save what changed: a crash or a kill loses at most a few seconds.
+            if !trial && save_at.elapsed() >= Duration::from_secs(5) {
+                save_at = std::time::Instant::now();
+                let st = app.saved_state();
+                if let Ok(json) = serde_json::to_string(&st) {
+                    if json != saved_json && state::save(&st).is_ok() {
+                        saved_json = json;
+                    }
+                }
+            }
             loop {
                 match rx.try_recv() {
                     Ok(msg) => app.on_msg(msg),
