@@ -1,6 +1,6 @@
 //! Background thread that owns the API client, so the UI never waits on the network.
 
-use crate::api::{Album, ApiError, Artist, Page, Play, Playback, Playlist, Spotify, Track, User};
+use crate::api::{Album, ApiError, Artist, Found, Page, Play, Playback, Playlist, Spotify, Track, User};
 use crate::radio::{Library, RadioTrack};
 use anyhow::{anyhow, Result};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -10,8 +10,11 @@ use std::thread;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum List {
     Search(String),
+    /// Search results of another kind: "artist", "album" or "playlist".
+    Found { query: String, kind: &'static str },
     Playlists,
     Liked,
+    Recent,
     Playlist(String),
     Album(String),
 }
@@ -35,6 +38,10 @@ pub enum Cmd {
     Queue { uri: String, name: String },
     CheckSaved(String),
     SetSaved { uri: String, saved: bool },
+    /// Likes a song, or unlikes it if it is liked (asks Spotify which first).
+    ToggleSaved(String),
+    /// A new private playlist with these songs.
+    CreatePlaylist { name: String, description: String, uris: Vec<String> },
     /// Profile, popular songs and albums of an artist (by id).
     Artist(String),
     /// Album details (by id); its tracks load through `Load { list: List::Album }`.
@@ -56,6 +63,7 @@ pub enum Msg {
     Device(Option<String>),
     Playback(Option<Box<Playback>>),
     Tracks { list: List, offset: usize, page: Page<Track> },
+    Found { list: List, offset: usize, page: Page<Found> },
     Playlists { offset: usize, page: Page<Playlist> },
     LoadFailed { list: List, forbidden: bool },
     Saved { uri: String, saved: bool },
@@ -76,6 +84,8 @@ pub enum Msg {
     Removed { playlist_id: String, uri: String },
     /// A track was added to a playlist.
     Added { playlist_id: String },
+    /// A playlist was created: the Playlists tab loads again.
+    Created,
     /// Sent after every command.
     Done(Kind),
 }
@@ -210,6 +220,22 @@ impl Worker {
                 self.send(Msg::Saved { uri, saved });
                 Ok(())
             }
+            Cmd::ToggleSaved(uri) => {
+                let saved = !self.api.is_saved(&uri)?;
+                self.api.set_saved(&uri, saved)?;
+                self.send(Msg::Saved { uri, saved });
+                self.send(Msg::Info(if saved { "Added to Liked Songs" } else { "Removed from Liked Songs" }.into()));
+                Ok(())
+            }
+            Cmd::CreatePlaylist { name, description, uris } => {
+                let pl = self.api.create_playlist(&name, &description)?;
+                for chunk in uris.chunks(100) {
+                    self.api.add_to_playlist(&pl.id, chunk)?;
+                }
+                self.send(Msg::Created);
+                self.send(Msg::Info(format!("Saved {} songs to the new playlist “{name}”", uris.len())));
+                Ok(())
+            }
             Cmd::SetSaved { uri, saved } => {
                 self.api.set_saved(&uri, saved)?;
                 self.send(Msg::Saved { uri, saved });
@@ -262,6 +288,23 @@ impl Worker {
                     }
                     if page.raw == 0 || offset >= page.total {
                         break;
+                    }
+                }
+                // Top and recent songs and artists, for discover. A login from before these
+                // permissions gets an error here: discover then knows Liked Songs only.
+                if self.api.has_scope("user-top-read") {
+                    for range in ["short_term", "medium_term", "long_term"] {
+                        for a in self.api.top_artists(range).unwrap_or_default() {
+                            library.top_artists.insert(format!("spotify:artist:{}", a.id));
+                        }
+                    }
+                    for range in ["short_term", "medium_term"] {
+                        library.heard.extend(self.api.top_tracks(range).unwrap_or_default().into_iter().map(|t| t.uri));
+                    }
+                }
+                if self.api.has_scope("user-read-recently-played") {
+                    if let Ok(page) = self.api.recently_played(0) {
+                        library.heard.extend(page.items.into_iter().map(|t| t.uri));
                     }
                 }
                 self.send(Msg::Library(library));
@@ -328,6 +371,14 @@ impl Worker {
         match &list {
             List::Search(q) => {
                 let page = self.api.search_tracks(q, offset)?;
+                self.send(Msg::Tracks { list, offset, page });
+            }
+            List::Found { query, kind } => {
+                let page = self.api.search(query, kind, offset)?;
+                self.send(Msg::Found { list, offset, page });
+            }
+            List::Recent => {
+                let page = self.api.recently_played(offset)?;
                 self.send(Msg::Tracks { list, offset, page });
             }
             List::Liked => {

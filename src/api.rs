@@ -4,7 +4,7 @@ use crate::auth::{self, Token};
 use crate::config::Config;
 use anyhow::Result;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
 use std::time::Duration;
@@ -45,7 +45,7 @@ impl fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Named {
     pub name: String,
     /// Artist URI (absent on some old or local items).
@@ -59,15 +59,15 @@ impl Named {
 }
 
 /// One size of a cover picture. Custom playlist covers come without a size.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageRef {
     pub url: String,
     pub width: Option<u32>,
 }
 
 /// `images` can be missing or null; both mean "no picture".
-fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ImageRef>, D::Error> {
-    Ok(Option::<Vec<ImageRef>>::deserialize(d)?.unwrap_or_default())
+fn null_as_empty<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
 
 /// URL of the smallest picture that is at least `min_px` wide, else the largest one.
@@ -81,7 +81,7 @@ pub fn pick_image(images: &[ImageRef], min_px: u32) -> Option<&str> {
         .map(|i| i.url.as_str())
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Album {
     pub name: String,
     #[serde(default, deserialize_with = "null_as_empty")]
@@ -93,6 +93,9 @@ pub struct Album {
     /// "album", "single" or "compilation".
     pub album_type: Option<String>,
     pub total_tracks: Option<usize>,
+    /// Given in search results and album details; empty elsewhere.
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub artists: Vec<Named>,
 }
 
 impl Album {
@@ -123,7 +126,7 @@ pub struct Artist {
     pub images: Vec<ImageRef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     pub uri: String,
     pub name: String,
@@ -266,6 +269,32 @@ impl<T> RawPage<T> {
             raw: self.items.len(),
             items: self.items.into_iter().flatten().filter_map(f).collect(),
             total: self.total,
+        }
+    }
+}
+
+/// A search result that is not a song.
+#[derive(Debug, Clone)]
+pub enum Found {
+    Artist(Artist),
+    Album(Album),
+    Playlist(Playlist),
+}
+
+impl Found {
+    pub fn name(&self) -> &str {
+        match self {
+            Found::Artist(a) => &a.name,
+            Found::Album(a) => &a.name,
+            Found::Playlist(p) => &p.name,
+        }
+    }
+
+    pub fn images(&self) -> &[ImageRef] {
+        match self {
+            Found::Artist(a) => &a.images,
+            Found::Album(a) => &a.images,
+            Found::Playlist(p) => &p.images,
         }
     }
 }
@@ -433,6 +462,21 @@ impl Spotify {
             .unwrap_or_else(Page::empty))
     }
 
+    /// Search for one kind of result: "artist", "album" or "playlist".
+    pub fn search(&mut self, query: &str, kind: &str, offset: usize) -> Result<Page<Found>> {
+        let off = offset.to_string();
+        let limit = SEARCH_PAGE.to_string();
+        let resp: Option<Value> =
+            self.get("/search", &[("q", query), ("type", kind), ("limit", &limit), ("offset", &off)])?;
+        let Some(mut resp) = resp else { return Ok(Page::empty()) };
+        let v = resp[format!("{kind}s")].take();
+        Ok(match kind {
+            "artist" => serde_json::from_value::<RawPage<Artist>>(v)?.into_page(|a| Some(Found::Artist(a))),
+            "album" => serde_json::from_value::<RawPage<Album>>(v)?.into_page(|a| Some(Found::Album(a))),
+            _ => serde_json::from_value::<RawPage<Playlist>>(v)?.into_page(|p| Some(Found::Playlist(p))),
+        })
+    }
+
     fn page<T: DeserializeOwned, U>(
         &mut self,
         path: &str,
@@ -449,6 +493,29 @@ impl Spotify {
 
     pub fn playlists(&mut self, offset: usize) -> Result<Page<Playlist>> {
         self.page("/me/playlists", offset, Some)
+    }
+
+    /// The last 50 songs played (newest first). The API pages by time, not offset, so only
+    /// the first page has songs.
+    pub fn recently_played(&mut self, offset: usize) -> Result<Page<Track>> {
+        if offset > 0 {
+            return Ok(Page { items: Vec::new(), raw: 0, total: offset });
+        }
+        let raw: Option<RawPage<SavedTrack>> = self.get("/me/player/recently-played", &[("limit", "50")])?;
+        let mut page = raw.map(|r| r.into_page(|s: SavedTrack| s.track)).unwrap_or_else(Page::empty);
+        page.total = page.raw;
+        Ok(page)
+    }
+
+    /// Your most played artists over a time range ("short_term", "medium_term", "long_term").
+    pub fn top_artists(&mut self, range: &str) -> Result<Vec<Artist>> {
+        let raw: Option<RawPage<Artist>> = self.get("/me/top/artists", &[("limit", "50"), ("time_range", range)])?;
+        Ok(raw.map(|r| r.into_page(Some).items).unwrap_or_default())
+    }
+
+    pub fn top_tracks(&mut self, range: &str) -> Result<Vec<Track>> {
+        let raw: Option<RawPage<Track>> = self.get("/me/top/tracks", &[("limit", "50"), ("time_range", range)])?;
+        Ok(raw.map(|r| r.into_page(Some).items).unwrap_or_default())
     }
 
     pub fn liked_tracks(&mut self, offset: usize) -> Result<Page<Track>> {
@@ -569,6 +636,15 @@ impl Spotify {
 
     pub fn queue(&mut self, device_id: Option<&str>, uri: &str) -> Result<()> {
         self.send("POST", "/me/player/queue", &Self::with_device(device_id, vec![("uri", uri)]), None)
+    }
+
+    /// A new private playlist of the user's (needs playlist-modify-private).
+    pub fn create_playlist(&mut self, name: &str, description: &str) -> Result<Playlist> {
+        let body = json!({ "name": name, "description": description, "public": false });
+        self.request("POST", "/me/playlists", &[], Some(body))?
+            .ok_or_else(|| anyhow::anyhow!("empty create-playlist response"))?
+            .into_json()
+            .map_err(Into::into)
     }
 
     pub fn is_saved(&mut self, uri: &str) -> Result<bool> {

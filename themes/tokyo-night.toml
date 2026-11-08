@@ -1,0 +1,26 @@
+# spotlite theme “tokyo-night”: Tokyo Night: deep navy, electric blue that shifts to purple, neon bars.
+#
+# Edit and save: a running spotlite shows the change within a second.
+# Colours are "#rrggbb". A key you leave out takes the value of the amber theme.
+# The background is your terminal's own (its opacity shows through).
+
+# Colours
+text     = "#c0caf5"  # song names, normal text
+bright   = "#e0e6ff"  # titles, the selected row
+muted    = "#9aa5ce"  # second lines, artists
+faint    = "#565f89"  # hints, numbers, rules
+border   = "#292e42"  # panel borders
+selected = "#24283b"  # background of the selected row
+accent   = "#7aa2f7"  # highlights, focused panel, start of the progress gradient
+accent2  = "#bb9af7"  # end of the progress gradient
+red      = "#f7768e"  # errors, remove actions
+green    = "#9ece6a"  # liked songs, the active device
+viz_low  = "#16161e"  # visualizer bars, bottom shade
+viz_high = "#24283b"  # visualizer bars, top shade
+viz_line = "#3d59a1"  # visualizer line over the bars
+
+# Style
+corners  = "rounded"  # panel corners and lines: rounded, plain, thick or double
+marker   = "┃"  # one character before the selected row
+logo     = "★"  # one character before "spotlite" and the playing song
+bar      = "▰▱"  # two characters: the filled and the empty part of the progress bar

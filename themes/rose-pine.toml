@@ -1,0 +1,26 @@
+# spotlite theme “rose-pine”: Rosé Pine: muted purples, a rose accent that fades to iris.
+#
+# Edit and save: a running spotlite shows the change within a second.
+# Colours are "#rrggbb". A key you leave out takes the value of the amber theme.
+# The background is your terminal's own (its opacity shows through).
+
+# Colours
+text     = "#e0def4"  # song names, normal text
+bright   = "#f4f1ff"  # titles, the selected row
+muted    = "#908caa"  # second lines, artists
+faint    = "#6e6a86"  # hints, numbers, rules
+border   = "#403d52"  # panel borders
+selected = "#26233a"  # background of the selected row
+accent   = "#ebbcba"  # highlights, focused panel, start of the progress gradient
+accent2  = "#c4a7e7"  # end of the progress gradient
+red      = "#eb6f92"  # errors, remove actions
+green    = "#9ccfd8"  # liked songs, the active device
+viz_low  = "#16141f"  # visualizer bars, bottom shade
+viz_high = "#2a2540"  # visualizer bars, top shade
+viz_line = "#6e5a99"  # visualizer line over the bars
+
+# Style
+corners  = "rounded"  # panel corners and lines: rounded, plain, thick or double
+marker   = "▎"  # one character before the selected row
+logo     = "✦"  # one character before "spotlite" and the playing song
+bar      = "━┈"  # two characters: the filled and the empty part of the progress bar

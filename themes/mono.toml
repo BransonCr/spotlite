@@ -1,0 +1,26 @@
+# spotlite theme “mono”: Monochrome: greys only, white for the accent, double lines.
+#
+# Edit and save: a running spotlite shows the change within a second.
+# Colours are "#rrggbb". A key you leave out takes the value of the amber theme.
+# The background is your terminal's own (its opacity shows through).
+
+# Colours
+text     = "#d0d0d0"  # song names, normal text
+bright   = "#ffffff"  # titles, the selected row
+muted    = "#8a8a8a"  # second lines, artists
+faint    = "#5a5a5a"  # hints, numbers, rules
+border   = "#3a3a3a"  # panel borders
+selected = "#262626"  # background of the selected row
+accent   = "#ffffff"  # highlights, focused panel, start of the progress gradient
+accent2  = "#8a8a8a"  # end of the progress gradient
+red      = "#c86464"  # errors, remove actions
+green    = "#a0a0a0"  # liked songs, the active device
+viz_low  = "#101010"  # visualizer bars, bottom shade
+viz_high = "#202020"  # visualizer bars, top shade
+viz_line = "#505050"  # visualizer line over the bars
+
+# Style
+corners  = "double"  # panel corners and lines: rounded, plain, thick or double
+marker   = "▌"  # one character before the selected row
+logo     = "♪"  # one character before "spotlite" and the playing song
+bar      = "■·"  # two characters: the filled and the empty part of the progress bar

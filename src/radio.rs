@@ -104,11 +104,16 @@ impl Default for Filters {
     }
 }
 
-/// What the filters know about Liked Songs.
+/// What the filters know about your taste.
 #[derive(Debug, Clone, Default)]
 pub struct Library {
+    /// Liked Songs, and their artists.
     pub tracks: std::collections::HashSet<String>,
     pub artists: std::collections::HashSet<String>,
+    /// Discover also leaves out these: top and recently played songs, top artists.
+    /// Empty when the login has no user-top-read / user-read-recently-played.
+    pub heard: std::collections::HashSet<String>,
+    pub top_artists: std::collections::HashSet<String>,
 }
 
 /// Keeps the tracks that pass the filters, in radio order.
@@ -147,8 +152,9 @@ pub fn apply(tracks: &[RadioTrack], seed: &RadioTrack, filters: &Filters, librar
 /// Songs one discover round shows.
 pub const DISCOVER_SIZE: usize = 50;
 
-/// The discover list: songs of the radio pool that are not near your Liked Songs (not liked,
-/// no liked artist, not the seed's artist) and that no earlier round showed, in `rank` order.
+/// The discover list: songs of the radio pool that are not near your taste (not liked, top or
+/// recently played; no liked or top artist; not the seed's artist) and that no earlier round
+/// showed, in `rank` order.
 pub fn discover(
     pool: &[RadioTrack],
     seed: &RadioTrack,
@@ -160,7 +166,8 @@ pub fn discover(
     let strict = Filters { new_only: true, new_artists: true, other_artists: true, ..*filters };
     let mut kept: Vec<RadioTrack> = apply(pool, seed, &strict, library)
         .into_iter()
-        .filter(|t| !seen.contains(&t.uri))
+        .filter(|t| !seen.contains(&t.uri) && !library.heard.contains(&t.uri))
+        .filter(|t| !t.artist_uris.iter().any(|a| library.top_artists.contains(a)))
         .collect();
     kept.sort_by_key(|t| rank.get(&t.uri).copied().unwrap_or(u32::MAX));
     kept.truncate(DISCOVER_SIZE);
@@ -367,6 +374,7 @@ mod tests {
         let library = Library {
             tracks: ["spotify:track:5".to_owned()].into(),
             artists: ["spotify:artist:b".to_owned()].into(),
+            ..Default::default()
         };
         let ids = |f: Filters| apply(&tracks, &seed, &f, &library).iter().map(|t| t.name.clone()).collect::<Vec<_>>();
 
@@ -395,7 +403,12 @@ mod tests {
         let library = Library {
             tracks: ["spotify:track:3".to_owned()].into(),
             artists: ["spotify:artist:b".to_owned()].into(),
+            heard: ["spotify:track:7".to_owned()].into(),
+            top_artists: ["spotify:artist:g".to_owned()].into(),
         };
+        let mut pool = pool;
+        pool.push(t("7", "h", 1994, 60, false)); // recently played
+        pool.push(t("8", "g", 1994, 60, false)); // a top artist
         let rank: std::collections::HashMap<String, u32> =
             [("spotify:track:6", 0), ("spotify:track:5", 1), ("spotify:track:4", 2)].map(|(u, r)| (u.to_owned(), r)).into();
         let mut seen = std::collections::HashSet::new();

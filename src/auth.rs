@@ -15,7 +15,8 @@ const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 
 pub const SCOPES: &str = "user-read-playback-state user-modify-playback-state \
 user-read-currently-playing user-library-read user-library-modify playlist-read-private \
-playlist-read-collaborative playlist-modify-private playlist-modify-public user-read-private";
+playlist-read-collaborative playlist-modify-private playlist-modify-public user-read-private \
+user-top-read user-read-recently-played";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Token {

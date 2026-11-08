@@ -1,0 +1,26 @@
+# spotlite theme “nord”: Nord: cool arctic greys, frost blue that deepens to sea blue, square corners.
+#
+# Edit and save: a running spotlite shows the change within a second.
+# Colours are "#rrggbb". A key you leave out takes the value of the amber theme.
+# The background is your terminal's own (its opacity shows through).
+
+# Colours
+text     = "#d8dee9"  # song names, normal text
+bright   = "#eceff4"  # titles, the selected row
+muted    = "#7b88a1"  # second lines, artists
+faint    = "#4c566a"  # hints, numbers, rules
+border   = "#434c5e"  # panel borders
+selected = "#3b4252"  # background of the selected row
+accent   = "#88c0d0"  # highlights, focused panel, start of the progress gradient
+accent2  = "#5e81ac"  # end of the progress gradient
+red      = "#bf616a"  # errors, remove actions
+green    = "#a3be8c"  # liked songs, the active device
+viz_low  = "#1e222a"  # visualizer bars, bottom shade
+viz_high = "#2e3440"  # visualizer bars, top shade
+viz_line = "#5e81ac"  # visualizer line over the bars
+
+# Style
+corners  = "plain"  # panel corners and lines: rounded, plain, thick or double
+marker   = "▍"  # one character before the selected row
+logo     = "◆"  # one character before "spotlite" and the playing song
+bar      = "━─"  # two characters: the filled and the empty part of the progress bar

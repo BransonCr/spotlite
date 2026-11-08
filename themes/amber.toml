@@ -1,0 +1,26 @@
+# spotlite theme “amber”: Near-black greys with an amber accent that warms to coral (the default).
+#
+# Edit and save: a running spotlite shows the change within a second.
+# Colours are "#rrggbb". A key you leave out takes the value of the amber theme.
+# The background is your terminal's own (its opacity shows through).
+
+# Colours
+text     = "#d9d8d2"  # song names, normal text
+bright   = "#ecebe6"  # titles, the selected row
+muted    = "#888780"  # second lines, artists
+faint    = "#5f5e59"  # hints, numbers, rules
+border   = "#2e2e31"  # panel borders
+selected = "#232326"  # background of the selected row
+accent   = "#e3a548"  # highlights, focused panel, start of the progress gradient
+accent2  = "#d9675e"  # end of the progress gradient
+red      = "#d9675e"  # errors, remove actions
+green    = "#94b479"  # liked songs, the active device
+viz_low  = "#0b1016"  # visualizer bars, bottom shade
+viz_high = "#1b2736"  # visualizer bars, top shade
+viz_line = "#4d6176"  # visualizer line over the bars
+
+# Style
+corners  = "rounded"  # panel corners and lines: rounded, plain, thick or double
+marker   = "▌"  # one character before the selected row
+logo     = "♪"  # one character before "spotlite" and the playing song
+bar      = "━─"  # two characters: the filled and the empty part of the progress bar

@@ -8,6 +8,7 @@ mod folders;
 mod images;
 mod pages;
 mod radio;
+mod state;
 mod theme;
 mod ui;
 mod viz;
@@ -33,6 +34,11 @@ usage:
   spotlite devices    list Spotify Connect devices
   spotlite folders    show your playlist folders
   spotlite radio URI  list the radio for a song or artist (spotify:track:... or spotify:artist:...)
+  spotlite theme              list the themes (* = in use)
+  spotlite theme set NAME     use a theme (a running spotlite changes within a second)
+  spotlite theme file NAME    print the theme's file, copying a built-in one there first
+  spotlite theme new NAME [FROM]  make a theme from FROM (default: the one in use)
+  spotlite theme check NAME   check a theme file for mistakes
   spotlite toggle     play/pause
   spotlite next       next track
   spotlite prev       previous track";
@@ -71,6 +77,7 @@ fn main() -> Result<()> {
                 },
             }
         }
+        Some("theme") => theme_cmd(std::env::args().skip(2).collect()),
         Some("folders") => {
             let tree = folders::fetch()?;
             folders::save_cache(&tree)?;
@@ -115,6 +122,74 @@ fn main() -> Result<()> {
     }
 }
 
+/// `spotlite theme ...`: themes from a shell, for scripts and AI agents.
+fn theme_cmd(args: Vec<String>) -> Result<()> {
+    let mut saved = state::load();
+    let current = saved.theme.clone().unwrap_or_else(|| theme::DEFAULT.to_owned());
+    let arg = |i: usize| args.get(i).map(String::as_str);
+    match (arg(0), arg(1)) {
+        (None | Some("list"), _) => {
+            for (name, text) in theme::all() {
+                let mark = if name == current { "*" } else { " " };
+                let state = match theme::parse(&text) {
+                    Err(e) => format!("  (broken: {e})"),
+                    Ok(_) if theme::file(&name).exists() => format!("  ({})", theme::file(&name).display()),
+                    Ok(_) => String::new(),
+                };
+                println!("{mark} {name}{state}");
+            }
+            println!("\nThemes folder: {}", theme::dir().display());
+            Ok(())
+        }
+        (Some("set"), Some(name)) => {
+            theme::load(name).map_err(anyhow::Error::msg)?;
+            saved.theme = Some(name.to_owned());
+            state::save(&saved)?;
+            println!("Theme set to {name}. A running spotlite changes within a second.");
+            Ok(())
+        }
+        (Some("file"), Some(name)) => {
+            let path = theme::file(name);
+            if !path.exists() {
+                let (_, text) = theme::all()
+                    .into_iter()
+                    .find(|(n, _)| n == name)
+                    .ok_or_else(|| anyhow::anyhow!("no theme “{name}”; `spotlite theme new {name}` makes one"))?;
+                std::fs::create_dir_all(theme::dir())?;
+                std::fs::write(&path, text)?;
+            }
+            println!("{}", path.display());
+            Ok(())
+        }
+        (Some("new"), Some(name)) => {
+            let from = arg(2).unwrap_or(&current);
+            let path = theme::file(name);
+            if path.exists() {
+                bail!("{} already exists", path.display());
+            }
+            let (_, text) = theme::all()
+                .into_iter()
+                .find(|(n, _)| n == from)
+                .ok_or_else(|| anyhow::anyhow!("no theme “{from}”"))?;
+            // Keep the comments: they say what each key does.
+            let text = match text.split_once('\n') {
+                Some((first, rest)) if first.starts_with('#') => format!("# spotlite theme “{name}” (made from {from}).\n{rest}"),
+                _ => text,
+            };
+            std::fs::create_dir_all(theme::dir())?;
+            std::fs::write(&path, text)?;
+            println!("{}", path.display());
+            Ok(())
+        }
+        (Some("check"), Some(name)) => {
+            theme::load(name).map_err(anyhow::Error::msg)?;
+            println!("{name}: OK");
+            Ok(())
+        }
+        _ => bail!("usage: spotlite theme [list | set NAME | file NAME | new NAME [FROM] | check NAME]"),
+    }
+}
+
 fn run_tui() -> Result<()> {
     let api = Spotify::new(Config::load()?)?;
     start_spotifyd();
@@ -142,6 +217,13 @@ fn run_tui() -> Result<()> {
     if let Some(tree) = folders::load_cached() {
         app.set_folders(tree);
     }
+    let saved = state::load();
+    if let Some(name) = &saved.theme {
+        if let Err(e) = theme::apply(name) {
+            app.error(e);
+        }
+    }
+    app.restore(saved);
     // Refresh the folder tree in the background; the cached one shows meanwhile.
     if client::AVAILABLE {
         let folder_tx = msg_tx.clone();
@@ -192,6 +274,9 @@ fn run_tui() -> Result<()> {
     app.viz.stop();
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    if let Err(e) = state::save(&app.saved_state()) {
+        eprintln!("spotlite: could not save the open tabs: {e:#}");
+    }
     if app.stop_services {
         stop_spotifyd();
     }

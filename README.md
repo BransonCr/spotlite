@@ -61,7 +61,8 @@ selected song, so you do not need to remember the keys below.
 | Key | Action |
 |-----|--------|
 | `/` | Search (Enter to run, Esc to stop typing, `Ctrl+U` to clear) |
-| `1` … `9`, `Tab` | Go to a tab: Search / Playlists / Liked, then the open pages |
+| `t` | In Search: list songs, artists, albums or playlists |
+| `1` … `9`, `Tab` | Go to a tab: Search / Playlists / Liked / Recent, then the open pages |
 | `H` / `L` | Previous / next tab |
 | `x` | Close the artist, album or radio tab you are on |
 | `j` `k`, arrows, `g` `G`, `Ctrl+D` `Ctrl+U` | Move (more pages load as you scroll) |
@@ -76,6 +77,7 @@ selected song, so you do not need to remember the keys below.
 | `Tab` / `Shift+Tab` | Next / previous section on an artist page |
 | `F` | Radio filters (on a radio page) |
 | `d` | Discover: new songs outside your taste (on a radio page; again for a new round) |
+| `S` | Save the radio list on screen as a new playlist (asks first) |
 | `e` | Add the selected song to one of your playlists |
 | `D` | Remove the selected song from the open playlist (asks first) |
 | `Space` | Play / pause (starts spotifyd if nothing is active) |
@@ -85,17 +87,29 @@ selected song, so you do not need to remember the keys below.
 | `m` | Mute / unmute |
 | `s` | Shuffle |
 | `r` | Repeat: off, all, one |
-| `f` | Like / unlike the playing song |
+| `f` | Like / unlike the selected song (else the playing one) |
+| `T` | Theme picker (moving previews, Enter keeps, Esc goes back) |
 | `v` | Sound visualizer on / off |
 | `R` | Reload the list |
 | `q` | Quit (music keeps playing) |
 | `Q` | Quit and stop spotifyd: nothing keeps running (spotlite starts it again next time) |
 
+### Search and Recent
+
+`t` changes what the search lists: **Songs**, **Artists**, **Albums** or **Playlists** (or
+click one in the list title). Enter on an artist or album opens its page; on one of your
+playlists it opens the playlist; on someone else's playlist it plays it (the 2026 dev-mode
+API lists songs only of your own playlists).
+
+**Recent** (`4`) is the last 50 songs you played, loaded again each time you go to it.
+
 ### Artists, albums, radio
 
-Each artist, album and radio opens in its own tab, after Search, Playlists and Liked. Go
-to Liked and back with `Esc`, and the radio is still there. Opening the same one again goes
-to its tab. `x` closes a tab; with more than 8 open, the oldest closes.
+Each artist, album and radio opens in its own tab, after Search, Playlists, Liked and
+Recent. Go to Liked and back with `Esc`, and the radio is still there. Opening the same one
+again goes to its tab. `x` closes a tab; with more than 8 open, the oldest closes. The open
+tabs come back the next time spotlite starts (each one loads when you go to it); they are
+saved in `~/.local/state/spotlite/state.json`.
 
 - **Artist page** (`i`): picture, then sections: **Popular** (10 songs), **Radio** (the
   artist's radio and song radios from the top 3 songs), **Albums**, **Singles and EPs**
@@ -111,9 +125,14 @@ to its tab. `x` closes a tab; with more than 8 open, the oldest closes.
   artist, at most 1 or 2 songs per artist, songs from near the seed's year, popular
   songs only or deep cuts only. The list updates as you change a filter.
 - **Discover** (`d`, or the first entry in `F`): hides every song in your Liked Songs,
-  every artist in it, and the seed's artist; adds the radios of 4 songs it found; and
-  shuffles. Press `d` again for a new round: the songs you saw go, the radios of 4 new
-  finds come in, and it shuffles again. `F`, then Reset, goes back to the plain radio.
+  every artist in it, your top artists, your top and recently played songs, and the
+  seed's artist; adds the radios of 4 songs it found; and shuffles. Press `d` again for a
+  new round: the songs you saw go, the radios of 4 new finds come in, and it shuffles
+  again. `F`, then Reset, goes back to the plain radio. `S` saves the list on screen as a
+  new private playlist, so a good round is not lost when you close the tab. Top and
+  recent songs need the `user-top-read` and `user-read-recently-played` permissions: if
+  you logged in with an older spotlite, run `spotlite auth` again (without them, discover
+  knows Liked Songs only).
 - **Playlists**: `e` adds a song to one of your playlists (type to narrow the list);
   `D` removes it from the open playlist. These need the `playlist-modify-*` permissions:
   if you logged in with an older spotlite, run `spotlite auth` again.
@@ -126,6 +145,40 @@ to its tab. `x` closes a tab; with more than 8 open, the oldest closes.
 - Click a row to select it; double-click to play it or open the playlist.
 - Wheel scrolls the list. Over the progress or volume bar, the wheel seeks or changes the volume.
 - Click or drag the progress bar to seek, and the volume slider to set the volume.
+
+### Themes
+
+`T` opens the theme picker. Seven themes are built in: **amber** (the default),
+**rose-pine**, **gruvbox**, **nord**, **catppuccin**, **tokyo-night** and **mono**. Each one
+sets the colours, a second accent for the gradient on the progress bar and the logo, the
+panel corners, the mark on the selected row, the logo character and the progress-bar
+characters. The background is always your terminal's own.
+
+A theme is one commented TOML file (see [`themes/`](themes/)). Your own themes go in
+`~/.config/spotlite/themes/<name>.toml`; a file with the name of a built-in theme replaces
+it. Keys you leave out take the amber value, and a typo or a bad value is reported, not
+ignored. A running spotlite reloads the theme when you save its file, so you can edit a
+theme and watch it change.
+
+The same from a shell, for scripts and AI agents:
+
+```
+spotlite theme                   list themes (* = in use), with any broken ones
+spotlite theme set nord          use nord (a running spotlite changes within a second)
+spotlite theme file nord         print nord's file, copying the built-in one there first
+spotlite theme new dusk nord     make "dusk" from nord, print its file
+spotlite theme check dusk        report mistakes in a theme file
+```
+
+```toml
+# ~/.config/spotlite/themes/dusk.toml (part)
+accent   = "#88c0d0"  # highlights, focused panel, start of the progress gradient
+accent2  = "#b48ead"  # end of the progress gradient
+corners  = "rounded"  # rounded, plain, thick or double
+marker   = "▍"        # one character before the selected row
+logo     = "◆"        # one character before "spotlite" and the playing song
+bar      = "━─"       # filled and empty parts of the progress bar
+```
 
 ### Playlist folders
 
@@ -179,6 +232,7 @@ spotlite            terminal UI
 spotlite auth       log in (token in ~/.cache/spotlite/token.json, mode 600)
 spotlite devices    list Spotify Connect devices
 spotlite folders    print your playlist folders
+spotlite theme ...  list, set, copy, make and check themes (see Themes)
 spotlite toggle     play/pause
 spotlite next       next track
 spotlite prev       previous track

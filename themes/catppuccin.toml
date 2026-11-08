@@ -1,0 +1,26 @@
+# spotlite theme “catppuccin”: Catppuccin Mocha: soft pastels, mauve that blends to pink.
+#
+# Edit and save: a running spotlite shows the change within a second.
+# Colours are "#rrggbb". A key you leave out takes the value of the amber theme.
+# The background is your terminal's own (its opacity shows through).
+
+# Colours
+text     = "#cdd6f4"  # song names, normal text
+bright   = "#e6ebff"  # titles, the selected row
+muted    = "#a6adc8"  # second lines, artists
+faint    = "#6c7086"  # hints, numbers, rules
+border   = "#45475a"  # panel borders
+selected = "#313244"  # background of the selected row
+accent   = "#cba6f7"  # highlights, focused panel, start of the progress gradient
+accent2  = "#f5c2e7"  # end of the progress gradient
+red      = "#f38ba8"  # errors, remove actions
+green    = "#a6e3a1"  # liked songs, the active device
+viz_low  = "#181825"  # visualizer bars, bottom shade
+viz_high = "#2a2b3d"  # visualizer bars, top shade
+viz_line = "#7f849c"  # visualizer line over the bars
+
+# Style
+corners  = "rounded"  # panel corners and lines: rounded, plain, thick or double
+marker   = "▌"  # one character before the selected row
+logo     = "●"  # one character before "spotlite" and the playing song
+bar      = "━╌"  # two characters: the filled and the empty part of the progress bar

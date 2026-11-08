@@ -1,0 +1,26 @@
+# spotlite theme “gruvbox”: Gruvbox dark: warm browns, a yellow accent that burns to orange, retro blocks.
+#
+# Edit and save: a running spotlite shows the change within a second.
+# Colours are "#rrggbb". A key you leave out takes the value of the amber theme.
+# The background is your terminal's own (its opacity shows through).
+
+# Colours
+text     = "#ebdbb2"  # song names, normal text
+bright   = "#fbf1c7"  # titles, the selected row
+muted    = "#a89984"  # second lines, artists
+faint    = "#7c6f64"  # hints, numbers, rules
+border   = "#504945"  # panel borders
+selected = "#32302f"  # background of the selected row
+accent   = "#fabd2f"  # highlights, focused panel, start of the progress gradient
+accent2  = "#fe8019"  # end of the progress gradient
+red      = "#fb4934"  # errors, remove actions
+green    = "#b8bb26"  # liked songs, the active device
+viz_low  = "#1d2021"  # visualizer bars, bottom shade
+viz_high = "#282828"  # visualizer bars, top shade
+viz_line = "#7c6f64"  # visualizer line over the bars
+
+# Style
+corners  = "plain"  # panel corners and lines: rounded, plain, thick or double
+marker   = "█"  # one character before the selected row
+logo     = "♫"  # one character before "spotlite" and the playing song
+bar      = "█░"  # two characters: the filled and the empty part of the progress bar

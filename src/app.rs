@@ -1,9 +1,10 @@
-use crate::api::{Album, Page as ApiPage, Play, Playback, Playlist, Track};
+use crate::api::{Album, Found, Page as ApiPage, Play, Playback, Playlist, Track};
 use crate::control::Ctl;
 use crate::folders::Entry;
 use crate::images::Images;
 use crate::pages::{AlbumPage, ArtistPage, ArtistRow, FilterItem, Page, RadioPage};
 use crate::radio::Library;
+use crate::state::{SavedTab, State};
 use crate::viz::Visualizer;
 use crate::worker::{Cmd, Kind, List, Msg};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -35,16 +36,18 @@ pub enum Tab {
     Search,
     Playlists,
     Liked,
+    Recent,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Search, Tab::Playlists, Tab::Liked];
+    pub const ALL: [Tab; 4] = [Tab::Search, Tab::Playlists, Tab::Liked, Tab::Recent];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Search => "Search",
             Tab::Playlists => "Playlists",
             Tab::Liked => "Liked",
+            Tab::Recent => "Recent",
         }
     }
 }
@@ -150,6 +153,38 @@ pub const MAX_PAGES: usize = 8;
 /// Back steps kept.
 const HISTORY: usize = 50;
 
+/// What the search lists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SearchKind {
+    Songs,
+    Artists,
+    Albums,
+    Playlists,
+}
+
+impl SearchKind {
+    pub const ALL: [SearchKind; 4] = [SearchKind::Songs, SearchKind::Artists, SearchKind::Albums, SearchKind::Playlists];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            SearchKind::Songs => "Songs",
+            SearchKind::Artists => "Artists",
+            SearchKind::Albums => "Albums",
+            SearchKind::Playlists => "Playlists",
+        }
+    }
+
+    /// The Web API's search type (None for songs, which have their own list).
+    fn api(self) -> Option<&'static str> {
+        match self {
+            SearchKind::Songs => None,
+            SearchKind::Artists => Some("artist"),
+            SearchKind::Albums => Some("album"),
+            SearchKind::Playlists => Some("playlist"),
+        }
+    }
+}
+
 /// What the main panel shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -157,6 +192,8 @@ pub enum View {
     Playlists,
     Playlist,
     Liked,
+    /// Recently played (the last 50 songs).
+    Recent,
     Artist,
     Album,
     Radio,
@@ -174,6 +211,8 @@ pub enum Action {
     RemoveFromPlaylist,
     Like,
     Filter(FilterItem),
+    /// A theme by name (the theme picker, `T`).
+    Theme(String),
 }
 
 /// A pop-up list of actions: for a track (`.` or right-click), or the radio filters (`F`).
@@ -182,8 +221,14 @@ pub struct Menu {
     /// (key hint, label, action); the label of a filter shows its current value.
     pub items: Vec<(&'static str, String, Action)>,
     pub cursor: usize,
-    /// The track the actions apply to (None for the filter menu).
+    /// The track the actions apply to (None for the filter and theme menus).
     pub track: Option<Track>,
+}
+
+impl Menu {
+    pub fn is_theme(&self) -> bool {
+        matches!(self.items.first(), Some((_, _, Action::Theme(_))))
+    }
 }
 
 /// Choose a playlist to add a track to; type to narrow the list.
@@ -203,6 +248,8 @@ pub struct Confirm {
 #[derive(Default, Debug)]
 pub struct Hits {
     pub tabs: Vec<(Rect, Loc)>,
+    /// Song / artist / album / playlist switches in the search results title.
+    pub search_kinds: Vec<(Rect, SearchKind)>,
     pub search_box: Rect,
     /// Rows of the current list (header excluded).
     pub list: Rect,
@@ -254,9 +301,13 @@ pub struct App {
     pub search: Listing<Track>,
     /// Query the search results belong to.
     pub searched: String,
+    pub search_kind: SearchKind,
+    /// Artists, albums or playlists found (when search_kind is not Songs).
+    pub found: Listing<Found>,
     pub playlists: Listing<Playlist>,
     pub open: Option<OpenPlaylist>,
     pub liked: Listing<Track>,
+    pub recent: Listing<Track>,
     pub playback: Option<Playback>,
     pub polled_at: Instant,
     /// Whether the playing track is in Liked Songs.
@@ -308,6 +359,12 @@ pub struct App {
     pub active: Option<usize>,
     /// Where you were before, for Esc (newest last).
     history: Vec<Loc>,
+    /// Pages restored at start that have not loaded yet (by key): they load when shown.
+    unloaded: std::collections::HashSet<String>,
+    /// The theme in use when the picker opened (Esc goes back to it).
+    theme_before: Option<String>,
+    /// Live reload: when the theme file and the saved state were last looked at, and their times.
+    theme_watch: (Instant, Option<std::time::SystemTime>, Option<std::time::SystemTime>),
     pub menu: Option<Menu>,
     pub picker: Option<Picker>,
     pub confirm: Option<Confirm>,
@@ -327,9 +384,12 @@ impl App {
             query: String::new(),
             search: Listing::default(),
             searched: String::new(),
+            search_kind: SearchKind::Songs,
+            found: Listing::default(),
             playlists: Listing::default(),
             open: None,
             liked: Listing::default(),
+            recent: Listing::default(),
             playback: None,
             polled_at: now,
             saved: None,
@@ -366,6 +426,9 @@ impl App {
             pages: Vec::new(),
             active: None,
             history: Vec::new(),
+            unloaded: Default::default(),
+            theme_before: None,
+            theme_watch: (Instant::now(), None, None),
             menu: None,
             picker: None,
             confirm: None,
@@ -610,6 +673,7 @@ impl App {
             Tab::Playlists if self.open.is_some() => View::Playlist,
             Tab::Playlists => View::Playlists,
             Tab::Liked => View::Liked,
+            Tab::Recent => View::Recent,
         }
     }
 
@@ -618,8 +682,9 @@ impl App {
         match (self.view(), self.page()) {
             (View::Album, Some(Page::Album(a))) => Some(&a.tracks),
             (View::Radio, Some(Page::Radio(r))) => Some(&r.tracks),
-            (View::Search, _) => Some(&self.search),
+            (View::Search, _) if self.search_kind == SearchKind::Songs => Some(&self.search),
             (View::Liked, _) => Some(&self.liked),
+            (View::Recent, _) => Some(&self.recent),
             (View::Playlist, _) => self.open.as_ref().map(|o| &o.tracks),
             _ => None,
         }
@@ -627,8 +692,10 @@ impl App {
 
     pub fn tracks_mut(&mut self) -> Option<&mut Listing<Track>> {
         match self.view() {
-            View::Search => Some(&mut self.search),
+            View::Search if self.search_kind == SearchKind::Songs => Some(&mut self.search),
+            View::Search => None,
             View::Liked => Some(&mut self.liked),
+            View::Recent => Some(&mut self.recent),
             View::Playlist => self.open.as_mut().map(|o| &mut o.tracks),
             View::Album => match self.page_mut() {
                 Some(Page::Album(a)) => Some(&mut a.tracks),
@@ -746,15 +813,18 @@ impl App {
             self.send(Cmd::Poll);
         }
         self.load_more();
+        self.watch_theme();
     }
 
     fn load_more(&mut self) {
         let request = match self.view() {
-            View::Search if !self.searched.is_empty() => self
-                .search
-                .wants_page()
-                .map(|o| (List::Search(self.searched.clone()), o)),
-            View::Search => None,
+            View::Search if self.searched.is_empty() => None,
+            View::Search => match self.search_kind.api() {
+                None => self.search.wants_page().map(|o| (List::Search(self.searched.clone()), o)),
+                Some(kind) => {
+                    self.found.wants_page().map(|o| (List::Found { query: self.searched.clone(), kind }, o))
+                }
+            },
             // The folder tree needs every playlist's name and cover, so load all pages at once.
             View::Playlists if self.foldered() => {
                 let l = &self.playlists;
@@ -762,6 +832,7 @@ impl App {
             }
             View::Playlists => self.playlists.wants_page().map(|o| (List::Playlists, o)),
             View::Liked => self.liked.wants_page().map(|o| (List::Liked, o)),
+            View::Recent => self.recent.wants_page().map(|o| (List::Recent, o)),
             View::Playlist => self.open.as_ref().and_then(|o| {
                 o.tracks
                     .wants_page()
@@ -782,6 +853,8 @@ impl App {
         if let Some((list, offset)) = request {
             if list == List::Playlists {
                 self.playlists.loading = true;
+            } else if matches!(list, List::Found { .. }) {
+                self.found.loading = true;
             } else if let Some(l) = self.listing_for(&list) {
                 l.loading = true;
             }
@@ -793,6 +866,7 @@ impl App {
         match list {
             List::Search(q) if *q == self.searched => Some(&mut self.search),
             List::Liked => Some(&mut self.liked),
+            List::Recent => Some(&mut self.recent),
             List::Playlist(id) => self
                 .open
                 .as_mut()
@@ -971,10 +1045,19 @@ impl App {
                     o.tracks.state.select((len > 0).then_some(sel));
                 }
             }
+            Msg::Created => {
+                self.playlists.reset();
+                self.rebuild_rows();
+            }
             Msg::Added { playlist_id } => {
                 // Reload an open copy of that playlist so the new song shows.
                 if let Some(o) = self.open.as_mut().filter(|o| o.playlist.id == playlist_id) {
                     o.tracks.reset();
+                }
+            }
+            Msg::Found { list, offset, page } => {
+                if self.is_current_found(&list) {
+                    self.found.apply(offset, page);
                 }
             }
             Msg::Tracks { list, offset, page } => {
@@ -991,6 +1074,9 @@ impl App {
                 if list == List::Playlists {
                     self.playlists.loading = false;
                     self.playlists.total = Some(self.playlists.fetched);
+                } else if self.is_current_found(&list) {
+                    self.found.loading = false;
+                    self.found.total = Some(self.found.fetched);
                 } else if let Some(listing) = self.listing_for(&list) {
                     listing.loading = false;
                     listing.total = Some(listing.fetched);
@@ -1001,7 +1087,33 @@ impl App {
                     }
                 }
             }
-            Msg::Saved { uri, saved } => self.saved = Some((uri, saved)),
+            Msg::Saved { uri, saved } => {
+                if self.playing_uri() == Some(uri.as_str()) {
+                    self.saved = Some((uri.clone(), saved));
+                }
+                if let Some(lib) = self.library.as_mut() {
+                    if saved {
+                        lib.tracks.insert(uri.clone());
+                    } else {
+                        lib.tracks.remove(&uri);
+                    }
+                }
+                if saved {
+                    // Liked Songs loads again, with the new song at the top.
+                    if self.view() != View::Liked {
+                        self.liked.reset();
+                    }
+                } else {
+                    let before = self.liked.items.len();
+                    self.liked.items.retain(|t| t.uri != uri);
+                    if self.liked.items.len() < before {
+                        self.liked.total = self.liked.total.map(|t| t.saturating_sub(1));
+                        let len = self.liked.items.len();
+                        let sel = self.liked.selected().min(len.saturating_sub(1));
+                        self.liked.state.select((len > 0).then_some(sel));
+                    }
+                }
+            }
             Msg::Info(text) => self.info(text),
             Msg::Error(text) => self.error(text),
             Msg::Backoff(secs) => self.next_poll = Instant::now() + Duration::from_secs(secs.max(5)),
@@ -1045,7 +1157,68 @@ impl App {
                 self.tab = t;
                 self.active = None;
             }
-            Loc::Page(k) => self.active = self.pages.iter().position(|p| p.key() == k),
+            Loc::Page(k) => {
+                self.active = self.pages.iter().position(|p| p.key() == k);
+                if self.unloaded.remove(&k) {
+                    if let Some(i) = self.active {
+                        self.load_page(i);
+                    }
+                }
+            }
+        }
+        // Recently played changes as you listen: load it again on each visit.
+        if self.view() == View::Recent && !self.recent.loading {
+            self.recent.reset();
+        }
+    }
+
+    /// Asks for what page `i` shows (the album's songs load in tick()).
+    fn load_page(&mut self, i: usize) {
+        let cmd = match &self.pages[i] {
+            Page::Artist(a) => Cmd::Artist(a.id.clone()),
+            Page::Album(a) => Cmd::Album(a.id.clone()),
+            Page::Radio(r) => Cmd::Radio(r.seed.uri.clone()),
+        };
+        if matches!(cmd, Cmd::Radio(_)) && !self.library_asked {
+            self.library_asked = true;
+            self.send(Cmd::Library);
+        }
+        self.send(cmd);
+    }
+
+    /// The open tabs and the theme, to save at quit.
+    pub fn saved_state(&self) -> State {
+        let tabs = self
+            .pages
+            .iter()
+            .map(|p| match p {
+                Page::Artist(a) => SavedTab::Artist { id: a.id.clone(), name: a.name.clone() },
+                Page::Album(a) => SavedTab::Album { album: a.album.clone() },
+                Page::Radio(r) => SavedTab::Radio { seed: r.seed.clone() },
+            })
+            .collect();
+        State { theme: Some(crate::theme::name()), tabs, active: self.active }
+    }
+
+    /// Opens the tabs of the last run. Nothing loads until a tab is shown.
+    pub fn restore(&mut self, state: State) {
+        for tab in state.tabs.into_iter().take(MAX_PAGES) {
+            let page = match tab {
+                SavedTab::Artist { id, name } => Page::Artist(ArtistPage::new(id, name)),
+                SavedTab::Album { album } => match album.id.clone() {
+                    Some(id) => Page::Album(AlbumPage { id, album, tracks: Listing::default() }),
+                    None => continue,
+                },
+                SavedTab::Radio { seed } => Page::Radio(Box::new(RadioPage::new(seed))),
+            };
+            let key = page.key();
+            if !self.exists(&Loc::Page(key.clone())) {
+                self.unloaded.insert(key);
+                self.pages.push(page);
+            }
+        }
+        if let Some(key) = state.active.and_then(|i| self.pages.get(i)).map(Page::key) {
+            self.show(Loc::Page(key));
         }
     }
 
@@ -1099,6 +1272,7 @@ impl App {
             return;
         };
         let key = self.pages.remove(i).key();
+        self.unloaded.remove(&key);
         self.active = None;
         self.history.retain(|l| *l != Loc::Page(key.clone()));
         while let Some(loc) = self.history.pop() {
@@ -1218,10 +1392,12 @@ impl App {
         if let Some(pl) = self.editable_open_playlist() {
             items.push(("D", format!("Remove from {}", pl.name), Action::RemoveFromPlaylist));
         }
-        let liked = matches!(&self.saved, Some((u, true)) if *u == track.uri);
-        if self.playing_uri() == Some(track.uri.as_str()) {
-            items.push(("f", if liked { "Remove from Liked Songs" } else { "Add to Liked Songs" }.into(), Action::Like));
-        }
+        let label = match self.is_liked(&track.uri) {
+            Some(true) => "Remove from Liked Songs",
+            Some(false) => "Add to Liked Songs",
+            None => "Like / unlike",
+        };
+        items.push(("f", label.into(), Action::Like));
         self.menu = Some(Menu { title: track.name.clone(), items, cursor: 0, track: Some(track) });
     }
 
@@ -1259,6 +1435,80 @@ impl App {
         }
     }
 
+    /// The theme picker: every theme, read fresh from disk; moving previews it.
+    fn open_themes(&mut self) {
+        let current = crate::theme::name();
+        let items: Vec<(&'static str, String, Action)> = crate::theme::all()
+            .into_iter()
+            .map(|(name, _)| {
+                let edited = crate::theme::file(&name).exists();
+                let label = if edited { format!("{name} (your file)") } else { name.clone() };
+                ("", label, Action::Theme(name))
+            })
+            .collect();
+        let cursor = items.iter().position(|(_, _, a)| *a == Action::Theme(current.clone())).unwrap_or(0);
+        self.theme_before = Some(current);
+        self.menu = Some(Menu { title: "Theme".into(), items, cursor, track: None });
+    }
+
+    /// Uses the theme under the picker's cursor (as a preview, or for good with `keep`).
+    fn try_theme(&mut self, name: &str, keep: bool) {
+        match crate::theme::apply(name) {
+            Ok(()) if keep => {
+                self.theme_before = None;
+                if !cfg!(test) {
+                    let _ = crate::state::save(&self.saved_state());
+                }
+                self.theme_watch.2 = None;
+                self.info(format!("Theme {name}. To change it: spotlite theme file {name}"));
+            }
+            Ok(()) => {}
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// Closes any menu; the theme picker puts the old theme back.
+    fn close_menu(&mut self) {
+        if let Some(name) = self.theme_before.take() {
+            let _ = crate::theme::apply(&name);
+        }
+        self.menu = None;
+    }
+
+    /// Live reload, once a second: the theme file changed (an edit), or the saved theme name
+    /// changed (`spotlite theme set`, from a shell or an AI agent).
+    fn watch_theme(&mut self) {
+        if cfg!(test) || self.theme_watch.0.elapsed() < Duration::from_secs(1) || self.theme_before.is_some() {
+            return;
+        }
+        self.theme_watch.0 = Instant::now();
+        let mtime = |p: std::path::PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let state_time = mtime(crate::state::path());
+        if state_time != self.theme_watch.2 {
+            let first = self.theme_watch.2.is_none();
+            self.theme_watch.2 = state_time;
+            if let Some(name) = crate::state::load().theme.filter(|n| *n != crate::theme::name()) {
+                match crate::theme::apply(&name) {
+                    Ok(()) if !first => self.info(format!("Theme {name}")),
+                    Ok(()) => {}
+                    Err(e) => self.error(e),
+                }
+            }
+        }
+        let name = crate::theme::name();
+        let file_time = mtime(crate::theme::file(&name));
+        if file_time != self.theme_watch.1 {
+            let first = self.theme_watch.1.is_none();
+            self.theme_watch.1 = file_time;
+            if !first || file_time.is_some() {
+                // A deleted file goes back to the built-in theme of that name, if there is one.
+                if let Err(e) = crate::theme::apply(&name) {
+                    self.error(e);
+                }
+            }
+        }
+    }
+
     fn open_filters(&mut self) {
         if self.view() != View::Radio {
             return;
@@ -1272,6 +1522,11 @@ impl App {
         let Some(menu) = self.menu.as_ref() else { return };
         let Some((_, _, action)) = menu.items.get(menu.cursor).cloned() else { return };
         let track = menu.track.clone();
+        if let Action::Theme(name) = action {
+            self.menu = None;
+            self.try_theme(&name, true);
+            return;
+        }
         if let Action::Filter(item) = action {
             // Filters stay open: change, see the list update, change again.
             if item == FilterItem::Discover {
@@ -1309,8 +1564,8 @@ impl App {
             Action::Radio => self.start_radio(track),
             Action::AddToPlaylist => self.open_picker(track),
             Action::RemoveFromPlaylist => self.ask_remove(track),
-            Action::Like => self.toggle_like(),
-            Action::Filter(_) => {}
+            Action::Like => self.toggle_like(Some(track)),
+            Action::Filter(_) | Action::Theme(_) => {}
         }
     }
 
@@ -1385,6 +1640,9 @@ impl App {
         let step = |c: usize| (c as isize + delta).rem_euclid(len as isize) as usize;
         if let Some(m) = self.menu.as_mut() {
             m.cursor = step(m.cursor);
+            if let Some((_, _, Action::Theme(name))) = m.items.get(m.cursor).cloned() {
+                self.try_theme(&name, false);
+            }
         } else if let Some(p) = self.picker.as_mut() {
             p.cursor = step(p.cursor.min(len - 1));
         }
@@ -1398,6 +1656,15 @@ impl App {
                 let uri = a.album.uri.clone().unwrap_or_else(|| format!("spotify:album:{}", a.id));
                 self.send(Cmd::Play(Play::Context { uri, from: Some(t.uri.clone()) }));
                 self.poll_soon();
+            }
+            View::Recent => {
+                // The same song can be in the list twice; play the list as it is.
+                let uris: Vec<String> = self.recent.items.iter().map(|t| t.uri.clone()).collect();
+                if !uris.is_empty() {
+                    let offset = self.recent.selected();
+                    self.send(Cmd::Play(Play::Tracks { uris, offset }));
+                    self.poll_soon();
+                }
             }
             View::Radio => {
                 let Some(Page::Radio(r)) = self.page() else { return };
@@ -1429,6 +1696,7 @@ impl App {
                     Some(ArtistRow::Header(_)) | None => {}
                 }
             }
+            View::Search if self.search_kind != SearchKind::Songs => self.open_found(),
             View::Search => {
                 let uris: Vec<String> = self.search.items.iter().map(|t| t.uri.clone()).collect();
                 if !uris.is_empty() {
@@ -1508,15 +1776,57 @@ impl App {
         }
     }
 
-    fn toggle_like(&mut self) {
+    /// Whether a song is in Liked Songs, if spotlite knows.
+    pub fn is_liked(&self, uri: &str) -> Option<bool> {
+        match &self.saved {
+            Some((u, s)) if u == uri => Some(*s),
+            _ => self.library.as_ref().map(|l| l.tracks.contains(uri)),
+        }
+    }
+
+    /// Likes or unlikes a song: the selected one, else the playing one.
+    fn toggle_like(&mut self, track: Option<Track>) {
         if !self.can_like {
             self.error("Run `spotlite auth` again to allow liking songs.");
             return;
         }
-        match self.saved.clone() {
-            Some((uri, saved)) => self.send(Cmd::SetSaved { uri, saved: !saved }),
-            None => self.info("Nothing to like yet."),
+        let Some(track) = track.or_else(|| self.target_track()) else {
+            self.info("Select a song first.");
+            return;
+        };
+        match &self.saved {
+            Some((u, saved)) if *u == track.uri => {
+                let saved = *saved;
+                self.send(Cmd::SetSaved { uri: track.uri, saved: !saved })
+            }
+            // Spotify says which it is: the library index may be old.
+            _ => self.send(Cmd::ToggleSaved(track.uri)),
         }
+    }
+
+    /// Asks to save the radio list on screen as a new playlist.
+    fn ask_save_radio(&mut self) {
+        if !self.can_edit {
+            self.error("Run `spotlite auth` again to allow editing playlists.");
+            return;
+        }
+        let Some(Page::Radio(r)) = self.page() else { return };
+        let uris: Vec<String> = r.tracks.items.iter().map(|t| t.uri.clone()).collect();
+        if uris.is_empty() {
+            self.info("No songs to save.");
+            return;
+        }
+        let kind = if r.seed.uri.starts_with("spotify:artist:") { "artist radio" } else { "song radio" };
+        let name = if r.filters.discover {
+            format!("{} · discover {}", r.seed.name, r.round)
+        } else {
+            format!("{} radio", r.seed.name)
+        };
+        let description = format!("Made with spotlite from the {kind} of {}.", r.seed.name);
+        self.confirm = Some(Confirm {
+            text: format!("Save these {} songs as a new playlist “{name}”?", uris.len()),
+            cmd: Cmd::CreatePlaylist { name, description, uris },
+        });
     }
 
     fn seek(&mut self, forward: bool) {
@@ -1603,6 +1913,42 @@ impl App {
         self.send(Cmd::Shuffle(on));
     }
 
+    /// True when `list` is the non-song search shown now (older answers are dropped).
+    fn is_current_found(&self, list: &List) -> bool {
+        matches!(list, List::Found { query, kind } if *query == self.searched && Some(*kind) == self.search_kind.api())
+    }
+
+    /// Shows another kind of search result (the list loads in tick()).
+    pub fn set_search_kind(&mut self, kind: SearchKind) {
+        if self.tab != Tab::Search || self.active.is_some() {
+            self.switch_tab(Tab::Search);
+        }
+        if kind != self.search_kind {
+            self.search_kind = kind;
+            self.found.reset();
+        }
+    }
+
+    /// Enter on an artist, album or playlist found by search.
+    fn open_found(&mut self) {
+        let Some(item) = self.found.current().cloned() else { return };
+        match item {
+            Found::Artist(a) => self.open_artist(a.id, a.name),
+            Found::Album(a) => self.open_album(a),
+            Found::Playlist(p) if self.owns(&p) => {
+                // Your own playlist opens in the Playlists tab, like there.
+                self.open = Some(OpenPlaylist { playlist: p, tracks: Listing::default() });
+                self.switch_tab(Tab::Playlists);
+            }
+            Found::Playlist(p) => {
+                // Spotify lists only your own playlists' songs to dev-mode apps: play it.
+                self.info(format!("Playing {}", p.name));
+                self.send(Cmd::Play(Play::Context { uri: p.uri, from: None }));
+                self.poll_soon();
+            }
+        }
+    }
+
     fn submit_search(&mut self) {
         let q = self.query.trim().to_owned();
         self.typing = false;
@@ -1611,18 +1957,23 @@ impl App {
         }
         self.searched = q;
         self.search.reset();
+        self.found.reset();
         // tick() loads the first page.
     }
 
     fn reload(&mut self) {
         match self.view() {
             View::Artist | View::Album | View::Radio => {}
-            View::Search => self.search.reset(),
+            View::Search => {
+                self.search.reset();
+                self.found.reset();
+            }
             View::Playlists => {
                 self.playlists.reset();
                 self.rebuild_rows();
             }
             View::Liked => self.liked.reset(),
+            View::Recent => self.recent.reset(),
             View::Playlist => {
                 if let Some(o) = self.open.as_mut() {
                     o.tracks.reset();
@@ -1635,6 +1986,8 @@ impl App {
     fn move_selection(&mut self, delta: isize) {
         if let Some(a) = self.artist_page_mut() {
             a.move_by(delta);
+        } else if self.view() == View::Search && self.search_kind != SearchKind::Songs {
+            self.found.move_by(delta);
         } else if self.view() == View::Playlists && self.foldered() {
             self.rows.move_by(delta);
         } else if self.view() == View::Playlists {
@@ -1651,6 +2004,7 @@ impl App {
         match self.view() {
             View::Playlists if self.foldered() => self.rows.items.len(),
             View::Playlists => self.playlists.items.len(),
+            View::Search if self.search_kind != SearchKind::Songs => self.found.items.len(),
             _ => self.tracks().map_or(0, |l| l.items.len()),
         }
     }
@@ -1658,6 +2012,8 @@ impl App {
     fn select(&mut self, i: usize) {
         if let Some(a) = self.artist_page_mut() {
             a.select(i);
+        } else if self.view() == View::Search && self.search_kind != SearchKind::Songs {
+            self.found.state.select(Some(i));
         } else if self.view() == View::Playlists && self.foldered() {
             self.rows.state.select(Some(i));
         } else if self.view() == View::Playlists {
@@ -1714,7 +2070,7 @@ impl App {
                             }
                         }
                         _ if !self.hits.popup.contains(pos) || self.confirm.is_some() => {
-                            self.menu = None;
+                            self.close_menu();
                             self.picker = None;
                             self.confirm = None;
                         }
@@ -1773,7 +2129,9 @@ impl App {
 
     fn on_click(&mut self, pos: Position) {
         let h = &self.hits;
-        if let Some((_, loc)) = h.tabs.iter().find(|(r, _)| r.contains(pos)) {
+        if let Some(&(_, kind)) = h.search_kinds.iter().find(|(r, _)| r.contains(pos)) {
+            self.set_search_kind(kind);
+        } else if let Some((_, loc)) = h.tabs.iter().find(|(r, _)| r.contains(pos)) {
             let loc = loc.clone();
             self.go(loc);
         } else if h.search_box.contains(pos) {
@@ -1800,7 +2158,11 @@ impl App {
         } else if h.repeat.contains(pos) {
             self.cycle_repeat();
         } else if h.like.contains(pos) {
-            self.toggle_like();
+            // The heart in the player is for the playing song.
+            let playing = self.playback.as_ref().and_then(|p| p.item.clone());
+            if playing.is_some() {
+                self.toggle_like(playing);
+            }
         } else if h.volume.contains(pos) {
             self.drag = Some(Drag::Volume);
             self.set_volume((fraction(h.volume, pos.x) * 100.0).round() as u8);
@@ -1871,8 +2233,11 @@ impl App {
         }
         if self.menu.is_some() {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('.') => self.menu = None,
-                KeyCode::Char('F') if self.menu.as_ref().is_some_and(|m| m.track.is_none()) => self.menu = None,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('.') => self.close_menu(),
+                KeyCode::Char('F') if self.menu.as_ref().is_some_and(|m| m.track.is_none() && !m.is_theme()) => {
+                    self.close_menu()
+                }
+                KeyCode::Char('T') if self.menu.as_ref().is_some_and(Menu::is_theme) => self.close_menu(),
                 KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') => self.run_menu(),
                 KeyCode::Down | KeyCode::Char('j') => self.move_popup(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_popup(-1),
@@ -1940,6 +2305,11 @@ impl App {
                 }
             }
             KeyCode::Char('x') => self.close_page(),
+            KeyCode::Char('t') if self.view() == View::Search => {
+                let i = SearchKind::ALL.iter().position(|k| *k == self.search_kind).unwrap_or(0);
+                self.set_search_kind(SearchKind::ALL[(i + 1) % SearchKind::ALL.len()]);
+            }
+            KeyCode::Char('T') => self.open_themes(),
             KeyCode::Char('d') if !ctrl && self.view() == View::Radio => self.discover_round(),
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => self.back(),
             KeyCode::Char('.') => self.open_menu(),
@@ -2002,7 +2372,8 @@ impl App {
             KeyCode::Char('m') => self.toggle_mute(),
             KeyCode::Char('s') => self.toggle_shuffle(),
             KeyCode::Char('r') => self.cycle_repeat(),
-            KeyCode::Char('f') => self.toggle_like(),
+            KeyCode::Char('f') => self.toggle_like(None),
+            KeyCode::Char('S') if self.view() == View::Radio => self.ask_save_radio(),
             KeyCode::Char('R') => self.reload(),
             _ => {}
         }
@@ -2383,8 +2754,8 @@ mod tests {
         // Esc went back, but the artist, radio and album tabs stay open.
         let keys: Vec<String> = app.pages.iter().map(Page::key).collect();
         assert_eq!(keys, ["artist:ar1", "radio:spotify:artist:ar1", "album:al1"]);
-        // 5 is the second page tab (after Search, Playlists, Liked).
-        app.on_key(KeyEvent::from(KeyCode::Char('5')));
+        // 6 is the second page tab (after Search, Playlists, Liked, Recent).
+        app.on_key(KeyEvent::from(KeyCode::Char('6')));
         assert_eq!(app.view(), View::Radio);
         app.on_key(KeyEvent::from(KeyCode::Char('2')));
         assert_eq!(app.view(), View::Playlists);
@@ -2402,7 +2773,138 @@ mod tests {
         assert_eq!(app.pages.len(), 2);
         assert_eq!(app.view(), View::Artist);
         app.on_key(KeyEvent::from(KeyCode::Char('H')));
-        assert_eq!(app.view(), View::Liked);
+        assert_eq!(app.view(), View::Recent);
+    }
+
+    #[test]
+    fn tabs_come_back_at_start_and_load_when_shown() {
+        let (mut app, rx) = test_app();
+        app.open_artist("ar1".into(), "Bowie".into());
+        app.start_radio(track_by("s", ("ar1", "Bowie"), ("al1", "Low")));
+        let saved = app.saved_state();
+        let text = serde_json::to_string(&saved).unwrap();
+        let back: State = serde_json::from_str(&text).unwrap();
+        drain(&rx);
+
+        let (mut app, rx) = test_app();
+        app.restore(back);
+        assert_eq!(app.pages.iter().map(Page::key).collect::<Vec<_>>(), ["artist:ar1", "radio:spotify:track:s"]);
+        assert_eq!(app.view(), View::Radio, "the tab shown at quit");
+        let cmds = drain(&rx);
+        if crate::client::AVAILABLE {
+            assert!(cmds.iter().any(|c| matches!(c, Cmd::Radio(u) if u == "spotify:track:s")), "{cmds:?}");
+        }
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::Artist(_))), "the artist waits: {cmds:?}");
+        app.on_key(KeyEvent::from(KeyCode::Char('5')));
+        assert_eq!(app.view(), View::Artist);
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Artist(id) if id == "ar1")));
+        // Shown once, it does not load again.
+        app.on_key(KeyEvent::from(KeyCode::Char('6')));
+        app.on_key(KeyEvent::from(KeyCode::Char('5')));
+        assert!(!drain(&rx).iter().any(|c| matches!(c, Cmd::Artist(_))));
+    }
+
+    #[test]
+    fn theme_picker_previews_and_esc_puts_it_back() {
+        let (mut app, _rx) = test_app();
+        assert_eq!(crate::theme::name(), "amber");
+        app.on_key(KeyEvent::from(KeyCode::Char('T')));
+        let menu = app.menu.as_ref().unwrap();
+        assert!(menu.is_theme());
+        assert!(menu.items.iter().any(|i| i.2 == Action::Theme("tokyo-night".into())), "built-ins listed");
+        // Moving previews; Esc goes back.
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(crate::theme::name(), "rose-pine");
+        assert_eq!(crate::theme::c().logo, '✦');
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(crate::theme::name(), "amber");
+        assert!(app.menu.is_none());
+        // Enter keeps it, and the saved state carries it.
+        app.on_key(KeyEvent::from(KeyCode::Char('T')));
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(crate::theme::name(), "gruvbox");
+        assert_eq!(app.saved_state().theme.as_deref(), Some("gruvbox"));
+        crate::theme::apply("amber").unwrap();
+    }
+
+    #[test]
+    fn recent_tab_loads_each_visit() {
+        let (mut app, rx) = test_app();
+        app.on_key(KeyEvent::from(KeyCode::Char('4')));
+        assert_eq!(app.view(), View::Recent);
+        app.tick();
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Load { list: List::Recent, offset: 0 })));
+        let t = track_by("1", ("a", "A"), ("b", "B"));
+        app.on_msg(Msg::Tracks { list: List::Recent, offset: 0, page: ApiPage { items: vec![t], raw: 1, total: 1 } });
+        app.on_key(KeyEvent::from(KeyCode::Char('1')));
+        app.on_key(KeyEvent::from(KeyCode::Char('4')));
+        assert!(app.recent.items.is_empty(), "loads again");
+    }
+
+    #[test]
+    fn search_lists_artists_albums_and_playlists() {
+        use crate::api::{Artist, Found};
+        let (mut app, rx) = test_app();
+        app.query = "bowie".into();
+        app.submit_search();
+        app.on_key(KeyEvent::from(KeyCode::Char('t')));
+        assert_eq!(app.search_kind, SearchKind::Artists);
+        app.tick();
+        let cmds = drain(&rx);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::Load { list: List::Found { query, kind: "artist" }, offset: 0 } if query == "bowie")),
+            "{cmds:?}"
+        );
+        let artist: Artist = serde_json::from_value(serde_json::json!({"id": "ar1", "name": "David Bowie"})).unwrap();
+        // An answer for another kind is dropped.
+        let other = List::Found { query: "bowie".into(), kind: "album" };
+        app.on_msg(Msg::Found { list: other, offset: 0, page: ApiPage { items: vec![Found::Artist(artist.clone())], raw: 1, total: 1 } });
+        assert!(app.found.items.is_empty());
+        let list = List::Found { query: "bowie".into(), kind: "artist" };
+        app.on_msg(Msg::Found { list, offset: 0, page: ApiPage { items: vec![Found::Artist(artist)], raw: 1, total: 1 } });
+        assert_eq!(app.list_len(), 1);
+        // Enter opens the artist in its own tab.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.view(), View::Artist);
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Artist(id) if id == "ar1")));
+        // Back on Search, the artists are still listed.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!((app.view(), app.found.items.len()), (View::Search, 1));
+        for _ in 0..3 {
+            app.on_key(KeyEvent::from(KeyCode::Char('t')));
+        }
+        assert_eq!(app.search_kind, SearchKind::Songs, "t goes round");
+    }
+
+    #[test]
+    fn like_the_selected_song_and_save_a_radio() {
+        let (mut app, rx) = test_app();
+        app.switch_tab(Tab::Liked);
+        let t = track_by("1", ("a", "A"), ("b", "B"));
+        app.on_msg(Msg::Tracks { list: List::Liked, offset: 0, page: ApiPage { items: vec![t.clone()], raw: 1, total: 1 } });
+        drain(&rx);
+        // f is for the selected song, not only the playing one.
+        app.on_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::ToggleSaved(u) if *u == t.uri)));
+        app.on_msg(Msg::Saved { uri: t.uri.clone(), saved: false });
+        assert!(app.liked.items.is_empty(), "an unliked song leaves Liked Songs");
+        assert_eq!(app.liked.total, Some(0));
+
+        // S on a radio asks, then makes a playlist of the list on screen.
+        app.start_radio(track_by("s", ("ar1", "A"), ("al1", "X")));
+        let Some(Page::Radio(r)) = app.page_mut() else { panic!() };
+        r.tracks.items = vec![t.clone(), track_by("2", ("c", "C"), ("d", "D"))];
+        drain(&rx);
+        app.on_key(KeyEvent::from(KeyCode::Char('S')));
+        assert!(app.confirm.as_ref().unwrap().text.contains("2 songs"));
+        app.on_key(KeyEvent::from(KeyCode::Char('y')));
+        let cmds = drain(&rx);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::CreatePlaylist { name, uris, .. } if name == "Song s radio" && uris.len() == 2)),
+            "{cmds:?}"
+        );
     }
 
     #[test]
@@ -2497,6 +2999,7 @@ mod tests {
         app.on_msg(Msg::Library(Library {
             tracks: ["spotify:track:1".to_owned()].into(),
             artists: ["spotify:artist:liked".to_owned()].into(),
+            ..Default::default()
         }));
         let radio = vec![rt("1", "x"), rt("2", "liked"), rt("3", "ar1"), rt("4", "y"), rt("5", "z")];
         app.on_msg(Msg::Radio { seed: "spotify:track:s".into(), result: Ok((rt("s", "ar1"), radio)) });
