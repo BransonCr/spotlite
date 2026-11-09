@@ -58,6 +58,15 @@ pub fn entries(app: &App) -> Vec<Entry> {
         add("Add the song to a playlist…", "e", key('e'));
         add("Like / unlike the song", "f", key('f'));
     }
+    add(if app.sidebar.open { "Close the sidebar" } else { "Open the sidebar" }, "\\", key('\\'));
+    add("Sidebar: now playing", "<", key('<'));
+    add("Sidebar: library", ">", key('>'));
+    if app.selected_track().is_some() {
+        add("Pin the song to the library", "*", key('*'));
+    }
+    if app.playback.as_ref().is_some_and(|p| p.item.is_some()) {
+        add("Share card of the song (picture)", "C", key('C'));
+    }
     add("Search", "/", key('/'));
     for (i, tab) in Tab::ALL.iter().enumerate() {
         let k: &'static str = ["1", "2", "3", "4"][i];

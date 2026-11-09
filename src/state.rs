@@ -1,5 +1,5 @@
 //! What spotlite remembers between runs: the open tabs and the tab shown, the search, the
-//! theme, the visualizer, and what was playing (song, position, shuffle, repeat, volume).
+//! theme, the visualizer, the sidebar and its pins, and what was playing (song, position, shuffle, repeat, volume).
 //! Saved as JSON in ~/.local/state/spotlite/state.json every few seconds when something
 //! changed, and when spotlite quits or its window closes.
 
@@ -27,6 +27,18 @@ pub struct State {
     pub viz_on: bool,
     #[serde(default)]
     pub playback: Option<SavedPlayback>,
+    #[serde(default)]
+    pub sidebar: Option<SavedSidebar>,
+    /// Songs, albums and playlists pinned in the sidebar's Library, newest first.
+    #[serde(default)]
+    pub pins: Vec<crate::sidebar::Pin>,
+}
+
+/// The sidebar: open or shut, and which view it shows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SavedSidebar {
+    pub open: bool,
+    pub view: crate::sidebar::SideView,
 }
 
 /// What was playing, to start it again when nothing plays at the next start.

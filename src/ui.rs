@@ -121,8 +121,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits = Hits::default();
     let t = theme::c();
     let full = f.area().inner(Margin::new(1, 0));
+    app.screen_w = f.area().width;
     // Stage: a big cover column on wide terminals; the player then needs only two lines.
-    let stage = t.layout == theme::Layout::Stage && full.width >= 140 && full.height >= 24;
+    // The sidebar shows the song itself, so no stage column beside it.
+    let stage = t.layout == theme::Layout::Stage && full.width >= 140 && full.height >= 24 && !app.sidebar.visible();
     // Short terminals get a 2-line player, so the list keeps its room. On stage the big
     // column shows the song, so the player is only the controls, progress and volume.
     let player = if stage { 3 } else if f.area().height < 24 { 4 } else { PLAYER_HEIGHT };
@@ -147,6 +149,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .areas(full);
         (header, body, now, footer)
     };
+    // The sidebar, at the left of the list: its full width, and what shows while it slides.
+    let side_full = crate::sidebar::Sidebar::full_width(full.width).filter(|_| app.sidebar.visible());
+    let mut side = None;
+    if let Some(w) = side_full {
+        let shown = app.sidebar.shown_width(w);
+        if shown > 0 {
+            side = Some((Rect { width: w, ..body }, shown));
+            let cut = (shown + 1).min(body.width.saturating_sub(20));
+            body = Rect { x: body.x + cut, width: body.width - cut, ..body };
+        }
+    }
     if stage {
         let [list, side] = Layout::horizontal([Constraint::Min(60), Constraint::Length(48)]).spacing(1).areas(body);
         body = list;
@@ -188,6 +201,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_now_playing(f, app, now);
     draw_footer(f, app, footer);
+    if let Some((area, shown)) = side {
+        crate::sidebar::draw(f, app, area, shown);
+    }
     if app.viz_on {
         // Under the list, in the cells that nothing else uses.
         draw_visualizer(f.buffer_mut(), viz_area, &app.viz.frame());
@@ -1936,6 +1952,12 @@ fn hints(app: &App) -> &'static [(&'static str, &'static str)] {
     if app.menu.is_some() || app.picker.is_some() || app.confirm.is_some() || app.palette.is_some() {
         return &[("↑↓", "move"), ("⏎", "choose"), ("esc", "close")];
     }
+    if app.sidebar.open && app.sidebar.focus {
+        return match app.sidebar.view {
+            crate::sidebar::SideView::Playing => &[("⏎", "run"), ("f e o", "keys"), ("l", "library"), ("esc", "list"), ("\\", "close"), ("?", "help")],
+            crate::sidebar::SideView::Library => &[("⏎", "open"), ("*", "pin"), ("h", "playing"), ("esc", "list"), ("\\", "close"), ("?", "help")],
+        };
+    }
     match app.view() {
         View::Search if app.search_kind != SearchKind::Songs => &[("/", "search"), ("⏎", "open"), ("t", "type"), ("?", "help")],
         View::Search => &[("/", "search"), ("⏎", "play"), ("t", "type"), (".", "actions"), ("o", "radio"), ("?", "help")],
@@ -1997,6 +2019,13 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("c", "jump to the playing song"),
         ("/  t", "search, result type"),
         (":  ^p", "do anything (palette)"),
+    ]),
+    ("Sidebar", &[
+        ("\\  ^b", "open, focus, close"),
+        ("<  >", "playing, library"),
+        ("h l, tab", "switch (in the sidebar)"),
+        ("*", "pin, unpin"),
+        ("C", "share card picture"),
     ]),
     ("Play", &[
         ("⏎", "play, or open"),
@@ -2134,6 +2163,40 @@ mod tests {
             context: None,
             item: Some(t.clone()),
         })))
+    }
+
+    #[test]
+    fn sidebar_shows_the_song_then_the_library() {
+        use crate::sidebar::SideView;
+        let (mut app, _rx) = test_app();
+        app.typing = false;
+        let t = track("Teardrop", "Massive Attack", "Mezzanine");
+        app.on_msg(playing(&t));
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Char('<')));
+        assert!(app.sidebar.open && app.sidebar.focus);
+        // Mid-slide, then settled: both draw.
+        let _ = screen(&mut app, 120, 40);
+        while app.sidebar.animating() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = screen(&mut app, 120, 40);
+        }
+        app.sidebar.step();
+        let out = screen(&mut app, 120, 40);
+        for want in ["Playing", "Library", "Teardrop", "Massive Attack", "Share card", "Add to playlist"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        app.sidebar.show(SideView::Library);
+        let _ = screen(&mut app, 120, 40);
+        while app.sidebar.animating() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = screen(&mut app, 120, 40);
+        }
+        app.sidebar.step();
+        let out = screen(&mut app, 120, 40);
+        assert!(out.contains("Liked Songs") && out.contains("PLAYLISTS") || out.contains("Playlists"), "{out}");
+        // Too narrow: no sidebar, and no panic.
+        let out = screen(&mut app, 70, 20);
+        assert!(!out.contains("Liked Songs"), "{out}");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::folders::Entry;
 use crate::images::Images;
 use crate::pages::{AlbumPage, ArtistPage, ArtistRow, FilterItem, Page, RadioPage};
 use crate::radio::Library;
+use crate::sidebar::{Item as SideItem, Pin, SideView, Sidebar, SongAct};
 use crate::state::{SavedPlayback, SavedTab, State};
 use crate::viz::Visualizer;
 use crate::worker::{Cmd, Kind, List, Msg};
@@ -17,6 +18,8 @@ use std::time::{Duration, Instant};
 /// How long the like animation runs.
 pub const LIKE_BURST: Duration = Duration::from_millis(720);
 const POLL_EVERY: Duration = Duration::from_secs(5);
+/// Search as you type: the pause after the last key before the search starts.
+const SEARCH_DELAY: Duration = Duration::from_millis(300);
 const VOLUME_STEP: u8 = 5;
 const SEEK_STEP_MS: u64 = 10_000;
 /// After a volume change, trust the local value over polled state for this long
@@ -276,6 +279,10 @@ pub struct Hits {
     /// Rows of an open menu or picker, and the index each one stands for.
     pub popup_rows: Vec<(Rect, usize)>,
     pub popup: Rect,
+    /// The sidebar, its Playing / Library switch, and its rows (with the item index).
+    pub side: Rect,
+    pub side_tabs: [Rect; 2],
+    pub side_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +312,8 @@ pub struct App {
     pub search: Listing<Track>,
     /// Query the search results belong to.
     pub searched: String,
+    /// When to search the typed text (search as you type), set by each key in the search box.
+    search_due: Option<Instant>,
     pub search_kind: SearchKind,
     /// Artists, albums or playlists found (when search_kind is not Songs).
     pub found: Listing<Found>,
@@ -393,6 +402,12 @@ pub struct App {
     library_asked: bool,
     /// Playlist edits allowed by the saved login (playlist-modify-*).
     pub can_edit: bool,
+    /// The left sidebar: the playing song, or your library.
+    pub sidebar: Sidebar,
+    /// Songs, albums and playlists pinned to the top of the sidebar's Library.
+    pub pins: Vec<Pin>,
+    /// The screen width at the last draw (the sidebar needs room).
+    pub screen_w: u16,
 }
 
 impl App {
@@ -404,6 +419,7 @@ impl App {
             query: String::new(),
             search: Listing::default(),
             searched: String::new(),
+            search_due: None,
             search_kind: SearchKind::Songs,
             found: Listing::default(),
             playlists: Listing::default(),
@@ -464,6 +480,9 @@ impl App {
             library: None,
             library_asked: false,
             can_edit: true,
+            sidebar: Sidebar::default(),
+            pins: Vec::new(),
+            screen_w: 0,
         };
         app.send(Cmd::Init);
         app
@@ -671,7 +690,11 @@ impl App {
 
     /// True while the API thread has work, so the UI should check for replies often.
     pub fn busy(&self) -> bool {
-        self.in_flight > 0 || self.vol_target.is_some() || self.images.busy() || self.like_animating()
+        self.in_flight > 0
+            || self.vol_target.is_some()
+            || self.images.busy()
+            || self.like_animating()
+            || self.search_due.is_some()
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
@@ -815,7 +838,9 @@ impl App {
     }
 
     /// Called on every loop pass: polls the player and loads pages that are needed.
-    pub fn tick(&mut self) {
+    /// Returns true when something on screen changed (a toast went away, a search started).
+    pub fn tick(&mut self) -> bool {
+        let mut changed = false;
         if self.animating() {
             self.viz.ensure_running();
         } else if self.viz.running() {
@@ -824,6 +849,12 @@ impl App {
         let now = Instant::now();
         if self.toast.as_ref().is_some_and(|t| now >= t.until) {
             self.toast = None;
+            changed = true;
+        }
+        changed |= self.sidebar.step();
+        if self.search_due.is_some_and(|due| now >= due) {
+            self.search_due = None;
+            changed |= self.live_search();
         }
         // A track ended: ask for the new state now instead of at the next poll.
         let ended = self.playback.as_ref().is_some_and(|pb| {
@@ -848,6 +879,24 @@ impl App {
         if !self.library_asked && self.user_id.is_some() && self.in_flight == 0 && !cfg!(test) {
             self.library_asked = true;
             self.send(Cmd::Library);
+        }
+        changed
+    }
+
+    /// How long the screen may stay as it is: the visualizer's frame while it runs, a spinner
+    /// step while a request is open or the heart bursts, a quarter second while music moves,
+    /// else one second (the progress bar and toasts).
+    pub fn frame_period(&self, viz_frame: Duration) -> Duration {
+        if self.sidebar.animating() {
+            Duration::from_millis(16)
+        } else if self.animating() {
+            viz_frame
+        } else if self.in_flight > 0 || self.like_animating() {
+            Duration::from_millis(120)
+        } else if self.moving() {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(1)
         }
     }
 
@@ -928,7 +977,8 @@ impl App {
         // The playlist picker lists every playlist, so it needs them all.
         let request = request.or_else(|| {
             let l = &self.playlists;
-            (self.picker.is_some() && !l.loading && l.total.is_none_or(|t| l.fetched < t))
+            let wanted = self.picker.is_some() || (self.sidebar.open && self.sidebar.view == SideView::Library);
+            (wanted && !l.loading && l.total.is_none_or(|t| l.fetched < t))
                 .then_some((List::Playlists, l.fetched))
         });
         if let Some((list, offset)) = request {
@@ -1316,6 +1366,8 @@ impl App {
             search: self.searched.clone(),
             search_kind: Some(self.search_kind),
             viz_on: self.viz_on,
+            sidebar: Some(crate::state::SavedSidebar { open: self.sidebar.open, view: self.sidebar.view }),
+            pins: self.pins.clone(),
             // The live state (a shuffle just pressed counts), else the last one seen.
             playback: self.snapshot().or_else(|| self.last_playback.clone()),
         }
@@ -1336,6 +1388,11 @@ impl App {
             self.search_kind = kind;
         }
         self.viz_on |= state.viz_on;
+        if let Some(sb) = state.sidebar {
+            self.sidebar.open = sb.open;
+            self.sidebar.view = sb.view;
+        }
+        self.pins = state.pins;
         self.last_playback = state.playback.clone();
         self.resume = state.playback.map(|p| (p, Instant::now()));
         for tab in state.tabs.into_iter().take(MAX_PAGES) {
@@ -2127,9 +2184,23 @@ impl App {
     fn submit_search(&mut self) {
         let q = self.query.trim().to_owned();
         self.typing = false;
-        if q.is_empty() {
-            return;
+        self.search_due = None;
+        if !q.is_empty() && q != self.searched {
+            self.run_search(q);
         }
+    }
+
+    /// Search as you type: 300 ms after the last key, if the text has 2 or more characters.
+    fn live_search(&mut self) -> bool {
+        let q = self.query.trim().to_owned();
+        if q.chars().count() < 2 || q == self.searched {
+            return false;
+        }
+        self.run_search(q);
+        true
+    }
+
+    fn run_search(&mut self, q: String) {
         self.searched = q;
         self.search.reset();
         self.found.reset();
@@ -2266,6 +2337,14 @@ impl App {
                 _ => {}
             }
             return;
+        }
+        if self.sidebar.open && self.hits.side.contains(pos) {
+            self.side_mouse(m, pos);
+            return;
+        }
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            // A click in the list gives the keys back to it.
+            self.sidebar.focus = false;
         }
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {
@@ -2466,16 +2545,26 @@ impl App {
             }
             return;
         }
+        if !self.typing && self.side_key(key) {
+            return;
+        }
         if self.typing {
             match key.code {
-                KeyCode::Esc => self.typing = false,
+                KeyCode::Esc => {
+                    self.typing = false;
+                    self.search_due = None;
+                }
                 KeyCode::Down => self.typing = false,
                 KeyCode::Enter => self.submit_search(),
                 KeyCode::Backspace => {
                     self.query.pop();
+                    self.search_due = Some(Instant::now() + SEARCH_DELAY);
                 }
                 KeyCode::Char('u') if ctrl => self.query.clear(),
-                KeyCode::Char(c) if !ctrl => self.query.push(c),
+                KeyCode::Char(c) if !ctrl => {
+                    self.query.push(c);
+                    self.search_due = Some(Instant::now() + SEARCH_DELAY);
+                }
                 _ => {}
             }
             return;
@@ -2523,6 +2612,12 @@ impl App {
                 self.set_search_kind(SearchKind::ALL[(i + 1) % SearchKind::ALL.len()]);
             }
             KeyCode::Char('T') => self.open_themes(),
+            KeyCode::Char('*') => self.pin_selected(),
+            KeyCode::Char('C') => {
+                if let Some(t) = self.target_track() {
+                    self.share_card(t);
+                }
+            }
             KeyCode::Char('d') if !ctrl && self.view() == View::Radio => self.discover_round(),
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => self.back(),
             KeyCode::Char('.') => self.open_menu(),
@@ -2590,6 +2685,295 @@ impl App {
             KeyCode::Char('R') => self.reload(),
             _ => {}
         }
+    }
+}
+
+/// The sidebar: its rows, keys, mouse and actions.
+impl App {
+    /// The song that plays now, if any.
+    fn playing_track(&self) -> Option<Track> {
+        self.playback.as_ref()?.item.clone()
+    }
+
+    /// The rows of a sidebar view.
+    pub fn side_items(&self, view: SideView) -> Vec<SideItem> {
+        match view {
+            SideView::Playing => {
+                let Some(t) = self.playing_track() else { return Vec::new() };
+                let mut acts = vec![SongAct::Like, SongAct::AddToPlaylist];
+                if crate::client::AVAILABLE && t.uri.starts_with("spotify:track:") {
+                    acts.push(SongAct::Radio);
+                }
+                if t.album.as_ref().is_some_and(|a| a.id.is_some()) {
+                    acts.push(SongAct::Album);
+                }
+                if t.artists.iter().any(|a| a.id().is_some()) {
+                    acts.push(SongAct::Artist);
+                }
+                acts.extend([SongAct::Pin, SongAct::Card]);
+                acts.into_iter().map(SideItem::Act).collect()
+            }
+            SideView::Library => {
+                let mut items = Vec::new();
+                if !self.pins.is_empty() {
+                    items.push(SideItem::Header("Pinned".into()));
+                    items.extend((0..self.pins.len()).map(SideItem::Pin));
+                }
+                items.push(SideItem::Header("Library".into()));
+                items.push(SideItem::Liked);
+                let n = self.playlists.items.len();
+                items.push(SideItem::Header(match self.playlists.total {
+                    Some(t) => format!("Playlists · {t}"),
+                    None => "Playlists".into(),
+                }));
+                if n == 0 {
+                    items.push(SideItem::Note(if self.playlists.total.is_none() { "Loading…" } else { "No playlists" }));
+                }
+                items.extend((0..n).map(SideItem::Playlist));
+                items
+            }
+        }
+    }
+
+    /// True if the window has room for the sidebar; else says so.
+    fn side_fits(&mut self) -> bool {
+        if self.sidebar.open || self.screen_w == 0 || Sidebar::full_width(self.screen_w).is_some() {
+            return true;
+        }
+        self.info(format!("The window is too narrow for the sidebar ({} columns needed).", crate::sidebar::MIN_SCREEN));
+        false
+    }
+
+    /// Opens or shuts the sidebar (`\`, Ctrl+B).
+    fn toggle_sidebar(&mut self) {
+        if self.side_fits() {
+            self.sidebar.toggle();
+            self.fix_side_cursor();
+        }
+    }
+
+    fn show_side(&mut self, view: SideView) {
+        if self.side_fits() {
+            self.sidebar.show(view);
+            self.fix_side_cursor();
+        }
+    }
+
+    fn fix_side_cursor(&mut self) {
+        let items = self.side_items(self.sidebar.view);
+        self.sidebar.fix_cursor(&items);
+    }
+
+    /// Keys for the sidebar. True if the key was used.
+    fn side_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('\\') => {
+                self.toggle_sidebar();
+                return true;
+            }
+            KeyCode::Char('b') if ctrl => {
+                self.toggle_sidebar();
+                return true;
+            }
+            KeyCode::Char('<') => {
+                self.show_side(SideView::Playing);
+                return true;
+            }
+            KeyCode::Char('>') => {
+                self.show_side(SideView::Library);
+                return true;
+            }
+            _ => {}
+        }
+        if !(self.sidebar.open && self.sidebar.focus) {
+            return false;
+        }
+        let view = self.sidebar.view;
+        let items = self.side_items(view);
+        match key.code {
+            KeyCode::Esc => self.sidebar.focus = false,
+            KeyCode::Down | KeyCode::Char('j') => self.sidebar.move_cursor(&items, 1),
+            KeyCode::Up | KeyCode::Char('k') => self.sidebar.move_cursor(&items, -1),
+            KeyCode::Char('g') | KeyCode::Home => self.sidebar.move_cursor(&items, -10_000),
+            KeyCode::Char('G') | KeyCode::End => self.sidebar.move_cursor(&items, 10_000),
+            KeyCode::Char('h') | KeyCode::Left => self.show_side(SideView::Playing),
+            KeyCode::Char('l') | KeyCode::Right => self.show_side(SideView::Library),
+            KeyCode::Tab | KeyCode::BackTab => self.sidebar.switch(),
+            KeyCode::Enter => {
+                let i = self.sidebar.cursor(view);
+                self.side_run(i);
+            }
+            KeyCode::Char('*') if view == SideView::Library => match items.get(self.sidebar.cursor(view)) {
+                Some(SideItem::Pin(p)) => {
+                    let p = *p;
+                    self.unpin(p);
+                }
+                Some(SideItem::Playlist(p)) => {
+                    if let Some(pl) = self.playlists.items.get(*p).cloned() {
+                        self.toggle_pin(Pin::Playlist { uri: pl.uri, name: pl.name, images: pl.images });
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Char(c) if view == SideView::Playing && !ctrl => {
+                let hit = items
+                    .iter()
+                    .position(|it| matches!(it, SideItem::Act(a) if a.key().starts_with(c) && a.key().len() == c.len_utf8()));
+                match hit {
+                    Some(i) => self.side_run(i),
+                    // Other keys (space, n, +, …) work as always.
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Runs row `i` of the sidebar view shown: a song action, or opens a library entry.
+    fn side_run(&mut self, i: usize) {
+        let view = self.sidebar.view;
+        let items = self.side_items(view);
+        let Some(item) = items.get(i).cloned() else { return };
+        self.sidebar.set_cursor(view, i);
+        match item {
+            SideItem::Act(act) => {
+                let Some(t) = self.playing_track() else { return };
+                match act {
+                    SongAct::Like => self.toggle_like(Some(t)),
+                    SongAct::AddToPlaylist => self.open_picker(t),
+                    SongAct::Radio => self.start_radio(t),
+                    SongAct::Album => self.go_to_album(&t),
+                    SongAct::Artist => self.go_to_artist(&t),
+                    SongAct::Pin => self.toggle_pin(Pin::Song { track: t }),
+                    SongAct::Card => self.share_card(t),
+                }
+            }
+            SideItem::Pin(p) => match self.pins.get(p).cloned() {
+                Some(Pin::Song { track }) => {
+                    self.info(format!("Playing {}", track.name));
+                    self.send(Cmd::Play(Play::Tracks { uris: vec![track.uri], offset: 0 }));
+                    self.poll_soon();
+                }
+                Some(Pin::Album { album }) => self.open_album(album),
+                Some(Pin::Playlist { uri, name, .. }) => self.open_playlist_uri(&uri, &name),
+                None => {}
+            },
+            SideItem::Liked => {
+                self.open = None;
+                self.switch_tab(Tab::Liked);
+            }
+            SideItem::Playlist(p) => {
+                if let Some(pl) = self.playlists.items.get(p).cloned() {
+                    self.open_playlist_uri(&pl.uri, &pl.name);
+                }
+            }
+            SideItem::Header(_) | SideItem::Note(_) => {}
+        }
+    }
+
+    /// Opens your playlist in the Playlists tab; plays one you do not own (Spotify does not
+    /// list its songs to spotlite).
+    fn open_playlist_uri(&mut self, uri: &str, name: &str) {
+        match self.playlists.items.iter().find(|p| p.uri == uri).cloned() {
+            Some(pl) if self.owns(&pl) => {
+                self.open = Some(OpenPlaylist { playlist: pl, tracks: Listing::default() });
+                self.switch_tab(Tab::Playlists);
+            }
+            _ => {
+                self.info(format!("Playing {name}"));
+                self.send(Cmd::Play(Play::Context { uri: uri.to_owned(), from: None }));
+                self.poll_soon();
+            }
+        }
+    }
+
+    fn side_mouse(&mut self, m: MouseEvent, pos: Position) {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.sidebar.focus = true;
+                if let Some(i) = self.hits.side_tabs.iter().position(|r| r.contains(pos)) {
+                    self.show_side(if i == 0 { SideView::Playing } else { SideView::Library });
+                } else if let Some(&(_, i)) = self.hits.side_rows.iter().find(|(r, _)| r.contains(pos)) {
+                    self.side_run(i);
+                } else if self.hits.np_album.contains(pos) {
+                    if let Some(t) = self.playing_track() {
+                        self.go_to_album(&t);
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                // Right-click a library row: pin or unpin it.
+                self.sidebar.focus = true;
+                if let Some(&(_, i)) = self.hits.side_rows.iter().find(|(r, _)| r.contains(pos)) {
+                    if self.sidebar.view == SideView::Library {
+                        self.sidebar.set_cursor(SideView::Library, i);
+                        self.side_key(KeyEvent::from(KeyCode::Char('*')));
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let items = self.side_items(self.sidebar.view);
+                self.sidebar.move_cursor(&items, if m.kind == MouseEventKind::ScrollUp { -1 } else { 1 });
+            }
+            _ => {}
+        }
+    }
+
+    /// Pins it, or unpins it if it is pinned.
+    fn toggle_pin(&mut self, pin: Pin) {
+        let uri = pin.uri();
+        if let Some(i) = self.pins.iter().position(|p| p.uri() == uri) {
+            self.unpin(i);
+        } else {
+            self.info(format!("Pinned {} to the library", pin.name()));
+            self.pins.insert(0, pin);
+        }
+    }
+
+    fn unpin(&mut self, i: usize) {
+        if i < self.pins.len() {
+            let pin = self.pins.remove(i);
+            self.info(format!("Unpinned {}", pin.name()));
+            if self.sidebar.view == SideView::Library {
+                self.fix_side_cursor();
+            }
+        }
+    }
+
+    /// `*`: pins the selected song, album or playlist (or unpins it).
+    fn pin_selected(&mut self) {
+        let pin = match self.view() {
+            View::Search if self.search_kind != SearchKind::Songs => match self.found.current().cloned() {
+                Some(Found::Album(album)) => Some(Pin::Album { album }),
+                Some(Found::Playlist(p)) => Some(Pin::Playlist { uri: p.uri, name: p.name, images: p.images }),
+                Some(Found::Artist(_)) => {
+                    self.info("Artists cannot be pinned; pin a song or an album.");
+                    return;
+                }
+                None => None,
+            },
+            View::Playlists => self.current_playlist().map(|p| Pin::Playlist { uri: p.uri, name: p.name, images: p.images }),
+            View::Artist => match self.page() {
+                Some(Page::Artist(a)) => match a.rows.current() {
+                    Some(ArtistRow::Album(album)) => Some(Pin::Album { album: album.clone() }),
+                    _ => self.selected_track().map(|track| Pin::Song { track }),
+                },
+                _ => None,
+            },
+            _ => self.selected_track().map(|track| Pin::Song { track }),
+        };
+        match pin {
+            Some(pin) => self.toggle_pin(pin),
+            None => self.info("Select a song, album or playlist first."),
+        }
+    }
+
+    /// Saves a picture card of the song (cover, title, artist, album) to ~/Pictures/spotlite.
+    fn share_card(&mut self, track: Track) {
+        self.info(format!("Making a card for {}…", track.name));
+        self.send(Cmd::Card(Box::new(track)));
     }
 }
 
@@ -2669,6 +3053,120 @@ mod tests {
         app.on_msg(Msg::Tracks { list: List::Search("second".into()), offset: 0, page: page(0..10, 30) });
         assert_eq!(app.search.items.len(), 10);
         assert_eq!(app.search.total, Some(30));
+    }
+
+    fn searches(cmds: &[Cmd]) -> Vec<String> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                Cmd::Load { list: List::Search(q), .. } => Some(q.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn search_runs_after_a_pause_in_typing() {
+        let (mut app, rx) = test_app();
+        app.tab = Tab::Search;
+        app.typing = true;
+        for c in "bowie".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert!(app.busy(), "the loop wakes for the coming search");
+        app.tick();
+        assert!(searches(&drain(&rx)).is_empty(), "no search before the pause");
+        app.search_due = Some(Instant::now());
+        assert!(app.tick());
+        assert_eq!(searches(&drain(&rx)), ["bowie"]);
+        assert!(app.typing, "you can go on typing");
+        // Enter on the same text does not search again.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.tick();
+        assert!(searches(&drain(&rx)).is_empty());
+        // One letter is too short; Esc cancels a coming search.
+        app.typing = true;
+        app.query.clear();
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        app.search_due = Some(Instant::now());
+        assert!(!app.tick());
+        app.on_key(KeyEvent::from(KeyCode::Char('y')));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.search_due.is_none());
+    }
+
+    #[test]
+    fn frame_period_follows_what_moves() {
+        let (mut app, _rx) = test_app();
+        let viz = Duration::from_millis(50);
+        app.in_flight = 0;
+        assert_eq!(app.frame_period(viz), Duration::from_secs(1));
+        app.in_flight = 1;
+        assert_eq!(app.frame_period(viz), Duration::from_millis(120));
+        app.in_flight = 0;
+        app.playback = Some(serde_json::from_value(serde_json::json!({
+            "is_playing": true, "progress_ms": 0,
+            "item": {"uri": "spotify:track:a", "name": "A", "duration_ms": 1000, "artists": [], "album": {"name": "x", "images": []}}
+        })).unwrap());
+        app.viz_on = true;
+        assert_eq!(app.frame_period(viz), viz);
+    }
+
+    #[test]
+    fn sidebar_keys_open_switch_and_pin() {
+        use crate::sidebar::{Item as SideItem, SideView};
+        let (mut app, rx) = test_app();
+        app.typing = false;
+        app.on_key(KeyEvent::from(KeyCode::Char('\\')));
+        assert!(app.sidebar.open && app.sidebar.focus);
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.sidebar.view, SideView::Library);
+        // The cursor starts on Liked Songs; Enter opens that tab.
+        assert_eq!(app.side_items(SideView::Library)[app.sidebar.cursor(SideView::Library)], SideItem::Liked);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.tab, Tab::Liked);
+        // Esc gives the keys back to the list; `*` then pins the selected song.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.sidebar.focus);
+        app.on_msg(Msg::Tracks { list: List::Liked, offset: 0, page: page(0..3, 3) });
+        app.on_key(KeyEvent::from(KeyCode::Char('*')));
+        assert_eq!(app.pins.len(), 1);
+        assert_eq!(app.side_items(SideView::Library)[1], SideItem::Pin(0));
+        // Pins and the sidebar are saved, and come back.
+        let st = app.saved_state();
+        let json = serde_json::to_string(&st).unwrap();
+        let (mut again, _rx2) = test_app();
+        again.restore(serde_json::from_str(&json).unwrap());
+        assert_eq!(again.pins.len(), 1);
+        assert!(again.sidebar.open);
+        // `*` again unpins; `\` twice shuts (focus first, then close).
+        app.on_key(KeyEvent::from(KeyCode::Char('*')));
+        assert!(app.pins.is_empty());
+        app.on_key(KeyEvent::from(KeyCode::Char('\\')));
+        assert!(app.sidebar.focus);
+        app.on_key(KeyEvent::from(KeyCode::Char('\\')));
+        assert!(!app.sidebar.open);
+        drop(rx);
+    }
+
+    #[test]
+    fn sidebar_actions_use_the_playing_song() {
+        use crate::sidebar::SideView;
+        let (mut app, rx) = test_app();
+        app.typing = false;
+        app.playback = Some(serde_json::from_value(serde_json::json!({
+            "is_playing": true, "progress_ms": 0,
+            "item": {"uri": "spotify:track:p", "name": "P", "duration_ms": 1000, "artists": [], "album": {"name": "x", "images": []}}
+        })).unwrap());
+        app.on_key(KeyEvent::from(KeyCode::Char('<')));
+        assert_eq!(app.sidebar.view, SideView::Playing);
+        drain(&rx);
+        app.on_key(KeyEvent::from(KeyCode::Char('C')));
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Card(t) if t.uri == "spotify:track:p")));
+        app.on_key(KeyEvent::from(KeyCode::Char('*')));
+        assert_eq!(app.pins.first().map(|p| p.uri()), Some("spotify:track:p".into()));
+        // Space still plays / pauses while the sidebar has the keys.
+        app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Toggle)));
     }
 
     #[test]

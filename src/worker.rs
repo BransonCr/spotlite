@@ -4,7 +4,9 @@ use crate::api::{Album, ApiError, Artist, Found, Page, Play, Playback, Playlist,
 use crate::radio::{Library, RadioTrack};
 use anyhow::{anyhow, Result};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::collections::VecDeque;
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// A list the UI shows, used to route pages back to the right place.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,8 @@ pub enum Cmd {
     ToggleSaved(String),
     /// A new private playlist with these songs.
     CreatePlaylist { name: String, description: String, uris: Vec<String> },
+    /// Saves a share card picture of the song (on its own thread).
+    Card(Box<Track>),
     /// Profile, popular songs and albums of an artist (by id).
     Artist(String),
     /// Album details (by id); its tracks load through `Load { list: List::Album }`.
@@ -116,6 +120,8 @@ pub fn spawn(api: Spotify) -> (Sender<Cmd>, Sender<Msg>, Receiver<Msg>) {
         device: None,
         user: None,
         last: None,
+        song_searches: SearchCache::default(),
+        found_searches: SearchCache::default(),
     };
     thread::Builder::new()
         .name("spotlite-api".into())
@@ -130,6 +136,43 @@ struct Worker {
     device: Option<String>,
     user: Option<User>,
     last: Option<Playback>,
+    song_searches: SearchCache<Track>,
+    found_searches: SearchCache<Found>,
+}
+
+/// First pages of recent searches. Search as you type asks again for a text you had a moment
+/// ago (Backspace); this answers it without a request.
+struct SearchCache<T> {
+    pages: VecDeque<(String, Instant, Page<T>)>,
+}
+
+impl<T> Default for SearchCache<T> {
+    fn default() -> Self {
+        SearchCache { pages: VecDeque::new() }
+    }
+}
+
+impl<T: Clone> SearchCache<T> {
+    const KEEP: usize = 16;
+    const MAX_AGE: Duration = Duration::from_secs(120);
+
+    /// The first page for `key`, from the cache if it is recent, else from `fetch`. Later pages
+    /// always come from `fetch`.
+    fn get(&mut self, key: &str, offset: usize, fetch: impl FnOnce() -> Result<Page<T>>) -> Result<Page<T>> {
+        if offset > 0 {
+            return fetch();
+        }
+        self.pages.retain(|(_, at, _)| at.elapsed() < Self::MAX_AGE);
+        if let Some((_, _, page)) = self.pages.iter().find(|(k, _, _)| k == key) {
+            return Ok(page.clone());
+        }
+        let page = fetch()?;
+        self.pages.push_back((key.to_owned(), Instant::now(), page.clone()));
+        if self.pages.len() > Self::KEEP {
+            self.pages.pop_front();
+        }
+        Ok(page)
+    }
 }
 
 impl Worker {
@@ -274,6 +317,17 @@ impl Worker {
                 self.send(Msg::Info(if saved { "Added to Liked Songs" } else { "Removed from Liked Songs" }.into()));
                 Ok(())
             }
+            Cmd::Card(track) => {
+                let tx = self.tx.clone();
+                thread::Builder::new().name("spotlite-card".into()).spawn(move || {
+                    let msg = match crate::card::make(&track) {
+                        Ok(path) => Msg::Info(format!("Saved the card to {} (path copied)", path.display())),
+                        Err(e) => Msg::Error(format!("Share card: {e:#}")),
+                    };
+                    let _ = tx.send(msg);
+                })?;
+                Ok(())
+            }
             Cmd::Artist(id) => {
                 let result = (|| -> Result<()> {
                     let artist = self.api.artist(&id)?;
@@ -402,11 +456,14 @@ impl Worker {
     fn load(&mut self, list: List, offset: usize) -> Result<()> {
         match &list {
             List::Search(q) => {
-                let page = self.api.search_tracks(q, offset)?;
+                let api = &mut self.api;
+                let page = self.song_searches.get(q, offset, || api.search_tracks(q, offset))?;
                 self.send(Msg::Tracks { list, offset, page });
             }
             List::Found { query, kind } => {
-                let page = self.api.search(query, kind, offset)?;
+                let api = &mut self.api;
+                let key = format!("{kind}\n{query}");
+                let page = self.found_searches.get(&key, offset, || api.search(query, kind, offset))?;
                 self.send(Msg::Found { list, offset, page });
             }
             List::Recent => {
@@ -431,5 +488,41 @@ impl Worker {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(n: usize) -> Page<u32> {
+        Page { items: vec![n as u32], raw: 1, total: 1 }
+    }
+
+    #[test]
+    fn search_cache_answers_a_recent_first_page() {
+        let mut cache: SearchCache<u32> = SearchCache::default();
+        let mut calls = 0;
+        let mut get = |cache: &mut SearchCache<u32>, key: &str, offset: usize| {
+            cache
+                .get(key, offset, || {
+                    calls += 1;
+                    Ok(page(calls))
+                })
+                .unwrap()
+                .items[0]
+        };
+        assert_eq!(get(&mut cache, "bowie", 0), 1);
+        assert_eq!(get(&mut cache, "bowie", 0), 1, "from the cache");
+        assert_eq!(get(&mut cache, "bowie", 50), 2, "later pages always load");
+        assert_eq!(get(&mut cache, "bowi", 0), 3);
+        // Old entries go: only the last 16 texts stay.
+        for i in 0..16 {
+            get(&mut cache, &format!("q{i}"), 0);
+        }
+        assert_eq!(get(&mut cache, "bowie", 0), 20);
+        // A failed request is not kept.
+        assert!(cache.get("err", 0, || Err(anyhow!("down"))).is_err());
+        assert!(cache.pages.iter().all(|(k, _, _)| k != "err"));
     }
 }

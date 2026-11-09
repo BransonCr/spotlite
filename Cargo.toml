@@ -25,6 +25,7 @@ toml = "0.8"
 unicode-width = "0.2"
 ureq = { version = "2.12", features = ["json"] }
 url = "2"
+ab_glyph = "0.2"
 
 [features]
 default = ["client"]

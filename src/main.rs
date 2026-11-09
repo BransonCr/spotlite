@@ -8,7 +8,9 @@ mod folders;
 mod images;
 mod pages;
 mod palette;
+mod card;
 mod radio;
+mod sidebar;
 mod state;
 mod theme;
 mod ui;
@@ -19,7 +21,7 @@ use anyhow::{bail, Result};
 use api::Spotify;
 use config::Config;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui_image::picker::Picker;
@@ -256,6 +258,9 @@ fn run_tui() -> Result<()> {
     let mut saved_json = String::new();
     let mut save_at = std::time::Instant::now();
     let result = (|| -> Result<()> {
+        let mut last_draw = std::time::Instant::now();
+        // Something on screen changed by input (or it is the first frame): draw.
+        let mut input = true;
         while !app.quit && !stop.load(std::sync::atomic::Ordering::Relaxed) {
             // Every 5 s, save what changed: a crash or a kill loses at most a few seconds.
             if !trial && save_at.elapsed() >= Duration::from_secs(5) {
@@ -267,33 +272,52 @@ fn run_tui() -> Result<()> {
                     }
                 }
             }
+            let mut dirty = std::mem::take(&mut input);
             loop {
                 match rx.try_recv() {
-                    Ok(msg) => app.on_msg(msg),
+                    Ok(msg) => {
+                        app.on_msg(msg);
+                        dirty = true;
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => anyhow::bail!("the API thread stopped"),
                 }
             }
-            app.images.poll();
-            app.tick();
-            terminal.draw(|f| ui::draw(f, &mut app))?;
-            // Idle: wake once a second to move the progress bar. While a request or a picture
-            // is open, wake often so its result shows at once; the visualizer runs at its fps.
-            // Input always wakes us.
-            let wait = if app.busy() {
-                Duration::from_millis(30)
-            } else if app.animating() {
-                viz_frame
-            } else if app.moving() {
-                Duration::from_millis(250)
-            } else {
-                Duration::from_secs(1)
-            };
+            dirty |= app.images.poll();
+            dirty |= app.tick();
+            let now = std::time::Instant::now();
+            let period = app.frame_period(viz_frame);
+            dirty |= now >= last_draw + period;
+            if dirty {
+                draw(&mut terminal, &mut app)?;
+                last_draw = std::time::Instant::now();
+            }
+            // Sleep until the next frame is due (1 s idle, faster while music or the visualizer
+            // moves). While a request or a picture is open, wake often so its result shows at
+            // once. Input always wakes us.
+            let due = (last_draw + period).saturating_duration_since(std::time::Instant::now());
+            let wait = if app.busy() { due.min(Duration::from_millis(30)) } else { due };
             if event::poll(wait)? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
-                    Event::Mouse(m) => app.on_mouse(m),
-                    _ => {}
+                // Take every event that waits, then draw one time: a wheel burst or a held
+                // key does not queue up frames.
+                for _ in 0..256 {
+                    match event::read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            app.on_key(key);
+                            input = true;
+                        }
+                        // Pointer motion changes nothing on screen (yet).
+                        Event::Mouse(m) if m.kind == MouseEventKind::Moved => {}
+                        Event::Mouse(m) => {
+                            app.on_mouse(m);
+                            input = true;
+                        }
+                        Event::Resize(..) => input = true,
+                        _ => {}
+                    }
+                    if app.quit || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
                 }
             }
         }
@@ -312,6 +336,17 @@ fn run_tui() -> Result<()> {
         stop_spotifyd();
     }
     result
+}
+
+/// Draws one frame inside a synchronized update (DEC mode 2026): the terminal shows the whole
+/// frame at once, so covers and the visualizer do not tear. Terminals without it ignore it.
+fn draw(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> Result<()> {
+    use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+    let _ = execute!(std::io::stdout(), BeginSynchronizedUpdate);
+    let drawn = terminal.draw(|f| ui::draw(f, app));
+    let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);
+    drawn?;
+    Ok(())
 }
 
 /// Starts the spotifyd user service if it is not running (after `Q` stopped it). Does not wait.
