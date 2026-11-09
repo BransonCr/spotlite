@@ -30,6 +30,11 @@ pub enum Cmd {
     Play(Play),
     /// Play Liked Songs as a context, starting at a track.
     PlayLiked { from: String },
+    /// Play from a position (turning true shuffle off goes back to the list there).
+    PlayAt(Play, u64),
+    /// True shuffle: every song of a playlist, album or Liked Songs (`…:collection`) in a
+    /// random order (`from` first), played as a list with Spotify's own shuffle off.
+    PlayShuffled { context: String, from: Option<String>, position_ms: u64 },
     Toggle,
     Next,
     Prev,
@@ -61,6 +66,10 @@ pub enum Cmd {
     /// Every Liked Songs track and artist, for the radio filters.
     Library,
     AddToPlaylist { playlist_id: String, playlist: String, uris: Vec<String>, what: String },
+    /// The genres of an artist (MusicBrainz, on its own thread), for Randomize.
+    Genres { artists: Vec<(String, String)> },
+    /// 50 random songs of a genre.
+    Randomize(String),
     RemoveFromPlaylist { playlist_id: String, playlist: String, uri: String, what: String },
 }
 
@@ -74,6 +83,9 @@ pub enum Msg {
     Found { list: List, offset: usize, page: Page<Found> },
     Playlists { offset: usize, page: Page<Playlist> },
     LoadFailed { list: List, forbidden: bool },
+    /// Spotify limits `list` for `secs`: the UI shows what it has (maybe a saved copy) and
+    /// asks again then.
+    RetryLater { list: List, secs: u64 },
     Saved { uri: String, saved: bool },
     Info(String),
     Error(String),
@@ -93,6 +105,10 @@ pub enum Msg {
     /// A track was added to a playlist.
     Added { playlist_id: String },
     UpNext(Option<Track>),
+    /// A true shuffle started: these songs play for `context`.
+    Shuffled { context: String, uris: Vec<String> },
+    Genres { artist: String, result: Result<Vec<String>, String> },
+    Random { genre: String, result: Result<Vec<Track>, String> },
     /// A playlist was created: the Playlists tab loads again.
     Created,
     /// Sent after every command.
@@ -185,15 +201,16 @@ impl Worker {
                 // Init ends with the first player state, like a poll.
                 Cmd::Poll | Cmd::Init => Kind::Poll,
                 Cmd::Volume(_) => Kind::Volume,
-                Cmd::Play(_) | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
+                Cmd::Play(_) | Cmd::PlayAt(..) | Cmd::PlayShuffled { .. } | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
                 _ => Kind::Other,
             };
             let list = match &cmd {
                 Cmd::Load { list, .. } => Some(list.clone()),
                 _ => None,
             };
+            let quiet = matches!(cmd, Cmd::CheckSaved(_) | Cmd::UpNext);
             if let Err(err) = self.handle(cmd) {
-                self.report(err, list, kind);
+                self.report(err, list, kind, quiet);
             }
             if self.tx.send(Msg::Done(kind)).is_err() {
                 return; // UI has quit
@@ -205,12 +222,22 @@ impl Worker {
         let _ = self.tx.send(msg);
     }
 
-    fn report(&self, err: anyhow::Error, list: Option<List>, kind: Kind) {
+    fn report(&self, err: anyhow::Error, list: Option<List>, kind: Kind, quiet: bool) {
         let api_err = err.downcast_ref::<ApiError>();
+        // A check the user did not ask for (the ♥ of the playing song, what plays next) waits
+        // for the limit to end without a message.
+        if quiet && matches!(api_err, Some(ApiError::RateLimited(_))) {
+            return;
+        }
         // Spotify limits each kind of request on its own: only a limit on the player state
         // itself delays the next poll (a limit on /me must not stop the player for hours).
         if let (Some(ApiError::RateLimited(secs)), Kind::Poll) = (api_err, kind) {
             self.send(Msg::Backoff(*secs));
+        }
+        if let (Some(list), Some(ApiError::RateLimited(secs))) = (&list, api_err) {
+            self.send(Msg::LoadFailed { list: list.clone(), forbidden: false });
+            self.send(Msg::RetryLater { list: list.clone(), secs: *secs });
+            return; // not an error: the UI says it once, quietly
         }
         if let Some(list) = list {
             let forbidden = matches!(api_err, Some(ApiError::Forbidden));
@@ -266,6 +293,8 @@ impl Worker {
                 };
                 self.player(|api, dev| api.play(dev, Some(&play)))
             }
+            Cmd::PlayAt(play, ms) => self.player(|api, dev| api.play_at(dev, Some(&play), ms)),
+            Cmd::PlayShuffled { context, from, position_ms } => self.play_shuffled(context, from, position_ms),
             Cmd::Toggle => {
                 let playing = self.last.as_ref().is_some_and(|pb| pb.is_playing);
                 let idle = self.last.as_ref().and_then(|pb| pb.device.as_ref()).is_none();
@@ -285,14 +314,28 @@ impl Worker {
             Cmd::Volume(pct) => self.player(|api, dev| api.set_volume(dev, pct)),
             Cmd::Shuffle(on) => self.player(|api, dev| api.set_shuffle(dev, on)),
             Cmd::Repeat(state) => self.player(|api, dev| api.set_repeat(dev, state)),
+            Cmd::Resume(sp) if sp.shuffle && sp.context.as_deref().is_some_and(shufflable) => {
+                let context = sp.context.clone().unwrap_or_default();
+                self.play_shuffled(context, Some(sp.track.clone()), sp.position_ms)?;
+                let _ = self.player(|api, dev| api.set_repeat(dev, &sp.repeat));
+                if let Some(v) = sp.volume {
+                    let _ = self.player(|api, dev| api.set_volume(dev, v));
+                }
+                if !sp.playing {
+                    let _ = self.player(|api, dev| api.pause(dev));
+                }
+                self.send(Msg::Info(format!("{} where you left off: {}", if sp.playing { "Playing" } else { "Ready" }, sp.name)));
+                Ok(())
+            }
             Cmd::Resume(sp) => {
                 let play = match &sp.context {
                     Some(uri) => Play::Context { uri: uri.clone(), from: Some(sp.track.clone()) },
                     None => Play::Tracks { uris: vec![sp.track.clone()], offset: 0 },
                 };
                 self.player(|api, dev| api.play_at(dev, Some(&play), sp.position_ms))?;
-                // Shuffle, repeat and volume after play: they need an active device.
-                let _ = self.player(|api, dev| api.set_shuffle(dev, sp.shuffle));
+                // Shuffle, repeat and volume after play: they need an active device. Spotify's
+                // own shuffle stays off: spotlite shuffles itself.
+                let _ = self.player(|api, dev| api.set_shuffle(dev, false));
                 let _ = self.player(|api, dev| api.set_repeat(dev, &sp.repeat));
                 if let Some(v) = sp.volume {
                     let _ = self.player(|api, dev| api.set_volume(dev, v));
@@ -390,37 +433,38 @@ impl Worker {
                 Ok(())
             }
             Cmd::Library => {
-                let mut library = Library::default();
-                let mut offset = 0;
-                loop {
-                    let page = self.api.liked_tracks(offset)?;
-                    offset += page.raw;
-                    for t in &page.items {
-                        library.tracks.insert(t.uri.clone());
-                        library.artists.extend(t.artists.iter().filter_map(|a| a.uri.clone()));
-                    }
-                    if page.raw == 0 || offset >= page.total {
-                        break;
-                    }
-                }
-                // Top and recent songs and artists, for discover. A login from before these
-                // permissions gets an error here: discover then knows Liked Songs only.
-                if self.api.has_scope("user-top-read") {
-                    for range in ["short_term", "medium_term", "long_term"] {
-                        for a in self.api.top_artists(range).unwrap_or_default() {
-                            library.top_artists.insert(format!("spotify:artist:{}", a.id));
+                let library = match sync_library(&mut self.api, crate::store::read("library.json")) {
+                    Ok(library) => library,
+                    // The Liked Songs tab says so already; the ♥ marks wait for the next start.
+                    Err(e) if matches!(e.downcast_ref::<ApiError>(), Some(ApiError::RateLimited(_))) => return Ok(()),
+                    Err(e) => return Err(e),
+                };
+                crate::store::write("library.json", &library);
+                self.send(Msg::Library(library));
+                Ok(())
+            }
+            Cmd::Genres { artists } => {
+                let tx = self.tx.clone();
+                thread::Builder::new().name("spotlite-genres".into()).spawn(move || {
+                    // The first artist MusicBrainz has genres for (a song's guests count too).
+                    let mut result = Ok(Vec::new());
+                    let first = artists.first().map(|a| a.1.clone()).unwrap_or_default();
+                    for (uri, name) in &artists {
+                        result = crate::genre::of_artist(uri, name).map_err(|e| format!("{e:#}"));
+                        if let Ok(g) = &result {
+                            if !g.is_empty() {
+                                let _ = tx.send(Msg::Genres { artist: name.clone(), result });
+                                return;
+                            }
                         }
                     }
-                    for range in ["short_term", "medium_term"] {
-                        library.heard.extend(self.api.top_tracks(range).unwrap_or_default().into_iter().map(|t| t.uri));
-                    }
-                }
-                if self.api.has_scope("user-read-recently-played") {
-                    if let Ok(page) = self.api.recently_played(0) {
-                        library.heard.extend(page.items.into_iter().map(|t| t.uri));
-                    }
-                }
-                self.send(Msg::Library(library));
+                    let _ = tx.send(Msg::Genres { artist: first, result });
+                })?;
+                Ok(())
+            }
+            Cmd::Randomize(genre) => {
+                let result = crate::genre::random(&mut self.api, &genre).map_err(|e| format!("{e:#}"));
+                self.send(Msg::Random { genre, result });
                 Ok(())
             }
             Cmd::AddToPlaylist { playlist_id, playlist, uris, what } => {
@@ -436,6 +480,68 @@ impl Worker {
                 Ok(())
             }
         }
+    }
+
+    /// Every song of a context, in its order.
+    fn context_uris(&mut self, context: &str) -> Result<Vec<String>> {
+        if context.ends_with(":collection") {
+            let library: Option<Library> = crate::store::read("library.json");
+            if let Some(lib) = library.filter(|l| !l.liked_order.is_empty()) {
+                return Ok(lib.liked_order);
+            }
+            let mut out = Vec::new();
+            let mut offset = 0;
+            loop {
+                let page = self.api.liked_tracks(offset)?;
+                offset += page.raw;
+                out.extend(page.items.into_iter().map(|t| t.uri));
+                if page.raw == 0 || offset >= page.total {
+                    return Ok(out);
+                }
+            }
+        }
+        if context.starts_with("spotify:playlist:") {
+            if let Ok(uris) = crate::radio::playlist_uris(context) {
+                return Ok(uris);
+            }
+            let id = context.trim_start_matches("spotify:playlist:");
+            return self.all_pages(|api, offset| api.playlist_tracks(id, offset));
+        }
+        let id = context.trim_start_matches("spotify:album:").to_owned();
+        self.all_pages(|api, offset| api.album_tracks(&id, offset))
+    }
+
+    fn all_pages(&mut self, mut f: impl FnMut(&mut Spotify, usize) -> Result<Page<Track>>) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = f(&mut self.api, offset)?;
+            offset += page.raw;
+            out.extend(page.items.into_iter().map(|t| t.uri));
+            if page.raw == 0 || offset >= page.total {
+                return Ok(out);
+            }
+        }
+    }
+
+    fn play_shuffled(&mut self, context: String, from: Option<String>, position_ms: u64) -> Result<()> {
+        let uris = match self.context_uris(&context) {
+            Ok(uris) if !uris.is_empty() => uris,
+            // Cannot list it: play it with Spotify's own shuffle.
+            _ => {
+                let _ = self.player(|api, dev| api.set_shuffle(dev, true));
+                let play = Play::Context { uri: context, from };
+                return self.player(|api, dev| api.play_at(dev, Some(&play), position_ms));
+            }
+        };
+        let uris = shuffled(uris, from.as_deref(), &mut rand::thread_rng());
+        let _ = self.player(|api, dev| api.set_shuffle(dev, false));
+        // Only keep the position when the song it is for comes first.
+        let position_ms = if from.as_deref() == uris.first().map(String::as_str) { position_ms } else { 0 };
+        let play = Play::Tracks { uris: uris.clone(), offset: 0 };
+        self.player(|api, dev| api.play_at(dev, Some(&play), position_ms))?;
+        self.send(Msg::Shuffled { context, uris });
+        Ok(())
     }
 
     fn poll(&mut self) -> Result<()> {
@@ -508,7 +614,7 @@ impl Worker {
                 self.send(Msg::Tracks { list, offset, page });
             }
             List::Liked => {
-                let page = self.api.liked_tracks(offset)?;
+                let page = saved_copy(&list, offset, self.api.liked_tracks(offset), &self.tx)?;
                 self.send(Msg::Tracks { list, offset, page });
             }
             List::Playlist(id) => {
@@ -520,11 +626,183 @@ impl Worker {
                 self.send(Msg::Tracks { list, offset, page });
             }
             List::Playlists => {
-                let page = self.api.playlists(offset)?;
+                let page = saved_copy(&list, offset, self.api.playlists(offset), &self.tx)?;
                 self.send(Msg::Playlists { offset, page });
             }
         }
         Ok(())
+    }
+}
+
+/// Songs Spotify takes in one play request (a random sample of a longer list).
+const SHUFFLE_MAX: usize = 500;
+
+/// True shuffle can list these: a playlist, an album, Liked Songs.
+pub fn shufflable(context: &str) -> bool {
+    context.starts_with("spotify:playlist:") || context.starts_with("spotify:album:") || context.ends_with(":collection")
+}
+
+/// `uris` in a uniformly random order (Fisher-Yates), `first` at the front if it is there, cut
+/// to what one play request takes. Each song comes once.
+pub fn shuffled(uris: Vec<String>, first: Option<&str>, rng: &mut impl rand::Rng) -> Vec<String> {
+    use rand::seq::SliceRandom;
+    let mut seen = std::collections::HashSet::new();
+    let mut uris: Vec<String> = uris.into_iter().filter(|u| seen.insert(u.clone())).collect();
+    uris.shuffle(rng);
+    if let Some(i) = first.and_then(|f| uris.iter().position(|u| u == f)) {
+        let song = uris.remove(i);
+        uris.insert(0, song);
+    }
+    uris.truncate(SHUFFLE_MAX);
+    uris
+}
+
+/// Source of Liked Songs pages, so the sync can be tested without Spotify.
+trait LikedPages {
+    fn liked_page(&mut self, offset: usize) -> Result<Page<Track>>;
+}
+
+impl LikedPages for Spotify {
+    fn liked_page(&mut self, offset: usize) -> Result<Page<Track>> {
+        self.liked_tracks(offset)
+    }
+}
+
+fn add_liked(library: &mut Library, t: &Track) {
+    library.tracks.insert(t.uri.clone());
+    library.artists.extend(t.artists.iter().filter_map(|a| a.uri.clone()));
+}
+
+/// Brings the Liked Songs index up to date with as few requests as it can. Liked Songs come
+/// newest first, so: read pages until a song the copy knows; if the count then matches, the
+/// copy plus the new songs is the list (often 1 request). Else (songs were removed) read it all.
+/// With no copy, or when Spotify refuses midway and there is a copy, the copy stands.
+fn sync_liked(api: &mut impl LikedPages, copy: Option<Library>) -> Result<Library> {
+    let mut fresh: Vec<Track> = Vec::new();
+    let mut offset = 0;
+    let mut total;
+    let mut met = false;
+    loop {
+        let page = match api.liked_page(offset) {
+            Ok(page) => page,
+            Err(e) => return copy.ok_or(e),
+        };
+        total = page.total;
+        offset += page.raw;
+        for t in page.items {
+            if copy.as_ref().is_some_and(|c| c.tracks.contains(&t.uri)) {
+                met = true;
+                break;
+            }
+            fresh.push(t);
+        }
+        if met || page.raw == 0 || offset >= total {
+            break;
+        }
+    }
+    if let Some(mut lib) = copy.clone().filter(|_| met) {
+        let joined = fresh.len() + lib.liked_order.len();
+        if joined == total {
+            for t in &fresh {
+                add_liked(&mut lib, t);
+            }
+            let mut order: Vec<String> = fresh.iter().map(|t| t.uri.clone()).collect();
+            order.append(&mut lib.liked_order);
+            lib.liked_order = order;
+            return Ok(lib);
+        }
+    }
+    if !met {
+        // No song of the copy came up: `fresh` is the whole list.
+        let mut lib = copy.unwrap_or_default();
+        lib.tracks.clear();
+        lib.artists.clear();
+        for t in &fresh {
+            add_liked(&mut lib, t);
+        }
+        lib.liked_order = fresh.into_iter().map(|t| t.uri).collect();
+        return Ok(lib);
+    }
+    // Something changed that the newest pages do not show: read everything again.
+    let mut lib = copy.clone().unwrap_or_default();
+    lib.tracks.clear();
+    lib.artists.clear();
+    lib.liked_order.clear();
+    let mut offset = 0;
+    loop {
+        let page = match api.liked_page(offset) {
+            Ok(page) => page,
+            Err(e) => return copy.ok_or(e),
+        };
+        offset += page.raw;
+        for t in &page.items {
+            add_liked(&mut lib, t);
+            lib.liked_order.push(t.uri.clone());
+        }
+        if page.raw == 0 || offset >= page.total {
+            break;
+        }
+    }
+    Ok(lib)
+}
+
+/// The Liked Songs index, plus top and recent songs and artists (for discover) once a day.
+fn sync_library(api: &mut Spotify, copy: Option<Library>) -> Result<Library> {
+    let mut library = sync_liked(api, copy)?;
+    let now = crate::api::unix_now();
+    if now.saturating_sub(library.taste_at) < 24 * 3600 {
+        return Ok(library);
+    }
+    // A login from before these permissions gets an error here: discover then knows Liked
+    // Songs only.
+    let mut heard = std::collections::HashSet::new();
+    let mut top = std::collections::HashSet::new();
+    if api.has_scope("user-top-read") {
+        for range in ["short_term", "medium_term", "long_term"] {
+            for a in api.top_artists(range).unwrap_or_default() {
+                top.insert(format!("spotify:artist:{}", a.id));
+            }
+        }
+        for range in ["short_term", "medium_term"] {
+            heard.extend(api.top_tracks(range).unwrap_or_default().into_iter().map(|t| t.uri));
+        }
+    }
+    if api.has_scope("user-read-recently-played") {
+        if let Ok(page) = api.recently_played(0) {
+            heard.extend(page.items.into_iter().map(|t| t.uri));
+        }
+    }
+    // Keep the old lists when Spotify refused the new ones.
+    if !top.is_empty() || !heard.is_empty() {
+        library.top_artists = top;
+        library.heard = heard;
+        library.taste_at = now;
+    }
+    Ok(library)
+}
+
+/// Pages of Liked Songs and Playlists kept on disk: a good page is saved; when Spotify refuses
+/// one (a rate limit, no network), the saved one stands in, and a rate limit asks again later.
+fn saved_copy<T>(list: &List, offset: usize, fetched: Result<Page<T>>, tx: &Sender<Msg>) -> Result<Page<T>>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let name = match list {
+        List::Liked => format!("lists/liked-{offset}.json"),
+        _ => format!("lists/playlists-{offset}.json"),
+    };
+    match fetched {
+        Ok(page) => {
+            crate::store::write(&name, &page);
+            Ok(page)
+        }
+        Err(e) => {
+            let Some(page) = crate::store::read::<Page<T>>(&name) else { return Err(e) };
+            if let Some(ApiError::RateLimited(secs)) = e.downcast_ref::<ApiError>() {
+                let _ = tx.send(Msg::RetryLater { list: list.clone(), secs: *secs });
+            }
+            Ok(page)
+        }
     }
 }
 
@@ -534,6 +812,79 @@ mod tests {
 
     fn page(n: usize) -> Page<u32> {
         Page { items: vec![n as u32], raw: 1, total: 1 }
+    }
+
+    struct Fake {
+        /// Liked Songs, newest first.
+        uris: Vec<String>,
+        calls: usize,
+        fail: bool,
+    }
+
+    impl LikedPages for Fake {
+        fn liked_page(&mut self, offset: usize) -> Result<Page<Track>> {
+            self.calls += 1;
+            if self.fail {
+                return Err(ApiError::RateLimited(60).into());
+            }
+            let items: Vec<Track> = self.uris.iter().skip(offset).take(50).map(|u| track(u)).collect();
+            Ok(Page { raw: items.len(), items, total: self.uris.len() })
+        }
+    }
+
+    fn track(uri: &str) -> Track {
+        serde_json::from_value(serde_json::json!({ "uri": uri, "name": uri, "album": null, "show": null })).unwrap()
+    }
+
+    fn liked(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("spotify:track:{i}")).collect()
+    }
+
+    #[test]
+    fn liked_sync_asks_little_when_little_changed() {
+        let mut api = Fake { uris: liked(120), calls: 0, fail: false };
+        let lib = sync_liked(&mut api, None).unwrap();
+        assert_eq!((lib.liked_order.len(), api.calls), (120, 3), "no copy: every page");
+        // Nothing new: one request.
+        api.calls = 0;
+        let lib = sync_liked(&mut api, Some(lib)).unwrap();
+        assert_eq!((lib.liked_order.len(), api.calls), (120, 1));
+        // Two new songs on top: still one request, and they come first.
+        api.uris.insert(0, "spotify:track:new1".into());
+        api.uris.insert(0, "spotify:track:new2".into());
+        api.calls = 0;
+        let lib = sync_liked(&mut api, Some(lib)).unwrap();
+        assert_eq!(api.calls, 1);
+        assert_eq!(lib.liked_order, api.uris);
+        // A song removed: the count is off, so it reads everything again.
+        api.uris.remove(60);
+        api.calls = 0;
+        let lib = sync_liked(&mut api, Some(lib)).unwrap();
+        assert_eq!(lib.liked_order, api.uris);
+        assert!(!lib.tracks.contains("spotify:track:58"));
+        // Refused: the copy stands; no copy: the error.
+        api.fail = true;
+        assert_eq!(sync_liked(&mut api, Some(lib)).unwrap().liked_order.len(), 121);
+        assert!(sync_liked(&mut api, None).is_err());
+    }
+
+    #[test]
+    fn true_shuffle_keeps_every_song_once_with_the_start_first() {
+        let uris: Vec<String> = (0..300).map(|i| format!("spotify:track:{i}")).chain(["spotify:track:7".into()]).collect();
+        let mut rng = rand::thread_rng();
+        let out = shuffled(uris.clone(), Some("spotify:track:42"), &mut rng);
+        assert_eq!(out[0], "spotify:track:42");
+        assert_eq!(out.len(), 300, "the double one once");
+        let set: std::collections::HashSet<_> = out.iter().collect();
+        assert_eq!(set.len(), 300);
+        assert_ne!(out[1..20], uris[..19], "not in order");
+        // Every song can come anywhere: over many shuffles, song 0 is not always early.
+        let late = (0..200).filter(|_| {
+            let o = shuffled(uris.clone(), None, &mut rng);
+            o.iter().position(|u| u == "spotify:track:0").unwrap() > 150
+        });
+        assert!(late.count() > 50);
+        assert_eq!(shuffled((0..900).map(|i| i.to_string()).collect(), None, &mut rng).len(), SHUFFLE_MAX);
     }
 
     #[test]

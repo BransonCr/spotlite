@@ -35,6 +35,11 @@ pub fn entries(app: &App) -> Vec<Entry> {
             add("Discover new music (another round)", "d", key('d'));
             add("Radio filters", "F", key('F'));
             add("Save this radio as a playlist", "S", key('S'));
+            add("Randomize the seed's genre", "z", key('z'));
+        }
+        View::Random => {
+            add("Roll again (50 new random songs)", "d", key('d'));
+            add("Save these songs as a playlist", "S", key('S'));
         }
         View::Artist => add("Next section", "tab", KeyEvent::from(KeyCode::Tab)),
         View::Album | View::Playlist | View::Playlists => add("Play all", "P", key('P')),

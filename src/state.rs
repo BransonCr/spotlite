@@ -63,6 +63,7 @@ pub enum SavedTab {
     Artist { id: String, name: String },
     Album { album: Album },
     Radio { seed: Track },
+    Random { genre: String },
 }
 
 pub fn path() -> PathBuf {

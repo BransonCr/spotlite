@@ -33,7 +33,8 @@ pub enum ApiError {
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ApiError::RateLimited(s) => write!(f, "rate limited by Spotify; retrying in {s}s"),
+            ApiError::RateLimited(s) if *s >= 120 => write!(f, "Spotify limits this request for {} min", s.div_ceil(60)),
+            ApiError::RateLimited(s) => write!(f, "Spotify limits this request; try again in {s}s"),
             ApiError::Unauthorized => write!(f, "login expired; run `spotlite auth`"),
             ApiError::MissingScope => write!(f, "permission missing; run `spotlite auth` again"),
             ApiError::Forbidden => write!(f, "Spotify does not allow this"),
@@ -165,18 +166,18 @@ impl Track {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Owner {
     pub id: String,
     pub display_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Total {
     pub total: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: String,
     pub uri: String,
@@ -241,7 +242,7 @@ pub struct User {
 }
 
 /// One page of a list, plus the size of the whole list.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
     /// Entries Spotify returned, null ones included; the next page starts this far on.
@@ -334,6 +335,21 @@ pub struct Spotify {
     agent: ureq::Agent,
     cfg: Config,
     token: Token,
+    /// Requests Spotify refused with 429, by bucket, and the time (unix s) they open again.
+    /// Until then spotlite does not ask: each refused request makes the wait longer.
+    limits: std::collections::HashMap<String, u64>,
+}
+
+/// The bucket of a request path: its ids become `*` ("/playlists/*/items").
+pub fn bucket(path: &str) -> String {
+    path.split('/')
+        .map(|seg| if seg.len() >= 16 && seg.chars().all(|c| c.is_ascii_alphanumeric()) { "*" } else { seg })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 impl Spotify {
@@ -345,6 +361,7 @@ impl Spotify {
             agent,
             cfg,
             token: Token::load()?,
+            limits: crate::store::read("limits.json").unwrap_or_default(),
         })
     }
 
@@ -374,6 +391,14 @@ impl Spotify {
         query: &[(&str, &str)],
         body: Option<Value>,
     ) -> Result<Option<ureq::Response>> {
+        let key = bucket(path);
+        let now = unix_now();
+        if let Some(&until) = self.limits.get(&key) {
+            if until > now {
+                return Err(ApiError::RateLimited(until - now).into());
+            }
+            self.limits.remove(&key);
+        }
         let auth = self.bearer()?;
         let mut req = self
             .agent
@@ -398,6 +423,10 @@ impl Spotify {
                     .unwrap_or(5);
                 let body: Value = resp.into_json().unwrap_or(Value::Null);
                 let msg = body["error"]["message"].as_str().unwrap_or("no details").to_owned();
+                if code == 429 {
+                    self.limits.insert(key, now + retry_after);
+                    crate::store::write("limits.json", &self.limits);
+                }
                 Err(classify(code, msg, retry_after).into())
             }
             Err(e) => Err(e.into()),
@@ -436,7 +465,14 @@ impl Spotify {
         if let Some(user) = read_user(&path) {
             return Ok(user);
         }
-        let user = self.me()?;
+        let user = match self.me() {
+            Ok(user) => user,
+            // Refused (often a rate limit): the client protocol login knows the same id.
+            Err(e) => match crate::client::username() {
+                Some(id) => User { uri: format!("spotify:user:{id}"), id },
+                None => return Err(e),
+            },
+        };
         write_user(&path, &user);
         Ok(user)
     }
@@ -735,6 +771,12 @@ fn classify(code: u16, msg: String, retry_after: u64) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn buckets_hide_ids() {
+        assert_eq!(super::bucket("/playlists/37i9dQZF1DXcBWIGoYBM5M/items"), "/playlists/*/items");
+        assert_eq!(super::bucket("/me/tracks"), "/me/tracks");
+    }
+
     #[test]
     fn up_next_with_an_empty_or_odd_queue_does_not_panic() {
         use serde_json::json;

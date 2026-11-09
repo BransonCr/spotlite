@@ -104,9 +104,15 @@ impl Default for Filters {
     }
 }
 
-/// What the filters know about your taste.
-#[derive(Debug, Clone, Default)]
+/// What the filters know about your taste. Kept on disk (library.json) and brought up to date
+/// with few requests (see `worker::sync_library`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Library {
+    /// Liked Songs in Spotify's order (newest first): true shuffle plays these.
+    pub liked_order: Vec<String>,
+    /// When the top and recent lists were last read (unix s).
+    pub taste_at: u64,
     /// Liked Songs, and their artists.
     pub tracks: std::collections::HashSet<String>,
     pub artists: std::collections::HashSet<String>,
@@ -197,6 +203,35 @@ async fn radio_uris(sp: &librespot_core::spclient::SpClient, seed_uri: &str) -> 
         .map(|i| i.uri().to_owned())
         .filter(|u| u.starts_with("spotify:track:"))
         .collect())
+}
+
+/// Every song of a playlist, in order, over the client protocol: it works for any playlist
+/// (the Web API lists only your own) and uses none of the Web API's quota. Blocks.
+#[cfg(feature = "client")]
+pub fn playlist_uris(playlist_uri: &str) -> anyhow::Result<Vec<String>> {
+    use anyhow::anyhow;
+    use librespot_core::SpotifyId;
+    use librespot_protocol::playlist4_external::SelectedListContent;
+    use protobuf::Message;
+
+    let id = playlist_uri.strip_prefix("spotify:playlist:").ok_or_else(|| anyhow!("not a playlist: {playlist_uri}"))?;
+    let id = SpotifyId::from_base62(id).map_err(|e| anyhow!("bad playlist id: {e}"))?;
+    let (rt, session) = crate::client::connect()?;
+    let bytes = rt.block_on(session.spclient().get_playlist(&id));
+    session.shutdown();
+    let list = SelectedListContent::parse_from_bytes(&bytes?)?;
+    Ok(list
+        .contents
+        .items
+        .iter()
+        .map(|i| i.uri().to_owned())
+        .filter(|u| u.starts_with("spotify:track:"))
+        .collect())
+}
+
+#[cfg(not(feature = "client"))]
+pub fn playlist_uris(_playlist_uri: &str) -> anyhow::Result<Vec<String>> {
+    anyhow::bail!("needs the `client` feature")
 }
 
 /// Radio tracks of several seeds together (for discover mode); seeds with no radio are skipped.
@@ -405,6 +440,7 @@ mod tests {
             artists: ["spotify:artist:b".to_owned()].into(),
             heard: ["spotify:track:7".to_owned()].into(),
             top_artists: ["spotify:artist:g".to_owned()].into(),
+            ..Default::default()
         };
         let mut pool = pool;
         pool.push(t("7", "h", 1994, 60, false)); // recently played

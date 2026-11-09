@@ -205,6 +205,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Artist => draw_artist(f, app, body),
         View::Album => draw_album(f, app, body),
         View::Radio => draw_radio(f, app, body),
+        View::Random => draw_random(f, app, body),
     }
     draw_now_playing(f, app, now);
     draw_footer(f, app, footer);
@@ -222,6 +223,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if app.menu.is_some() {
         draw_menu(f, app);
+    } else if app.genre_prompt.is_some() {
+        draw_genre_prompt(f, app);
     } else if app.picker.is_some() {
         draw_picker(f, app);
     } else if app.confirm.is_some() {
@@ -517,6 +520,41 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: Rect) {
     draw_tracks(f, app, list, title, &empty);
 }
 
+fn draw_random(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(Page::Random(page)) = app.page() else { return };
+    let (genre, rolling, error, count) = (page.genre.clone(), page.rolling, page.error.clone(), page.tracks.items.len());
+    let cover = page.tracks.items.first().map(|t| t.images().to_vec()).unwrap_or_default();
+    let [head, list] = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).spacing(gap()).areas(area);
+    let block = panel();
+    let inner = block.inner(head);
+    f.render_widget(block, head);
+    let state = if rolling {
+        format!("{} Picking random songs…", SPINNER[anim(80) % SPINNER.len()])
+    } else {
+        format!("{count} songs  ·  d to roll again  ·  S to save as a playlist")
+    };
+    draw_page_header(
+        f,
+        &mut app.images,
+        inner,
+        &cover,
+        vec![
+            Line::from(vec![Span::styled("Randomize  ", theme::muted()), Span::styled(genre.clone(), theme::bright())]),
+            Line::from(Span::styled(
+                "Picked at random from all through the genre on Spotify, not by your taste",
+                theme::muted(),
+            )),
+            Line::from(Span::styled(state, theme::accent())),
+        ],
+    );
+    let title = page_title(app, list, "Randomize");
+    let empty = match &error {
+        Some(e) => e.clone(),
+        None => format!("Picking random {genre} songs…"),
+    };
+    draw_tracks(f, app, list, title, &empty);
+}
+
 /// " 12 / 266 " at the bottom right of a list panel.
 fn draw_position(f: &mut Frame, area: Rect, selected: usize, len: usize) {
     // Without a bottom line there is no place for it (the title shows the count).
@@ -600,6 +638,21 @@ fn draw_menu(f: &mut Frame, app: &mut App) {
         f.render_widget(Line::from(Span::styled(format!("{key} "), theme::faint())).right_aligned(), row);
         app.hits.popup_rows.push((row, i));
     }
+}
+
+fn draw_genre_prompt(f: &mut Frame, app: &mut App) {
+    let Some(text) = app.genre_prompt.clone() else { return };
+    let area = popup_area(f, 56, 7);
+    let block = popup_block("Randomize · which genre?".into())
+        .title_bottom(Line::from(Span::styled(" ⏎ randomize · esc close ", theme::faint())).right_aligned());
+    let inner = block.inner(area).inner(Margin::new(0, 1));
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    app.hits.popup = area;
+    let [line, _, hint] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    f.render_widget(Line::from(vec![Span::styled("› ", theme::accent()), Span::styled(text.clone(), theme::text())]), line);
+    f.set_cursor_position(Position::new(line.x + 2 + text.width() as u16, line.y));
+    f.render_widget(Span::styled("Like: shoegaze, drum and bass, city pop, hyperpop", theme::faint()), hint);
 }
 
 fn draw_picker(f: &mut Frame, app: &mut App) {
@@ -1028,6 +1081,7 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         let glyph = match kind {
             "Artist" => '◉',
             "Album" => '◎',
+            "Random" => '⚄',
             _ => '≋',
         };
         let key = i + Tab::ALL.len() + 1;
@@ -1144,6 +1198,7 @@ fn draw_tabs_list(f: &mut Frame, app: &mut App, header: Rect) {
         let glyph = match kind {
             "Artist" => '◉',
             "Album" => '◎',
+            "Random" => '⚄',
             _ => '≋',
         };
         let key = i + Tab::ALL.len() + 1;
@@ -1400,9 +1455,10 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
         View::Liked => Some(&mut app.liked),
         View::Recent => Some(&mut app.recent),
         View::Playlist => app.open.as_mut().map(|o| &mut o.tracks),
-        View::Album | View::Radio => match app.active.and_then(|i| app.pages.get_mut(i)) {
+        View::Album | View::Radio | View::Random => match app.active.and_then(|i| app.pages.get_mut(i)) {
             Some(Page::Album(a)) => Some(&mut a.tracks),
             Some(Page::Radio(r)) => Some(&mut r.tracks),
+            Some(Page::Random(r)) => Some(&mut r.tracks),
             _ => None,
         },
         View::Playlists | View::Artist => None,
@@ -2163,7 +2219,8 @@ fn hints(app: &App) -> &'static [(&'static str, &'static str)] {
         View::Recent => &[("⏎", "play"), (".", "actions"), ("f", "like"), ("o", "radio"), ("R", "reload"), ("?", "help")],
         View::Artist => &[("⏎", "play / open"), ("tab", "section"), ("H L", "tabs"), ("x", "close"), ("esc", "back"), ("?", "help")],
         View::Album => &[("⏎", "play"), ("P", "play album"), (".", "actions"), ("x", "close"), ("esc", "back"), ("?", "help")],
-        View::Radio => &[("⏎", "play"), ("d", "discover"), ("F", "filters"), ("x", "close"), ("esc", "back"), ("?", "help")],
+        View::Radio => &[("⏎", "play"), ("d", "discover"), ("z", "randomize"), ("F", "filters"), ("x", "close"), ("esc", "back"), ("?", "help")],
+        View::Random => &[("⏎", "play"), ("d", "roll again"), ("S", "save as playlist"), ("x", "close"), ("esc", "back"), ("?", "help")],
     }
 }
 
@@ -2230,13 +2287,14 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("space", "play / pause"),
         ("n p", "next / previous"),
         ("← →", "seek 10 s"),
-        ("s  r", "shuffle, repeat"),
+        ("s  r", "true shuffle, repeat"),
     ]),
     ("Song", &[
         (".", "all actions (or right-click)"),
         ("a", "add to queue"),
         ("i  b", "go to artist, album"),
         ("o", "song radio (or artist)"),
+        ("z", "randomize: 50 random songs of its genre"),
         ("e  D", "add to playlist, remove"),
         ("f", "like / unlike"),
     ]),

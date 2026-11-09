@@ -414,11 +414,44 @@ pub fn active_filters(f: &Filters) -> Vec<String> {
         .collect()
 }
 
+/// Randomize: songs picked at random inside one genre (see genre.rs).
+pub struct RandomPage {
+    pub genre: String,
+    pub tracks: Listing<Track>,
+    /// A roll is on its way.
+    pub rolling: bool,
+    /// How many times it rolled (the playlist name counts them).
+    pub rolls: u32,
+    pub error: Option<String>,
+}
+
+impl RandomPage {
+    pub fn new(genre: String) -> Self {
+        RandomPage { genre, tracks: Listing::default(), rolling: true, rolls: 0, error: None }
+    }
+
+    pub fn fill(&mut self, result: Result<Vec<Track>, String>) {
+        self.rolling = false;
+        match result {
+            Ok(tracks) => {
+                self.rolls += 1;
+                self.error = None;
+                self.tracks.total = Some(tracks.len());
+                self.tracks.items = tracks;
+                self.tracks.state.select((!self.tracks.items.is_empty()).then_some(0));
+                *self.tracks.state.offset_mut() = 0;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+}
+
 /// A page in its own tab.
 pub enum Page {
     Artist(ArtistPage),
     Album(AlbumPage),
     Radio(Box<RadioPage>),
+    Random(RandomPage),
 }
 
 impl Page {
@@ -428,6 +461,7 @@ impl Page {
             Page::Artist(a) => format!("artist:{}", a.id),
             Page::Album(a) => format!("album:{}", a.id),
             Page::Radio(r) => format!("radio:{}", r.seed.uri),
+            Page::Random(r) => format!("random:{}", r.genre),
         }
     }
 
@@ -437,6 +471,7 @@ impl Page {
             Page::Artist(a) => ("Artist", &a.name),
             Page::Album(a) => ("Album", &a.album.name),
             Page::Radio(r) => ("Radio", &r.seed.name),
+            Page::Random(r) => ("Random", &r.genre),
         }
     }
 }

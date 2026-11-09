@@ -32,6 +32,20 @@ mod imp {
         })?;
         Ok((rt, session))
     }
+
+    /// The account's user id, from the client protocol login. The Web API's /me can be refused
+    /// for hours; this asks nothing of it.
+    pub fn username() -> Option<String> {
+        let (_rt, session) = connect().ok()?;
+        let name = session.username();
+        session.shutdown();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
+#[cfg(not(feature = "client"))]
+pub fn username() -> Option<String> {
+    None
 }
 
 /// True when this build can use the client protocol.

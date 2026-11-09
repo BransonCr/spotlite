@@ -2,7 +2,7 @@ use crate::api::{Album, Found, Page as ApiPage, Play, Playback, Playlist, Track}
 use crate::control::Ctl;
 use crate::folders::Entry;
 use crate::images::Images;
-use crate::pages::{AlbumPage, ArtistPage, ArtistRow, FilterItem, Page, RadioPage};
+use crate::pages::{AlbumPage, ArtistPage, ArtistRow, FilterItem, Page, RadioPage, RandomPage};
 use crate::radio::Library;
 use crate::sidebar::{Item as SideItem, Pin, SideView, Sidebar, SongAct};
 use crate::state::{SavedPlayback, SavedTab, State};
@@ -201,6 +201,8 @@ pub enum View {
     Artist,
     Album,
     Radio,
+    /// Randomize: random songs of one genre.
+    Random,
 }
 
 /// What a menu entry does.
@@ -211,6 +213,12 @@ pub enum Action {
     Artist { id: String, name: String },
     Album(Album),
     Radio,
+    /// Find the song's genres, to randomize one.
+    Genres,
+    /// 50 random songs of this genre.
+    Randomize(String),
+    /// Type the genre to randomize.
+    TypeGenre,
     AddToPlaylist,
     RemoveFromPlaylist,
     Like,
@@ -398,6 +406,14 @@ pub struct App {
     pub tabs_list: Option<TabsList>,
     /// Pages restored at start that have not loaded yet (by key): they load when shown.
     unloaded: std::collections::HashSet<String>,
+    /// Lists Spotify limits for now: each loads again at its time.
+    retries: Vec<(List, Instant)>,
+    /// spotlite's own shuffle (Fisher-Yates over the whole list). Spotify's is kept off.
+    pub true_shuffle: bool,
+    /// Randomize: a genre being typed (when MusicBrainz knows none, or you want another).
+    pub genre_prompt: Option<String>,
+    /// The list a true shuffle plays, and its songs: the player shows that list as the source.
+    shuffled: Option<(String, std::collections::HashSet<String>)>,
     /// The theme in use when the picker opened (Esc goes back to it).
     theme_before: Option<String>,
     /// Live reload: when the theme file and the saved state were last looked at, and their times.
@@ -487,6 +503,10 @@ impl App {
             nav: NavTree::new(Loc::Base(Tab::Search), "⌕ Search".into()),
             undo: None,
             tabs_list: None,
+            retries: Vec::new(),
+            true_shuffle: false,
+            genre_prompt: None,
+            shuffled: None,
             unloaded: Default::default(),
             theme_before: None,
             theme_watch: (Instant::now(), None, None),
@@ -706,8 +726,35 @@ impl App {
     }
 
     fn send(&mut self, cmd: Cmd) {
+        let cmd = self.with_true_shuffle(cmd);
         if self.tx.send(cmd).is_ok() {
             self.in_flight += 1;
+        }
+    }
+
+    /// With true shuffle on, a play command plays the whole list in a random order instead.
+    fn with_true_shuffle(&mut self, cmd: Cmd) -> Cmd {
+        if !self.true_shuffle {
+            return cmd;
+        }
+        match cmd {
+            Cmd::Play(Play::Context { uri, from }) if crate::worker::shufflable(&uri) => {
+                Cmd::PlayShuffled { context: uri, from, position_ms: 0 }
+            }
+            Cmd::PlayLiked { from } => {
+                let context = match &self.user_id {
+                    Some(id) => format!("spotify:user:{id}:collection"),
+                    None => "spotify:collection".into(),
+                };
+                Cmd::PlayShuffled { context, from: Some(from), position_ms: 0 }
+            }
+            Cmd::Play(Play::Tracks { uris, offset }) if uris.len() > 1 => {
+                let first = uris.get(offset).cloned();
+                let uris = crate::worker::shuffled(uris, first.as_deref(), &mut rand::thread_rng());
+                self.shuffled = None;
+                Cmd::Play(Play::Tracks { uris, offset: 0 })
+            }
+            cmd => cmd,
         }
     }
 
@@ -740,6 +787,7 @@ impl App {
             Some(Page::Artist(_)) => return View::Artist,
             Some(Page::Album(_)) => return View::Album,
             Some(Page::Radio(_)) => return View::Radio,
+            Some(Page::Random(_)) => return View::Random,
             None => {}
         }
         match self.tab {
@@ -756,6 +804,7 @@ impl App {
         match (self.view(), self.page()) {
             (View::Album, Some(Page::Album(a))) => Some(&a.tracks),
             (View::Radio, Some(Page::Radio(r))) => Some(&r.tracks),
+            (View::Random, Some(Page::Random(r))) => Some(&r.tracks),
             (View::Search, _) if self.search_kind == SearchKind::Songs => Some(&self.search),
             (View::Liked, _) => Some(&self.liked),
             (View::Recent, _) => Some(&self.recent),
@@ -777,6 +826,10 @@ impl App {
             },
             View::Radio => match self.page_mut() {
                 Some(Page::Radio(r)) => Some(&mut r.tracks),
+                _ => None,
+            },
+            View::Random => match self.page_mut() {
+                Some(Page::Random(r)) => Some(&mut r.tracks),
                 _ => None,
             },
             View::Playlists | View::Artist => None,
@@ -995,7 +1048,7 @@ impl App {
                 Some(Page::Album(a)) => a.tracks.wants_page().map(|off| (List::Album(a.id.clone()), off)),
                 _ => None,
             },
-            View::Artist | View::Radio => None,
+            View::Artist | View::Radio | View::Random => None,
         };
         // The playlist picker lists every playlist, so it needs them all.
         let request = request.or_else(|| {
@@ -1004,7 +1057,16 @@ impl App {
             (wanted && !l.loading && l.total.is_none_or(|t| l.fetched < t))
                 .then_some((List::Playlists, l.fetched))
         });
+        // A list Spotify limited loads again when the limit ends.
+        let now = Instant::now();
+        let request = request.or_else(|| {
+            let i = self.retries.iter().position(|(_, at)| *at <= now)?;
+            Some((self.retries.remove(i).0, 0))
+        });
         if let Some((list, offset)) = request {
+            if offset == 0 {
+                self.retries.retain(|(l, _)| *l != list);
+            }
             if list == List::Playlists {
                 self.playlists.loading = true;
             } else if matches!(list, List::Found { .. }) {
@@ -1014,6 +1076,29 @@ impl App {
             }
             self.send(Cmd::Load { list, offset });
         }
+    }
+
+    /// Spotify limits `list` for `secs`: say so once, and load it again then.
+    fn retry_later(&mut self, list: List, secs: u64) {
+        let at = Instant::now() + Duration::from_secs(secs.clamp(5, 6 * 3600));
+        if let Some(r) = self.retries.iter_mut().find(|(l, _)| *l == list) {
+            r.1 = at;
+            return;
+        }
+        let what = match &list {
+            List::Liked => "Liked Songs",
+            List::Playlists => "your playlists",
+            List::Recent => "recently played songs",
+            _ => "this list",
+        };
+        let wait = if secs >= 120 { format!("{} min", secs.div_ceil(60)) } else { format!("{secs} s") };
+        let copy = match &list {
+            List::Liked if !self.liked.items.is_empty() => " It shows the saved copy until then.",
+            List::Playlists if !self.playlists.items.is_empty() => " It shows the saved copy until then.",
+            _ => "",
+        };
+        self.info(format!("Spotify limits {what} for {wait}; spotlite asks again then.{copy}"));
+        self.retries.push((list, at));
     }
 
     fn listing_for(&mut self, list: &List) -> Option<&mut Listing<Track>> {
@@ -1069,12 +1154,8 @@ impl App {
                         p.progress_ms = Some(local_now);
                     }
                 }
-                if let (Some((held, at)), Some(p)) = (self.shuffle_hold, pb.as_mut()) {
-                    if p.shuffle_state == held || at.elapsed() >= PLAYER_HOLD {
-                        self.shuffle_hold = None;
-                    } else {
-                        p.shuffle_state = held;
-                    }
+                if let Some(p) = pb.as_mut() {
+                    self.own_shuffle(p);
                 }
                 if let (Some((held, at)), Some(p)) = (self.repeat_hold, pb.as_mut()) {
                     if p.repeat_state == held || at.elapsed() >= PLAYER_HOLD {
@@ -1156,6 +1237,33 @@ impl App {
                                     ta.images = album.images.clone();
                                 }
                             }
+                        }
+                    }
+                }
+            }
+            Msg::Shuffled { context, uris } => {
+                self.shuffled = Some((context, uris.into_iter().collect()));
+            }
+            Msg::Genres { artist, result } => match result {
+                Ok(genres) if genres.is_empty() => {
+                    self.info(format!("MusicBrainz has no genres for {artist}: type one."));
+                    self.genre_prompt = Some(String::new());
+                }
+                Ok(genres) => self.offer_genres(&artist, genres),
+                Err(e) => self.error(format!("Genres of {artist}: {e}")),
+            },
+            Msg::Random { genre, result } => {
+                if let Err(e) = &result {
+                    self.error(e.clone());
+                } else if let Ok(t) = &result {
+                    if t.len() < crate::genre::WANT {
+                        self.info(format!("Only {} songs found in {genre}.", t.len()));
+                    }
+                }
+                for p in self.pages.iter_mut() {
+                    if let Page::Random(r) = p {
+                        if r.genre == genre {
+                            r.fill(result.clone());
                         }
                     }
                 }
@@ -1246,6 +1354,7 @@ impl App {
                 self.rebuild_rows();
             }
             Msg::Folders(tree) => self.set_folders(tree),
+            Msg::RetryLater { list, secs } => self.retry_later(list, secs),
             Msg::LoadFailed { list, forbidden } => {
                 if list == List::Playlists {
                     self.playlists.loading = false;
@@ -1360,6 +1469,7 @@ impl App {
             Page::Artist(a) => Cmd::Artist(a.id.clone()),
             Page::Album(a) => Cmd::Album(a.id.clone()),
             Page::Radio(r) => Cmd::Radio(r.seed.uri.clone()),
+            Page::Random(r) => Cmd::Randomize(r.genre.clone()),
         };
         if matches!(cmd, Cmd::Radio(_)) && !self.library_asked {
             self.library_asked = true;
@@ -1377,6 +1487,7 @@ impl App {
                 Page::Artist(a) => SavedTab::Artist { id: a.id.clone(), name: a.name.clone() },
                 Page::Album(a) => SavedTab::Album { album: a.album.clone() },
                 Page::Radio(r) => SavedTab::Radio { seed: r.seed.clone() },
+                Page::Random(r) => SavedTab::Random { genre: r.genre.clone() },
             })
             .collect();
         // A theme tried with SPOTLITE_THEME is not saved.
@@ -1417,6 +1528,7 @@ impl App {
         }
         self.pins = state.pins;
         self.last_playback = state.playback.clone();
+        self.true_shuffle = state.playback.as_ref().is_some_and(|p| p.shuffle);
         self.resume = state.playback.map(|p| (p, Instant::now()));
         for tab in state.tabs.into_iter().take(MAX_PAGES) {
             let page = match tab {
@@ -1426,6 +1538,7 @@ impl App {
                     None => continue,
                 },
                 SavedTab::Radio { seed } => Page::Radio(Box::new(RadioPage::new(seed))),
+                SavedTab::Random { genre } => Page::Random(RandomPage::new(genre)),
             };
             let key = page.key();
             if !self.exists(&Loc::Page(key.clone())) {
@@ -1473,6 +1586,7 @@ impl App {
                         Page::Artist(a) => ("◉", SavedTab::Artist { id: a.id.clone(), name: a.name.clone() }),
                         Page::Album(a) => ("◎", SavedTab::Album { album: a.album.clone() }),
                         Page::Radio(r) => ("≋", SavedTab::Radio { seed: r.seed.clone() }),
+                        Page::Random(r) => ("⚄", SavedTab::Random { genre: r.genre.clone() }),
                     };
                     (format!("{glyph} {}", p.title().1), Some(saved))
                 }
@@ -1490,6 +1604,7 @@ impl App {
                 None => return false,
             },
             SavedTab::Radio { seed } => Page::Radio(Box::new(RadioPage::new(seed))),
+            SavedTab::Random { genre } => Page::Random(RandomPage::new(genre)),
         };
         let key = page.key();
         if !self.exists(&Loc::Page(key.clone())) {
@@ -1672,6 +1787,9 @@ impl App {
         if crate::client::AVAILABLE && track.uri.starts_with("spotify:track:") {
             items.push(("o", "Start song radio".into(), Action::Radio));
         }
+        if track.uri.starts_with("spotify:track:") && track.artists.iter().any(|a| a.uri.is_some()) {
+            items.push(("z", "Randomize this genre…".into(), Action::Genres));
+        }
         items.push(("e", "Add to playlist…".into(), Action::AddToPlaylist));
         if let Some(pl) = self.editable_open_playlist() {
             items.push(("D", format!("Remove from {}", pl.name), Action::RemoveFromPlaylist));
@@ -1850,11 +1968,90 @@ impl App {
             Action::Artist { id, name } => self.open_artist(id, name),
             Action::Album(album) => self.open_album(album),
             Action::Radio => self.start_radio(track),
+            Action::Genres => self.find_genres(&track),
+            Action::Randomize(genre) => self.randomize(genre),
+            Action::TypeGenre => self.genre_prompt = Some(String::new()),
             Action::AddToPlaylist => self.open_picker(track),
             Action::RemoveFromPlaylist => self.ask_remove(track),
             Action::Like => self.toggle_like(Some(track)),
             Action::Filter(_) | Action::Theme(_) => {}
         }
+    }
+
+    /// `z`: randomize the genre of the radio's seed, the selected song, or the playing one.
+    fn randomize_key(&mut self) {
+        let track = match self.page() {
+            Some(Page::Radio(r)) => Some(r.seed.clone()),
+            Some(Page::Random(_)) => {
+                self.reroll();
+                return;
+            }
+            _ => self.selected_track().or_else(|| self.playback.as_ref().and_then(|p| p.item.clone())),
+        };
+        match track {
+            Some(t) => self.find_genres(&t),
+            None => self.info("Select a song first."),
+        }
+    }
+
+    /// Asks for the genres of the song's artist (Randomize, `z`).
+    fn find_genres(&mut self, track: &Track) {
+        let artists: Vec<(String, String)> =
+            track.artists.iter().filter_map(|a| Some((a.uri.clone()?, a.name.clone()))).take(3).collect();
+        let Some((_, name)) = artists.first() else {
+            self.genre_prompt = Some(String::new());
+            return;
+        };
+        self.info(format!("Finding the genres of {name}…"));
+        self.send(Cmd::Genres { artists });
+    }
+
+    /// The genres to randomize: a menu to pick one, or straight on when there is one.
+    fn offer_genres(&mut self, artist: &str, genres: Vec<String>) {
+        let mut items: Vec<(&'static str, String, Action)> =
+            genres.into_iter().map(|g| ("", g.clone(), Action::Randomize(g))).collect();
+        items.push(("", "Type another genre…".into(), Action::TypeGenre));
+        // A track, so the choice runs as a song action.
+        let track = Track { uri: String::new(), name: artist.to_owned(), duration_ms: 0, artists: Vec::new(), album: None, show: None, images: Vec::new() };
+        self.menu = Some(Menu { title: format!("Randomize · genres of {artist}"), items, cursor: 0, track: Some(track), at: None });
+    }
+
+    /// Opens the Randomize page of `genre` (or goes to it) and rolls it.
+    fn randomize(&mut self, genre: String) {
+        if self.open_page(Page::Random(RandomPage::new(genre.clone()))) {
+            self.send(Cmd::Randomize(genre));
+        }
+    }
+
+    /// Rolls the open Randomize page again: 50 new random songs.
+    fn reroll(&mut self) {
+        let Some(Page::Random(r)) = self.page_mut() else { return };
+        if r.rolling {
+            return;
+        }
+        r.rolling = true;
+        let genre = r.genre.clone();
+        self.send(Cmd::Randomize(genre));
+    }
+
+    /// Asks to save the random songs on screen as a new playlist.
+    fn ask_save_random(&mut self) {
+        if !self.can_edit {
+            self.error("Run `spotlite auth` again to allow editing playlists.");
+            return;
+        }
+        let Some(Page::Random(r)) = self.page() else { return };
+        let uris: Vec<String> = r.tracks.items.iter().map(|t| t.uri.clone()).collect();
+        if uris.is_empty() {
+            self.info("No songs to save.");
+            return;
+        }
+        let name = if r.rolls > 1 { format!("Random · {} {}", r.genre, r.rolls) } else { format!("Random · {}", r.genre) };
+        let description = format!("{} random songs of {}, picked by spotlite (not by taste).", uris.len(), r.genre);
+        self.confirm = Some(Confirm {
+            text: format!("Save these {} songs as a new playlist “{name}”?", uris.len()),
+            cmd: Cmd::CreatePlaylist { name, description, uris },
+        });
     }
 
     fn open_picker(&mut self, track: Track) {
@@ -1977,6 +2174,15 @@ impl App {
                 let uris: Vec<String> = self.recent.items.iter().map(|t| t.uri.clone()).collect();
                 if !uris.is_empty() {
                     let offset = self.recent.selected();
+                    self.send(Cmd::Play(Play::Tracks { uris, offset }));
+                    self.poll_soon();
+                }
+            }
+            View::Random => {
+                let Some(Page::Random(r)) = self.page() else { return };
+                let uris: Vec<String> = r.tracks.items.iter().map(|t| t.uri.clone()).collect();
+                if !uris.is_empty() {
+                    let offset = r.tracks.selected();
                     self.send(Cmd::Play(Play::Tracks { uris, offset }));
                     self.poll_soon();
                 }
@@ -2231,14 +2437,62 @@ impl App {
         self.send(Cmd::Repeat(next));
     }
 
+    /// Spotify's state, with spotlite's shuffle: ⇄ shows the true shuffle, and the list a true
+    /// shuffle plays shows as the source. Spotify's own shuffle, turned on elsewhere (a phone),
+    /// becomes the true shuffle: spotlite turns Spotify's off and shuffles the list itself.
+    fn own_shuffle(&mut self, p: &mut Playback) {
+        let recent = self.shuffle_hold.is_some_and(|(_, at)| at.elapsed() < PLAYER_HOLD);
+        if p.shuffle_state && !recent {
+            self.shuffle_hold = Some((true, Instant::now()));
+            self.send(Cmd::Shuffle(false));
+            if !self.true_shuffle {
+                self.true_shuffle = true;
+                let ctx = p.context.as_ref().map(|c| c.uri.clone()).filter(|c| crate::worker::shufflable(c));
+                if let (Some(context), Some(t)) = (ctx, p.item.as_ref()) {
+                    let cmd = Cmd::PlayShuffled { context, from: Some(t.uri.clone()), position_ms: p.progress_ms.unwrap_or(0) };
+                    self.send(cmd);
+                }
+            }
+        }
+        p.shuffle_state = self.true_shuffle;
+        let playing = p.item.as_ref().map(|t| t.uri.as_str());
+        match (&p.context, &self.shuffled) {
+            (None, Some((context, uris))) if playing.is_some_and(|u| uris.contains(u)) => {
+                p.context = Some(crate::api::Context { uri: context.clone() });
+            }
+            // Something else plays now.
+            (Some(c), Some((context, _))) if c.uri != *context => self.shuffled = None,
+            _ => {}
+        }
+    }
+
+    /// `s`: true shuffle on or off. On, a playlist, album or Liked Songs that plays starts again
+    /// in a random order from the song playing; off, it goes back to the list's own order.
     fn toggle_shuffle(&mut self) {
-        let on = !self.playback.as_ref().is_some_and(|pb| pb.shuffle_state);
+        let on = !self.true_shuffle;
+        self.true_shuffle = on;
+        self.shuffle_hold = Some((on, Instant::now()));
+        let pb = self.playback.clone();
         if let Some(pb) = self.playback.as_mut() {
             pb.shuffle_state = on;
         }
-        self.shuffle_hold = Some((on, Instant::now()));
-        self.info(format!("Shuffle {}", if on { "on" } else { "off" }));
-        self.send(Cmd::Shuffle(on));
+        let context = pb.as_ref().and_then(|p| p.context.as_ref()).map(|c| c.uri.clone()).filter(|c| crate::worker::shufflable(c));
+        let track = pb.as_ref().and_then(|p| p.item.as_ref()).map(|t| t.uri.clone());
+        let position_ms = self.progress_ms();
+        match (on, context, track) {
+            (true, Some(context), Some(from)) if self.shuffled.is_none() => {
+                self.info("True shuffle on: the whole list, in a random order");
+                self.send(Cmd::PlayShuffled { context, from: Some(from), position_ms });
+                self.poll_soon();
+            }
+            (false, Some(uri), Some(from)) if self.shuffled.is_some() => {
+                self.info("Shuffle off: back to the list's order");
+                self.shuffled = None;
+                self.send(Cmd::PlayAt(Play::Context { uri, from: Some(from) }, position_ms));
+                self.poll_soon();
+            }
+            _ => self.info(if on { "True shuffle on" } else { "Shuffle off" }),
+        }
     }
 
     /// True when `list` is the non-song search shown now (older answers are dropped).
@@ -2305,7 +2559,7 @@ impl App {
 
     fn reload(&mut self) {
         match self.view() {
-            View::Artist | View::Album | View::Radio => {}
+            View::Artist | View::Album | View::Radio | View::Random => {}
             View::Search => {
                 self.search.reset();
                 self.found.reset();
@@ -2616,6 +2870,24 @@ impl App {
             }
             return;
         }
+        if let Some(text) = self.genre_prompt.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.genre_prompt = None,
+                KeyCode::Enter => {
+                    let genre = text.trim().to_lowercase();
+                    self.genre_prompt = None;
+                    if !genre.is_empty() {
+                        self.randomize(genre);
+                    }
+                }
+                KeyCode::Backspace => {
+                    text.pop();
+                }
+                KeyCode::Char(c) if !ctrl => text.push(c),
+                _ => {}
+            }
+            return;
+        }
         if self.picker.is_some() {
             match key.code {
                 KeyCode::Esc => self.picker = None,
@@ -2744,6 +3016,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') if !ctrl && self.view() == View::Radio => self.discover_round(),
+            KeyCode::Char('d') if !ctrl && self.view() == View::Random => self.reroll(),
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => self.back(),
             KeyCode::Char('.') => self.open_menu(),
             KeyCode::Char('i') => {
@@ -2807,6 +3080,8 @@ impl App {
             KeyCode::Char('r') => self.cycle_repeat(),
             KeyCode::Char('f') => self.toggle_like(None),
             KeyCode::Char('S') if self.view() == View::Radio => self.ask_save_radio(),
+            KeyCode::Char('S') if self.view() == View::Random => self.ask_save_random(),
+            KeyCode::Char('z') if !ctrl => self.randomize_key(),
             KeyCode::Char('R') => self.reload(),
             _ => {}
         }
@@ -3840,6 +4115,101 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(app.palette.is_none());
         assert_eq!(app.view(), View::Liked);
+    }
+
+    fn playing_in(context: &str) -> Msg {
+        Msg::Playback(Some(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "device": {"id": "d", "name": "spotlite", "is_active": true, "volume_percent": 50},
+                "is_playing": true, "progress_ms": 30_000, "shuffle_state": false,
+                "context": if context.is_empty() { serde_json::Value::Null } else { serde_json::json!({ "uri": context }) },
+                "item": {"uri": "spotify:track:x", "name": "X", "duration_ms": 200_000}
+            }))
+            .unwrap(),
+        )))
+    }
+
+    #[test]
+    fn true_shuffle_plays_the_whole_list_in_a_random_order() {
+        let (mut app, rx) = test_app();
+        app.on_msg(playing_in("spotify:playlist:p1"));
+        drain(&rx);
+        // On: the playlist starts again, shuffled by spotlite, from the song playing.
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        let cmds = drain(&rx);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::PlayShuffled { context, from: Some(f), position_ms }
+                if context == "spotify:playlist:p1" && f == "spotify:track:x" && *position_ms >= 30_000)),
+            "{cmds:?}"
+        );
+        // The songs play as a list: the player still shows the playlist, and ⇄ is on.
+        app.on_msg(Msg::Shuffled { context: "spotify:playlist:p1".into(), uris: vec!["spotify:track:x".into()] });
+        app.on_msg(playing_in(""));
+        let pb = app.playback.as_ref().unwrap();
+        assert_eq!(pb.context.as_ref().map(|c| c.uri.as_str()), Some("spotify:playlist:p1"));
+        assert!(pb.shuffle_state);
+        // Playing an album now: shuffled too.
+        drain(&rx);
+        app.send(Cmd::Play(Play::Context { uri: "spotify:album:a".into(), from: None }));
+        assert!(matches!(drain(&rx).as_slice(), [Cmd::PlayShuffled { context, from: None, .. }] if context == "spotify:album:a"));
+        // Off: back to the playlist's order at the same song.
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        let cmds = drain(&rx);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::PlayAt(Play::Context { uri, from: Some(f) }, _) if uri == "spotify:playlist:p1" && f == "spotify:track:x")),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn spotify_shuffle_turned_on_elsewhere_becomes_the_true_shuffle() {
+        let (mut app, rx) = test_app();
+        drain(&rx);
+        let Msg::Playback(Some(mut pb)) = playing_in("spotify:playlist:p1") else { panic!() };
+        pb.shuffle_state = true;
+        app.on_msg(Msg::Playback(Some(pb)));
+        assert!(app.true_shuffle);
+        let cmds = drain(&rx);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Shuffle(false))), "{cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::PlayShuffled { .. })), "{cmds:?}");
+    }
+
+    #[test]
+    fn randomize_picks_a_genre_then_fills_a_page() {
+        let (mut app, rx) = test_app();
+        app.on_msg(Msg::Genres { artist: "Slowdive".into(), result: Ok(vec!["shoegaze".into(), "dream pop".into()]) });
+        let menu = app.menu.as_ref().expect("a genre menu");
+        assert_eq!(menu.items.len(), 3, "two genres and \"type another\"");
+        drain(&rx);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.view(), View::Random);
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Randomize(g) if g == "shoegaze")));
+        app.on_msg(Msg::Random { genre: "shoegaze".into(), result: Ok((0..50).map(track).collect()) });
+        assert_eq!(app.tracks().unwrap().items.len(), 50);
+        // d rolls again; S asks to save.
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Randomize(_))));
+        app.on_msg(Msg::Random { genre: "shoegaze".into(), result: Ok((50..100).map(track).collect()) });
+        app.can_edit = true;
+        app.on_key(KeyEvent::from(KeyCode::Char('S')));
+        let confirm = app.confirm.as_ref().expect("asks first");
+        assert!(matches!(&confirm.cmd, Cmd::CreatePlaylist { name, uris, .. } if name == "Random · shoegaze 2" && uris.len() == 50));
+    }
+
+    #[test]
+    fn a_limited_list_keeps_what_it_shows_and_loads_again_later() {
+        let (mut app, rx) = test_app();
+        app.switch_tab(Tab::Liked);
+        app.tick();
+        app.on_msg(Msg::Tracks { list: List::Liked, offset: 0, page: crate::api::Page { items: vec![track(1)], raw: 1, total: 1 } });
+        app.on_msg(Msg::RetryLater { list: List::Liked, secs: 0 });
+        assert_eq!(app.liked.items.len(), 1);
+        assert!(app.toast.as_ref().is_some_and(|t| !t.error && t.text.contains("saved copy")));
+        // The wait is at least 5 s; pretend it is over.
+        app.retries[0].1 = Instant::now();
+        drain(&rx);
+        app.tick();
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Load { list: List::Liked, offset: 0 })));
     }
 
     #[test]
