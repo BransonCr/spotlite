@@ -28,12 +28,16 @@ pub struct NavTree {
     pub cur: usize,
 }
 
-/// One row of the drawn tree.
+/// One row of the drawn tree, in the style of `git log --graph`: each branch has its own lane
+/// (column); the node's dot sits in its lane, between `before` and `after`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub node: usize,
-    /// The lines before the label: "│  ├─ ".
-    pub prefix: String,
+    /// The lanes left of the dot ("│ ").
+    pub before: String,
+    /// The lanes right of the dot: "│" for a branch passing by, "─╯" where a branch
+    /// that starts here ends ("─┴─╯" for two).
+    pub after: String,
 }
 
 impl NavTree {
@@ -106,22 +110,57 @@ impl NavTree {
         Some(&self.nodes[i])
     }
 
-    /// The tree as rows from the root down, newest branch first, with the lines that join them.
+    /// The tree as a graph, newest place at the top, like `git log --graph`. Each branch keeps
+    /// one lane; where branches split, the older place shows `●─╯`. Lanes free up as branches
+    /// end, so the graph is only as wide as the branches open at one time.
     pub fn rows(&self) -> Vec<Row> {
-        let mut out = vec![Row { node: 0, prefix: String::new() }];
-        self.walk(0, "", &mut out);
+        // lanes[c]: the node lane c waits for (the parent of the last node drawn in it).
+        let mut lanes: Vec<Option<usize>> = Vec::new();
+        let mut out = Vec::new();
+        // A child always comes after its parent in `nodes`, so newest first is children first.
+        for id in (0..self.nodes.len()).rev() {
+            let waiting: Vec<usize> = (0..lanes.len()).filter(|&c| lanes[c] == Some(id)).collect();
+            let col = match waiting.first() {
+                Some(&c) => c,
+                // A branch tip: the first free lane.
+                None => match lanes.iter().position(Option::is_none) {
+                    Some(c) => c,
+                    None => {
+                        lanes.push(None);
+                        lanes.len() - 1
+                    }
+                },
+            };
+            let joins = &waiting[waiting.len().min(1)..];
+            let last_join = joins.last().copied();
+            let mut before = String::new();
+            for lane in &lanes[..col] {
+                before.push_str(if lane.is_some() { "│ " } else { "  " });
+            }
+            let mut after = String::new();
+            for (c, lane) in lanes.iter().enumerate().skip(col + 1) {
+                let across = last_join.is_some_and(|l| c <= l);
+                let (mark, gap) = if joins.contains(&c) {
+                    (if Some(c) == last_join { "╯" } else { "┴" }, "─")
+                } else if across {
+                    (if lane.is_some() { "┼" } else { "─" }, "─")
+                } else {
+                    (if lane.is_some() { "│" } else { " " }, " ")
+                };
+                after.push_str(gap);
+                after.push_str(mark);
+            }
+            out.push(Row { node: id, before, after: after.trim_end().to_owned() });
+            for &c in joins {
+                lanes[c] = None;
+            }
+            lanes[col] = self.nodes[id].parent;
+            while lanes.last() == Some(&None) {
+                lanes.pop();
+            }
+        }
         out
     }
-
-    fn walk(&self, node: usize, indent: &str, out: &mut Vec<Row>) {
-        let kids: Vec<usize> = self.nodes[node].children.iter().rev().copied().collect();
-        for (i, &c) in kids.iter().enumerate() {
-            let last = i + 1 == kids.len();
-            out.push(Row { node: c, prefix: format!("{indent}{}", if last { "└─ " } else { "├─ " }) });
-            self.walk(c, &format!("{indent}{}", if last { "   " } else { "│  " }), out);
-        }
-    }
-
 }
 
 /// "now", "40s", "5m", "2h": how long ago.
@@ -155,13 +194,30 @@ mod tests {
         let a = t.nodes[t.cur].parent.unwrap();
         assert_eq!(t.nodes[a].children.len(), 2);
         let rows = t.rows();
-        let labels: Vec<_> = rows.iter().map(|r| format!("{}{}", r.prefix, t.nodes[r.node].label)).collect();
-        assert_eq!(labels, ["Search", "└─ A", "   ├─ C", "   └─ B"]);
+        let labels: Vec<_> = rows.iter().map(|r| format!("{}●{} {}", r.before, r.after, t.nodes[r.node].label)).collect();
+        assert_eq!(labels, ["● C", "│ ● B", "●─╯ A", "● Search"]);
         // Jump to b on the other branch, then back goes to a.
         let b = rows.iter().find(|r| t.nodes[r.node].label == "B").unwrap().node;
         t.jump(b);
         assert_eq!(t.current().label, "B");
         assert_eq!(t.back(|_| true).map(|n| n.label.clone()), Some("A".into()));
+    }
+
+    #[test]
+    fn lanes_pass_by_and_free_up() {
+        // Search → a → b; back to a → c; back to Search → d → e.
+        let mut t = NavTree::new(Loc::Base(Tab::Search), "S".into());
+        t.visit(page("a"), "a".into(), None);
+        t.visit(page("b"), "b".into(), None);
+        t.back(|_| true);
+        t.visit(page("c"), "c".into(), None);
+        t.back(|_| true);
+        t.back(|_| true);
+        t.visit(page("d"), "d".into(), None);
+        t.visit(page("e"), "e".into(), None);
+        let lines: Vec<String> =
+            t.rows().iter().map(|r| format!("{}●{} {}", r.before, r.after, t.nodes[r.node].label)).collect();
+        assert_eq!(lines, ["● e", "● d", "│ ● c", "│ │ ● b", "│ ●─╯ a", "●─╯ S"]);
     }
 
     #[test]

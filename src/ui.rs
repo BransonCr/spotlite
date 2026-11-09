@@ -758,6 +758,8 @@ fn draw_undo(f: &mut Frame, app: &mut App) {
     let cursor = cursor.min(rows.len().saturating_sub(1));
     let start = cursor.saturating_sub(h.saturating_sub(1).min(h / 2)).min(rows.len().saturating_sub(h));
     let open: std::collections::HashSet<String> = app.pages.iter().map(|p| p.key()).collect();
+    // Labels start in one column, after the widest graph (at most half the width).
+    let graph_w = rows.iter().map(|r| r.before.width() + 1 + r.after.width()).max().unwrap_or(1).min(inner.width as usize / 2);
     for (n, (i, row)) in rows.iter().enumerate().skip(start).take(h).enumerate() {
         let node = &app.nav.nodes[row.node];
         let r = Rect::new(inner.x, inner.y + n as u16, inner.width, 1);
@@ -774,10 +776,16 @@ fn draw_undo(f: &mut Frame, app: &mut App) {
         };
         let when = crate::undo::ago(node.at);
         let note = if current { "  you are here" } else if closed { "  closed" } else { "" };
-        let room = (r.width as usize).saturating_sub(row.prefix.width() + 2 + note.width() + when.width() + 2);
+        let lane = Style::new().fg(t.border).patch(base);
+        let after_w = graph_w.saturating_sub(row.before.width() + 1);
+        let after: String = row.after.chars().take(after_w).collect();
+        let pad = " ".repeat(after_w.saturating_sub(after.width()) + 2);
+        let room = (r.width as usize).saturating_sub(graph_w + 2 + note.width() + when.width() + 2);
         let mut spans = vec![
-            Span::styled(row.prefix.clone(), Style::new().fg(t.border).patch(base)),
-            Span::styled(format!("{dot} "), dot_style.patch(base)),
+            Span::styled(row.before.clone(), lane),
+            Span::styled(dot, dot_style.patch(base)),
+            Span::styled(after, lane),
+            Span::styled(pad, base),
             Span::styled(fit(&node.label, room), label_style.patch(base)),
             Span::styled(note, theme::faint().patch(base)),
         ];
@@ -2496,10 +2504,14 @@ mod tests {
         app.typing = false;
         app.on_key(KeyEvent::from(KeyCode::Char('3')));
         app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        // Back to Liked, then Recent: a second branch from Liked.
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        app.on_key(KeyEvent::from(KeyCode::Char('4')));
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
         let out = screen(&mut app, 120, 40);
         assert!(out.contains("Where you went") && out.contains("you are here"), "{out}");
-        assert!(out.contains("└─"), "{out}");
+        // Drawn like `git log --graph`: the Playlists branch in its own lane, joining at Liked.
+        assert!(out.contains("●    ◷ Recent") && out.contains("│ ○  ≡ Playlists") && out.contains("○─╯  ♥ Liked"), "{out}");
         // Click the Liked row: go there, the tree closes.
         let liked = app.hits.popup_rows.iter().find(|(_, i)| app.nav.nodes[app.nav.rows()[*i].node].label.contains("Liked")).map(|(r, _)| *r).unwrap();
         app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: liked.x + 4, row: liked.y, modifiers: KeyModifiers::NONE });
