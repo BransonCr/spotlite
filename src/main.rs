@@ -60,6 +60,8 @@ fn main() -> Result<()> {
         }
         Some("auth") => {
             auth::login(&Config::load()?)?;
+            // Another account may have logged in: ask Spotify who it is again.
+            let _ = std::fs::remove_file(config::user_path());
             println!("Logged in. Token saved to {}", config::token_path().display());
             Ok(())
         }

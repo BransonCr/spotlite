@@ -234,7 +234,7 @@ fn repeat_off() -> String {
     "off".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: String,
     pub uri: String,
@@ -426,6 +426,19 @@ impl Spotify {
     pub fn me(&mut self) -> Result<User> {
         self.get("/me", &[])?
             .ok_or_else(|| anyhow::anyhow!("empty /me response"))
+    }
+
+    /// The user, from the copy kept on disk if there is one, else from Spotify (then kept).
+    /// Spotify limits /me hard (once an app starts often, it can refuse it for hours), and the
+    /// user of a login never changes; `spotlite auth` removes the copy.
+    pub fn me_cached(&mut self) -> Result<User> {
+        let path = crate::config::user_path();
+        if let Some(user) = read_user(&path) {
+            return Ok(user);
+        }
+        let user = self.me()?;
+        write_user(&path, &user);
+        Ok(user)
     }
 
     pub fn playback(&mut self) -> Result<Option<Playback>> {
@@ -693,6 +706,17 @@ impl PipeTrack for Value {
 
 /// The first song of a `/me/player/queue` answer. The queue can be empty: `v["queue"][0]` on a
 /// value we change panics there (and a panic aborts the app), so read it with `pointer_mut`.
+fn read_user(path: &std::path::Path) -> Option<User> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn write_user(path: &std::path::Path, user: &User) {
+    if let (Some(dir), Ok(json)) = (path.parent(), serde_json::to_vec(user)) {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(path, json);
+    }
+}
+
 fn first_queued(mut v: Value) -> Option<Track> {
     v.pointer_mut("/queue/0").map(Value::take).and_then(PipeTrack::pipe_track)
 }
@@ -740,6 +764,18 @@ mod tests {
         let idle: Playback = serde_json::from_str(r#"{"device": null, "item": null}"#).unwrap();
         assert!(!idle.is_playing && idle.item.is_none());
         assert_eq!(idle.repeat_state, "off");
+    }
+
+    #[test]
+    fn the_user_is_kept_on_disk() {
+        let path = std::env::temp_dir().join(format!("spotlite-user-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(read_user(&path).is_none());
+        write_user(&path, &User { id: "me".into(), uri: "spotify:user:me".into() });
+        assert_eq!(read_user(&path).map(|u| u.id).as_deref(), Some("me"));
+        std::fs::write(&path, "broken").unwrap();
+        assert!(read_user(&path).is_none(), "a broken copy asks Spotify again");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -809,3 +845,4 @@ mod tests {
         assert!(matches!(classify(401, String::new(), 0), ApiError::Unauthorized));
     }
 }
+

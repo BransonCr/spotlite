@@ -29,6 +29,13 @@ pub fn config_path() -> PathBuf {
         .join("spotlite/config.toml")
 }
 
+/// The logged-in user (id), kept so /me is asked once per login.
+pub fn user_path() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("spotlite/user.json")
+}
+
 pub fn token_path() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("."))

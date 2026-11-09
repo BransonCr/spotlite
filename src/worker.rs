@@ -122,6 +122,7 @@ pub fn spawn(api: Spotify) -> (Sender<Cmd>, Sender<Msg>, Receiver<Msg>) {
         last: None,
         song_searches: SearchCache::default(),
         found_searches: SearchCache::default(),
+        me_tried: None,
     };
     thread::Builder::new()
         .name("spotlite-api".into())
@@ -138,6 +139,8 @@ struct Worker {
     last: Option<Playback>,
     song_searches: SearchCache<Track>,
     found_searches: SearchCache<Found>,
+    /// When /me was last asked without an answer (it is asked again at most every 10 min).
+    me_tried: Option<Instant>,
 }
 
 /// First pages of recent searches. Search as you type asks again for a text you had a moment
@@ -179,7 +182,8 @@ impl Worker {
     fn run(mut self, rx: Receiver<Cmd>) {
         for cmd in rx {
             let kind = match cmd {
-                Cmd::Poll => Kind::Poll,
+                // Init ends with the first player state, like a poll.
+                Cmd::Poll | Cmd::Init => Kind::Poll,
                 Cmd::Volume(_) => Kind::Volume,
                 Cmd::Play(_) | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
                 _ => Kind::Other,
@@ -189,7 +193,7 @@ impl Worker {
                 _ => None,
             };
             if let Err(err) = self.handle(cmd) {
-                self.report(err, list);
+                self.report(err, list, kind);
             }
             if self.tx.send(Msg::Done(kind)).is_err() {
                 return; // UI has quit
@@ -201,9 +205,11 @@ impl Worker {
         let _ = self.tx.send(msg);
     }
 
-    fn report(&self, err: anyhow::Error, list: Option<List>) {
+    fn report(&self, err: anyhow::Error, list: Option<List>, kind: Kind) {
         let api_err = err.downcast_ref::<ApiError>();
-        if let Some(ApiError::RateLimited(secs)) = api_err {
+        // Spotify limits each kind of request on its own: only a limit on the player state
+        // itself delays the next poll (a limit on /me must not stop the player for hours).
+        if let (Some(ApiError::RateLimited(secs)), Kind::Poll) = (api_err, kind) {
             self.send(Msg::Backoff(*secs));
         }
         if let Some(list) = list {
@@ -219,11 +225,19 @@ impl Worker {
     fn handle(&mut self, cmd: Cmd) -> Result<()> {
         match cmd {
             Cmd::Init => {
-                let user = self.api.me()?;
-                self.user = Some(user.clone());
-                self.send(Msg::User(user));
+                // The device and the player first: they do not need the user, and /me can be
+                // refused for hours. A profile error is reported after them.
+                let user = self.api.me_cached();
+                match &user {
+                    Ok(user) => {
+                        self.user = Some(user.clone());
+                        self.send(Msg::User(user.clone()));
+                    }
+                    Err(_) => self.me_tried = Some(Instant::now()),
+                }
                 self.find_device()?;
-                self.poll()
+                self.poll()?;
+                user.map(|_| ())
             }
             Cmd::Poll => self.poll(),
             Cmd::Load { list, offset } => self.load(list, offset),
@@ -231,7 +245,7 @@ impl Worker {
             Cmd::PlayLiked { from } => {
                 let user = match &self.user {
                     Some(u) => u.clone(),
-                    None => self.api.me()?,
+                    None => self.api.me_cached()?,
                 };
                 let play = Play::Context {
                     uri: format!("{}:collection", user.uri),
@@ -412,6 +426,16 @@ impl Worker {
     }
 
     fn poll(&mut self) -> Result<()> {
+        // No user yet (/me was refused): ask again now and then, quietly.
+        if self.user.is_none() && self.me_tried.is_some_and(|at| at.elapsed() >= Duration::from_secs(600)) {
+            match self.api.me_cached() {
+                Ok(user) => {
+                    self.user = Some(user.clone());
+                    self.send(Msg::User(user));
+                }
+                Err(_) => self.me_tried = Some(Instant::now()),
+            }
+        }
         let pb = self.api.playback()?;
         self.last = pb.clone();
         self.send(Msg::Playback(pb.map(Box::new)));
