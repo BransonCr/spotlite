@@ -469,7 +469,8 @@ impl Spotify {
         let resp: Option<Value> =
             self.get("/search", &[("q", query), ("type", kind), ("limit", &limit), ("offset", &off)])?;
         let Some(mut resp) = resp else { return Ok(Page::empty()) };
-        let v = resp[format!("{kind}s")].take();
+        // Not `resp[..]`: indexing a non-object Value for writing panics, and a panic aborts the app.
+        let v = resp.get_mut(format!("{kind}s")).map(Value::take).unwrap_or(Value::Null);
         Ok(match kind {
             "artist" => serde_json::from_value::<RawPage<Artist>>(v)?.into_page(|a| Some(Found::Artist(a))),
             "album" => serde_json::from_value::<RawPage<Album>>(v)?.into_page(|a| Some(Found::Album(a))),
@@ -648,7 +649,7 @@ impl Spotify {
     /// The first song in the play queue (what plays next), if Spotify says.
     pub fn up_next(&mut self) -> Result<Option<Track>> {
         let v: Option<Value> = self.get("/me/player/queue", &[])?;
-        Ok(v.and_then(|mut v| v["queue"][0].take().pipe_track()))
+        Ok(v.and_then(first_queued))
     }
 
     pub fn queue(&mut self, device_id: Option<&str>, uri: &str) -> Result<()> {
@@ -690,6 +691,12 @@ impl PipeTrack for Value {
     }
 }
 
+/// The first song of a `/me/player/queue` answer. The queue can be empty: `v["queue"][0]` on a
+/// value we change panics there (and a panic aborts the app), so read it with `pointer_mut`.
+fn first_queued(mut v: Value) -> Option<Track> {
+    v.pointer_mut("/queue/0").map(Value::take).and_then(PipeTrack::pipe_track)
+}
+
 fn classify(code: u16, msg: String, retry_after: u64) -> ApiError {
     let lower = msg.to_lowercase();
     match code {
@@ -704,6 +711,16 @@ fn classify(code: u16, msg: String, retry_after: u64) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn up_next_with_an_empty_or_odd_queue_does_not_panic() {
+        use serde_json::json;
+        assert!(super::first_queued(json!({"currently_playing": null, "queue": []})).is_none());
+        assert!(super::first_queued(json!({})).is_none());
+        assert!(super::first_queued(json!(null)).is_none());
+        let t = super::first_queued(json!({"queue": [{"uri": "spotify:track:a", "name": "A", "duration_ms": 1, "artists": [], "album": {"name": "X"}}]}));
+        assert_eq!(t.map(|t| t.name), Some("A".into()));
+    }
+
     use super::*;
 
     #[test]
