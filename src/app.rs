@@ -283,6 +283,9 @@ pub struct Hits {
     pub side: Rect,
     pub side_tabs: [Rect; 2],
     pub side_rows: Vec<(Rect, usize)>,
+    /// The sidebar's hide button, and the tab at the left edge that opens it again.
+    pub side_hide: Rect,
+    pub side_open: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2338,6 +2341,10 @@ impl App {
             }
             return;
         }
+        if !self.sidebar.open && self.hits.side_open.contains(pos) && matches!(m.kind, MouseEventKind::Down(_)) {
+            self.show_side(self.sidebar.view);
+            return;
+        }
         if self.sidebar.open && self.hits.side.contains(pos) {
             self.side_mouse(m, pos);
             return;
@@ -2893,7 +2900,9 @@ impl App {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.sidebar.focus = true;
-                if let Some(i) = self.hits.side_tabs.iter().position(|r| r.contains(pos)) {
+                if self.hits.side_hide.contains(pos) {
+                    self.sidebar.close();
+                } else if let Some(i) = self.hits.side_tabs.iter().position(|r| r.contains(pos)) {
                     self.show_side(if i == 0 { SideView::Playing } else { SideView::Library });
                 } else if let Some(&(_, i)) = self.hits.side_rows.iter().find(|(r, _)| r.contains(pos)) {
                     self.side_run(i);

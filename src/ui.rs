@@ -128,6 +128,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Short terminals get a 2-line player, so the list keeps its room. On stage the big
     // column shows the song, so the player is only the controls, progress and volume.
     let player = if stage { 3 } else if f.area().height < 24 { 4 } else { PLAYER_HEIGHT };
+    // While the sidebar shows the song, the player drops it and keeps one line (controls,
+    // progress, shuffle, repeat, volume); it shrinks row by row.
+    let slim_target = app.sidebar.shows_song() && crate::sidebar::Sidebar::full_width(full.width).is_some();
+    let slim = app.sidebar.player_slim(slim_target);
+    let one_line = player - panel().inner(Rect::new(0, 0, 20, player)).height.saturating_sub(1);
+    let player = (player as f32 - (player - one_line.min(player)) as f32 * slim).round() as u16;
     let (header, mut body, now, footer) = if t.layout == theme::Layout::Top {
         let [header, now, body, footer] = Layout::vertical([
             Constraint::Length(1),
@@ -150,6 +156,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         (header, body, now, footer)
     };
     // The sidebar, at the left of the list: its full width, and what shows while it slides.
+    let side_fits = crate::sidebar::Sidebar::full_width(full.width).is_some();
     let side_full = crate::sidebar::Sidebar::full_width(full.width).filter(|_| app.sidebar.visible());
     let mut side = None;
     if let Some(w) = side_full {
@@ -203,6 +210,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_footer(f, app, footer);
     if let Some((area, shown)) = side {
         crate::sidebar::draw(f, app, area, shown);
+    } else if side_fits && !app.sidebar.visible() {
+        crate::sidebar::draw_tab(f, app, body);
     }
     if app.viz_on {
         // Under the list, in the cells that nothing else uses.
@@ -1785,7 +1794,22 @@ fn draw_transport(f: &mut Frame, app: &mut App, line: Rect) {
     ]);
     f.render_widget(controls, Rect { width: 9.min(line.width), ..line });
     let vol_w = if line.width >= 60 { 16 } else { 0 };
-    let bar_area = Rect { x: line.x + 11, width: line.width.saturating_sub(13 + vol_w), ..line };
+    // Shuffle and repeat, before the volume.
+    let modes_w = if line.width >= 40 { 7 } else { 0 };
+    if modes_w > 0 {
+        let mode_on = |on: bool| if on { theme::accent() } else { theme::faint() };
+        let repeat = if pb.repeat_state == "track" { "↻1" } else { "↻ " };
+        let x = line.right().saturating_sub(vol_w + modes_w);
+        let modes = Line::from(vec![
+            Span::styled("⇄", mode_on(pb.shuffle_state)),
+            Span::raw("  "),
+            Span::styled(repeat, mode_on(pb.repeat_state != "off")),
+        ]);
+        f.render_widget(modes, Rect { x, width: 5, ..line });
+        app.hits.shuffle = span_rect(line, x, 1);
+        app.hits.repeat = span_rect(line, x + 3, 2);
+    }
+    let bar_area = Rect { x: line.x + 11, width: line.width.saturating_sub(13 + vol_w + modes_w), ..line };
     let (bar, at) = progress_line(app.progress_ms(), track.duration_ms, pb.is_playing, bar_area.width);
     app.hits.progress = Rect { x: bar_area.x + at.0, width: at.1, ..bar_area };
     f.render_widget(bar, bar_area);
@@ -2197,6 +2221,41 @@ mod tests {
         // Too narrow: no sidebar, and no panic.
         let out = screen(&mut app, 70, 20);
         assert!(!out.contains("Liked Songs"), "{out}");
+    }
+
+    #[test]
+    fn player_drops_the_song_while_the_sidebar_shows_it() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind, KeyModifiers};
+        let settle = |app: &mut App| {
+            while app.sidebar.animating() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let _ = screen(app, 120, 40);
+            }
+            app.sidebar.step();
+            screen(app, 120, 40)
+        };
+        let (mut app, _rx) = test_app();
+        app.typing = false;
+        app.on_msg(playing(&track("Teardrop", "Massive Attack", "Mezzanine")));
+        // Hidden: the tab at the left edge, and the full player with the artist.
+        let out = settle(&mut app);
+        assert!(out.lines().any(|l| l.starts_with('›')), "{out}");
+        assert_eq!(out.matches("Massive Attack").count(), 1, "{out}");
+        // Click the tab: the sidebar opens on Playing; the player keeps one line.
+        let tab = app.hits.side_open;
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: tab.x, row: tab.y + 1, modifiers: KeyModifiers::NONE });
+        assert!(app.sidebar.open);
+        let out = settle(&mut app);
+        assert_eq!(out.matches("Massive Attack").count(), 1, "only the sidebar names the artist: {out}");
+        assert!(out.contains('⇄') && out.contains('↻'), "{out}");
+        // Library: the player has the song again.
+        app.on_key(KeyEvent::from(KeyCode::Char('>')));
+        let out = settle(&mut app);
+        assert_eq!(out.matches("Massive Attack").count(), 1, "{out}");
+        // The hide button shuts it.
+        let hide = app.hits.side_hide;
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: hide.x + 1, row: hide.y, modifiers: KeyModifiers::NONE });
+        assert!(!app.sidebar.open);
     }
 
     #[test]

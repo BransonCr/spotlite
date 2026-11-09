@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
+/// How long the player bar takes to shrink to one line, or to grow back.
+const SLIM_TIME: Duration = Duration::from_millis(320);
 /// How long the sidebar takes to open or shut, and to switch views.
 const OPEN_TIME: Duration = Duration::from_millis(260);
 const SWITCH_TIME: Duration = Duration::from_millis(280);
@@ -151,6 +153,9 @@ pub struct Sidebar {
     cursor: [usize; 2],
     scroll: [usize; 2],
     motion: Option<(Motion, Instant)>,
+    /// The player bar is slim (one line) while the Playing view shows the song: since when it
+    /// changes to slim (true) or back (false).
+    slim: Option<(bool, Instant)>,
 }
 
 /// Slow at the end: the panel glides into place.
@@ -214,7 +219,32 @@ impl Sidebar {
     }
 
     pub fn animating(&self) -> bool {
-        self.motion().is_some()
+        self.motion().is_some() || self.slim.is_some_and(|(_, at)| at.elapsed() < SLIM_TIME)
+    }
+
+    /// The Playing view shows the song, so the player bar can drop it.
+    pub fn shows_song(&self) -> bool {
+        self.open && self.view == SideView::Playing
+    }
+
+    /// How slim the player bar is: 0 full, 1 one line, between while it changes. `target`:
+    /// should it be slim now. A change starts the animation.
+    pub fn player_slim(&mut self, target: bool) -> f32 {
+        let now = Instant::now();
+        match self.slim {
+            Some((t, _)) if t == target => {}
+            None if !target => return 0.0,
+            Some((_, at)) if at.elapsed() < SLIM_TIME => {
+                // Turned around mid-way: start from where it is.
+                let done = at.elapsed().as_secs_f32() / SLIM_TIME.as_secs_f32();
+                let back = Duration::from_secs_f32((1.0 - done) * SLIM_TIME.as_secs_f32());
+                self.slim = Some((target, now - back));
+            }
+            _ => self.slim = Some((target, if theme::motion() { now } else { now - SLIM_TIME })),
+        }
+        let Some((t, at)) = self.slim else { return 0.0 };
+        let e = ease_out(at.elapsed().as_secs_f32() / SLIM_TIME.as_secs_f32());
+        if t { e } else { 1.0 - e }
     }
 
     /// Drops a finished motion. True when one ended (the screen then changes).
@@ -323,6 +353,27 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, shown: u16) {
     }
 }
 
+/// The tab at the left edge of the window while the sidebar is hidden: click it to open the
+/// sidebar again.
+pub fn draw_tab(f: &mut Frame, app: &mut App, body: Rect) {
+    let x = f.area().x;
+    if body.height < 5 || body.x <= x {
+        return;
+    }
+    let mid = body.y + body.height / 2;
+    let buf = f.buffer_mut();
+    let t = theme::c();
+    for (dy, sym, style) in [
+        (-1i32, "╷", Style::new().fg(t.faint)),
+        (0, "›", theme::accent().add_modifier(Modifier::BOLD)),
+        (1, "╵", Style::new().fg(t.faint)),
+    ] {
+        let y = (mid as i32 + dy) as u16;
+        buf[(x, y)].set_symbol(sym).set_style(style);
+    }
+    app.hits.side_open = Rect::new(x, mid - 1, 2, 3);
+}
+
 /// The ripple at the moving edge: rows stick out by a few columns, most in the middle of the
 /// slide and none at its ends, like the visualizer's bars settling.
 fn ripple(y: u16, e: f32) -> (u16, f32) {
@@ -418,6 +469,13 @@ fn render(buf: &mut Buffer, area: Rect, app: &mut App, view: SideView, ind: f32,
     if live {
         app.hits.side = area;
     }
+    // The hide button at the right end of the switch row.
+    let hide = Rect::new(inner.right() - 2, inner.y, 2, 1);
+    Paragraph::new(Line::styled(" «", theme::muted())).render(hide, buf);
+    if live {
+        app.hits.side_hide = hide;
+    }
+    let inner = Rect { width: inner.width - 3, ..inner };
     // The switch: two halves, the active one bright, an underline that slides between them.
     let half = inner.width / 2;
     let segs = [("♪", "Playing"), ("≡", "Library")];
@@ -444,6 +502,7 @@ fn render(buf: &mut Buffer, area: Rect, app: &mut App, view: SideView, ind: f32,
             buf[(x, line_y)].set_symbol("━").set_style(Style::new().fg(t.accent));
         }
     }
+    let inner = Rect { width: inner.width + 3, ..inner };
     let content = Rect::new(inner.x, inner.y + 3, inner.width, inner.height.saturating_sub(3));
     match view {
         SideView::Playing => render_playing(buf, content, app, live),

@@ -49,7 +49,15 @@ usage:
 fn main() -> Result<()> {
     let arg = std::env::args().nth(1);
     match arg.as_deref() {
-        None => run_tui(),
+        None => {
+            // Not `?`: Rust's own report panics if the terminal is gone (window closed).
+            if let Err(e) = run_tui() {
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "Error: {e:#}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Some("auth") => {
             auth::login(&Config::load()?)?;
             println!("Logged in. Token saved to {}", config::token_path().display());
@@ -254,6 +262,7 @@ fn run_tui() -> Result<()> {
     for sig in [signal_hook::consts::SIGHUP, signal_hook::consts::SIGTERM] {
         let _ = signal_hook::flag::register(sig, stop.clone());
     }
+    watchdog(stop.clone());
     let trial = theme::env_override().is_some();
     let mut saved_json = String::new();
     let mut save_at = std::time::Instant::now();
@@ -261,7 +270,14 @@ fn run_tui() -> Result<()> {
         let mut last_draw = std::time::Instant::now();
         // Something on screen changed by input (or it is the first frame): draw.
         let mut input = true;
+        // The program that started spotlite (the terminal, or a shell in it). If it goes away
+        // the terminal is gone too, even when no SIGHUP came (a shell in between does not pass
+        // it on): stop, instead of spinning on a dead terminal.
+        let parent = std::os::unix::process::parent_id();
         while !app.quit && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if std::os::unix::process::parent_id() != parent {
+                break;
+            }
             // Every 5 s, save what changed: a crash or a kill loses at most a few seconds.
             if !trial && save_at.elapsed() >= Duration::from_secs(5) {
                 save_at = std::time::Instant::now();
@@ -329,13 +345,37 @@ fn run_tui() -> Result<()> {
     // A trial run (SPOTLITE_THEME) saves nothing, so it never replaces your tabs or theme.
     if theme::env_override().is_none() {
         if let Err(e) = state::save(&app.saved_state()) {
-            eprintln!("spotlite: could not save the open tabs: {e:#}");
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "spotlite: could not save the open tabs: {e:#}");
         }
     }
     if app.stop_services {
         stop_spotifyd();
     }
     result
+}
+
+/// Ends spotlite if it does not stop by itself within 1.5 s of being told to (SIGHUP, SIGTERM)
+/// or of losing the program that started it (its terminal closed). When the terminal goes away
+/// during a wait for input, crossterm 0.28 keeps reading the dead terminal in a loop that never
+/// returns, at full CPU; the main loop then never sees the signal. The state was saved at most
+/// 5 s before.
+fn watchdog(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let parent = std::os::unix::process::parent_id();
+    let _ = std::thread::Builder::new().name("spotlite-watch".into()).spawn(move || {
+        let mut since: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let told = stop.load(std::sync::atomic::Ordering::Relaxed) || std::os::unix::process::parent_id() != parent;
+            if told {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let at = *since.get_or_insert_with(std::time::Instant::now);
+                if at.elapsed() >= Duration::from_millis(1500) {
+                    std::process::exit(0);
+                }
+            }
+        }
+    });
 }
 
 /// Draws one frame inside a synchronized update (DEC mode 2026): the terminal shows the whole
