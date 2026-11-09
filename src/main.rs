@@ -14,6 +14,7 @@ mod sidebar;
 mod state;
 mod theme;
 mod ui;
+mod undo;
 mod viz;
 mod worker;
 
@@ -324,8 +325,12 @@ fn run_tui() -> Result<()> {
                             app.on_key(key);
                             input = true;
                         }
-                        // Pointer motion changes nothing on screen (yet).
-                        Event::Mouse(m) if m.kind == MouseEventKind::Moved => {}
+                        // Pointer motion draws only when it changes something (a hover list).
+                        Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
+                            if app.on_hover(ratatui::layout::Position::new(m.column, m.row)) {
+                                input = true;
+                            }
+                        }
                         Event::Mouse(m) => {
                             app.on_mouse(m);
                             input = true;

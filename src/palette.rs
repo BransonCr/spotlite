@@ -84,6 +84,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
         add("Close this tab", "x", key('x'));
     }
     add("Back", "esc", KeyEvent::from(KeyCode::Esc));
+    add("Where you went (undo tree)", "^⌫", KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
     add("Next tab", "L", key('L'));
     add("Previous tab", "H", key('H'));
     add("Play / pause", "space", key(' '));

@@ -6,6 +6,7 @@ use crate::pages::{AlbumPage, ArtistPage, ArtistRow, FilterItem, Page, RadioPage
 use crate::radio::Library;
 use crate::sidebar::{Item as SideItem, Pin, SideView, Sidebar, SongAct};
 use crate::state::{SavedPlayback, SavedTab, State};
+use crate::undo::{NavTree, Node as NavNode};
 use crate::viz::Visualizer;
 use crate::worker::{Cmd, Kind, List, Msg};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -155,8 +156,6 @@ pub enum Loc {
 
 /// Open page tabs at most; opening one more closes the oldest.
 pub const MAX_PAGES: usize = 8;
-/// Back steps kept.
-const HISTORY: usize = 50;
 
 /// What the search lists.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
@@ -286,6 +285,20 @@ pub struct Hits {
     /// The sidebar's hide button, and the tab at the left edge that opens it again.
     pub side_hide: Rect,
     pub side_open: Rect,
+    /// The "+N ▾" chip for tabs that do not fit, its list, the list's rows and their "×".
+    pub tabs_more: Rect,
+    pub tabs_list: Rect,
+    pub tabs_rows: Vec<(Rect, usize)>,
+    pub tabs_close: Vec<(Rect, usize)>,
+}
+
+/// The list of open pages under the "+N ▾" chip. Hovering the chip opens it and leaving closes
+/// it; a click on the chip keeps it open until the next click.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TabsList {
+    pub pinned: bool,
+    /// The page row under the pointer.
+    pub hover: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,7 +390,12 @@ pub struct App {
     /// The page tab shown; None shows `tab`.
     pub active: Option<usize>,
     /// Where you were before, for Esc (newest last).
-    history: Vec<Loc>,
+    /// Where you went, as an undo tree (Backspace goes back; Ctrl+Backspace shows it).
+    pub nav: NavTree,
+    /// The undo tree popup: the row the cursor is on.
+    pub undo: Option<usize>,
+    /// The list of open pages under the "+N ▾" chip.
+    pub tabs_list: Option<TabsList>,
     /// Pages restored at start that have not loaded yet (by key): they load when shown.
     unloaded: std::collections::HashSet<String>,
     /// The theme in use when the picker opened (Esc goes back to it).
@@ -466,7 +484,9 @@ impl App {
             repoll: false,
             pages: Vec::new(),
             active: None,
-            history: Vec::new(),
+            nav: NavTree::new(Loc::Base(Tab::Search), "⌕ Search".into()),
+            undo: None,
+            tabs_list: None,
             unloaded: Default::default(),
             theme_before: None,
             theme_watch: (Instant::now(), None, None),
@@ -1416,18 +1436,89 @@ impl App {
         if let Some(key) = state.active.and_then(|i| self.pages.get(i)).map(Page::key) {
             self.show(Loc::Page(key));
         }
+        // The undo tree starts where the last run ended.
+        let here = self.loc();
+        let (label, reopen) = self.nav_describe(&here);
+        self.nav = NavTree::new(here, label);
+        self.nav.nodes[0].reopen = reopen;
     }
 
     /// Goes to a tab; Esc comes back here.
     pub fn go(&mut self, loc: Loc) {
-        let cur = self.loc();
-        if cur != loc {
-            self.history.push(cur);
-            if self.history.len() > HISTORY {
-                self.history.remove(0);
+        self.nav_visit(&loc);
+        self.show(loc);
+    }
+
+    /// Adds a visit to `loc` to the undo tree.
+    fn nav_visit(&mut self, loc: &Loc) {
+        let (label, reopen) = self.nav_describe(loc);
+        self.nav.visit(loc.clone(), label, reopen);
+    }
+
+    /// The tree's label for a place, and what opens it again if its tab closes.
+    fn nav_describe(&self, loc: &Loc) -> (String, Option<SavedTab>) {
+        match loc {
+            Loc::Base(tab) => {
+                let glyph = match tab {
+                    Tab::Search => "⌕",
+                    Tab::Playlists => "≡",
+                    Tab::Liked => "♥",
+                    Tab::Recent => "◷",
+                };
+                (format!("{glyph} {}", tab.title()), None)
+            }
+            Loc::Page(k) => match self.pages.iter().find(|p| p.key() == *k) {
+                Some(p) => {
+                    let (glyph, saved) = match p {
+                        Page::Artist(a) => ("◉", SavedTab::Artist { id: a.id.clone(), name: a.name.clone() }),
+                        Page::Album(a) => ("◎", SavedTab::Album { album: a.album.clone() }),
+                        Page::Radio(r) => ("≋", SavedTab::Radio { seed: r.seed.clone() }),
+                    };
+                    (format!("{glyph} {}", p.title().1), Some(saved))
+                }
+                None => ("?".into(), None),
+            },
+        }
+    }
+
+    /// Opens a closed page again from what the undo tree kept. True if it is open now.
+    fn reopen(&mut self, saved: &SavedTab) -> bool {
+        let page = match saved.clone() {
+            SavedTab::Artist { id, name } => Page::Artist(ArtistPage::new(id, name)),
+            SavedTab::Album { album } => match album.id.clone() {
+                Some(id) => Page::Album(AlbumPage { id, album, tracks: Listing::default() }),
+                None => return false,
+            },
+            SavedTab::Radio { seed } => Page::Radio(Box::new(RadioPage::new(seed))),
+        };
+        let key = page.key();
+        if !self.exists(&Loc::Page(key.clone())) {
+            self.unloaded.insert(key);
+            self.pages.push(page);
+            if self.pages.len() > MAX_PAGES {
+                self.pages.remove(0);
+                self.active = None;
             }
         }
-        self.show(loc);
+        true
+    }
+
+    /// Goes to node `i` of the undo tree (a click in the tree): opens its page again if its
+    /// tab was closed.
+    pub fn nav_jump(&mut self, i: usize) {
+        let Some(node) = self.nav.nodes.get(i).cloned() else { return };
+        if !self.exists(&node.loc) {
+            match &node.reopen {
+                Some(saved) if self.reopen(saved) => {}
+                _ => {
+                    self.info("That page cannot open again.");
+                    return;
+                }
+            }
+        }
+        self.open = None;
+        self.nav.jump(i);
+        self.show(node.loc);
     }
 
     fn switch_tab(&mut self, tab: Tab) {
@@ -1449,14 +1540,14 @@ impl App {
         if self.active.is_none() && (self.open.take().is_some() || self.close_folder()) {
             return;
         }
-        let cur = self.loc();
-        while let Some(loc) = self.history.pop() {
-            if loc != cur && self.exists(&loc) {
-                self.show(loc);
-                return;
-            }
-        }
-        if self.active.is_some() {
+        let open: std::collections::HashSet<String> = self.pages.iter().map(Page::key).collect();
+        let usable = |n: &NavNode| match &n.loc {
+            Loc::Base(_) => true,
+            Loc::Page(k) => open.contains(k),
+        };
+        if let Some(loc) = self.nav.back(usable).map(|n| n.loc.clone()) {
+            self.show(loc);
+        } else if self.active.is_some() {
             self.show(Loc::Base(self.tab));
         }
     }
@@ -1470,34 +1561,31 @@ impl App {
         let key = self.pages.remove(i).key();
         self.unloaded.remove(&key);
         self.active = None;
-        self.history.retain(|l| *l != Loc::Page(key.clone()));
-        while let Some(loc) = self.history.pop() {
-            if self.exists(&loc) {
-                self.show(loc);
-                return;
-            }
+        let open: std::collections::HashSet<String> = self.pages.iter().map(Page::key).collect();
+        let usable = |n: &NavNode| match &n.loc {
+            Loc::Base(_) => true,
+            Loc::Page(k) => open.contains(k),
+        };
+        match self.nav.back(usable).map(|n| n.loc.clone()) {
+            Some(loc) => self.show(loc),
+            None => self.show(Loc::Base(self.tab)),
         }
-        self.show(Loc::Base(self.tab));
     }
 
     /// Opens a page in a new tab, or goes to its tab if it is open. True for a new tab.
     fn open_page(&mut self, page: Page) -> bool {
         let key = page.key();
-        let cur = self.loc();
         let fresh = !self.exists(&Loc::Page(key.clone()));
         if fresh {
             self.pages.push(page);
             if self.pages.len() > MAX_PAGES {
-                let old = self.pages.remove(0).key();
-                self.history.retain(|l| *l != Loc::Page(old.clone()));
+                self.pages.remove(0);
                 self.active = None;
             }
         }
-        // `cur` may be the tab just closed; Esc skips it.
-        if cur != Loc::Page(key.clone()) {
-            self.history.push(cur);
-        }
-        self.show(Loc::Page(key));
+        let loc = Loc::Page(key);
+        self.nav_visit(&loc);
+        self.show(loc);
         fresh
     }
 
@@ -1827,6 +1915,11 @@ impl App {
     }
 
     fn move_popup(&mut self, delta: isize) {
+        if let Some(c) = self.undo {
+            let len = self.nav.rows().len();
+            self.undo = Some((c as isize + delta).clamp(0, len as isize - 1) as usize);
+            return;
+        }
         let len = if let Some(m) = &self.menu {
             m.items.len()
         } else if self.picker.is_some() {
@@ -2295,12 +2388,19 @@ impl App {
             }
             return;
         }
+        if self.tabs_mouse(m, pos) {
+            return;
+        }
         // Pop-ups take the mouse while they are open; a click outside closes them.
-        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.palette.is_some() {
+        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.palette.is_some() || self.undo.is_some() {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     let hit = self.hits.popup_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i);
                     match hit {
+                        Some(i) if self.undo.is_some() => {
+                            self.undo = Some(i);
+                            self.undo_go();
+                        }
                         Some(i) if self.palette.is_some() => {
                             if let Some(p) = self.palette.as_mut() {
                                 p.cursor = i;
@@ -2329,6 +2429,7 @@ impl App {
                             self.palette = None;
                             self.picker = None;
                             self.confirm = None;
+                            self.undo = None;
                         }
                         _ => {}
                     }
@@ -2343,6 +2444,11 @@ impl App {
         }
         if !self.sidebar.open && self.hits.side_open.contains(pos) && matches!(m.kind, MouseEventKind::Down(_)) {
             self.show_side(self.sidebar.view);
+            return;
+        }
+        // The hide handle sticks out of the sidebar into the gap: check it first.
+        if self.sidebar.open && self.hits.side_hide.contains(pos) && matches!(m.kind, MouseEventKind::Down(_)) {
+            self.sidebar.close();
             return;
         }
         if self.sidebar.open && self.hits.side.contains(pos) {
@@ -2467,6 +2573,14 @@ impl App {
             self.help = false;
             return;
         }
+        if self.undo.is_some() {
+            self.undo_key(key);
+            return;
+        }
+        if self.tabs_list.is_some() && key.code == KeyCode::Esc {
+            self.tabs_list = None;
+            return;
+        }
         if self.confirm.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -2550,6 +2664,10 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+        if !self.typing && is_ctrl_backspace(&key) {
+            self.open_undo();
             return;
         }
         if !self.typing && self.side_key(key) {
@@ -2691,6 +2809,132 @@ impl App {
             KeyCode::Char('S') if self.view() == View::Radio => self.ask_save_radio(),
             KeyCode::Char('R') => self.reload(),
             _ => {}
+        }
+    }
+}
+
+/// Ctrl+Backspace, as terminals send it: ^H (most, ghostty too), ^W (some), or Backspace with
+/// Ctrl or Alt (kitty keyboard protocol, or Alt as a fallback).
+fn is_ctrl_backspace(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Backspace => key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+        KeyCode::Char('h') | KeyCode::Char('w') => ctrl,
+        _ => false,
+    }
+}
+
+/// The tabs that do not fit in the bar: the "+N ▾" chip and its list.
+impl App {
+    /// The pointer moved (no button). True if the screen changes: the list opens, closes, or
+    /// another row is under the pointer.
+    pub fn on_hover(&mut self, pos: Position) -> bool {
+        let over_chip = self.hits.tabs_more.contains(pos);
+        let over_list = self.hits.tabs_list.contains(pos);
+        let row = self.hits.tabs_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i);
+        match self.tabs_list.as_mut() {
+            None if over_chip => {
+                self.tabs_list = Some(TabsList { pinned: false, hover: None });
+                true
+            }
+            None => false,
+            Some(l) if over_chip || over_list => {
+                let changed = l.hover != row;
+                l.hover = row;
+                changed
+            }
+            Some(l) if !l.pinned => {
+                self.tabs_list = None;
+                true
+            }
+            Some(l) => {
+                let changed = l.hover.is_some();
+                l.hover = None;
+                changed
+            }
+        }
+    }
+
+    /// A click on the chip or in its list. True if it was used (nothing else gets it).
+    fn tabs_mouse(&mut self, m: MouseEvent, pos: Position) -> bool {
+        if !matches!(m.kind, MouseEventKind::Down(_)) {
+            return self.tabs_list.is_some() && self.hits.tabs_list.contains(pos);
+        }
+        if self.hits.tabs_more.contains(pos) {
+            // A click keeps it open (or shuts it if it was kept open).
+            self.tabs_list = match self.tabs_list {
+                Some(l) if l.pinned => None,
+                _ => Some(TabsList { pinned: true, hover: None }),
+            };
+            return true;
+        }
+        if self.tabs_list.is_none() {
+            return false;
+        }
+        if let Some(&(_, i)) = self.hits.tabs_close.iter().find(|(r, _)| r.contains(pos)) {
+            self.close_page_at(i);
+            if self.pages.is_empty() {
+                self.tabs_list = None;
+            }
+            return true;
+        }
+        if let Some(&(_, i)) = self.hits.tabs_rows.iter().find(|(r, _)| r.contains(pos)) {
+            self.tabs_list = None;
+            if let Some(key) = self.pages.get(i).map(Page::key) {
+                self.go(Loc::Page(key));
+            }
+            return true;
+        }
+        // A click anywhere else shuts the list and does what it does there.
+        let inside = self.hits.tabs_list.contains(pos);
+        self.tabs_list = None;
+        inside
+    }
+
+    /// Closes page `i`, shown or not.
+    fn close_page_at(&mut self, i: usize) {
+        if self.active == Some(i) {
+            self.close_page();
+            return;
+        }
+        if i < self.pages.len() {
+            let key = self.pages.remove(i).key();
+            self.unloaded.remove(&key);
+            if let Some(a) = self.active.filter(|a| *a > i) {
+                self.active = Some(a - 1);
+            }
+        }
+    }
+}
+
+/// The undo tree popup.
+impl App {
+    /// Ctrl+Backspace: shows the tree, the cursor on where you are.
+    fn open_undo(&mut self) {
+        let rows = self.nav.rows();
+        self.undo = Some(rows.iter().position(|r| r.node == self.nav.cur).unwrap_or(0));
+    }
+
+    fn undo_key(&mut self, key: KeyEvent) {
+        let len = self.nav.rows().len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.undo = None,
+            _ if is_ctrl_backspace(&key) => self.undo = None,
+            KeyCode::Down | KeyCode::Char('j') => self.move_popup(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_popup(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.undo = Some(0),
+            KeyCode::Char('G') | KeyCode::End => self.undo = Some(len.saturating_sub(1)),
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => self.undo_go(),
+            _ => {}
+        }
+    }
+
+    /// Goes to the node under the tree's cursor and closes the tree.
+    fn undo_go(&mut self) {
+        let Some(c) = self.undo.take() else { return };
+        if let Some(row) = self.nav.rows().get(c) {
+            let node = row.node;
+            self.nav_jump(node);
         }
     }
 }
@@ -2900,9 +3144,7 @@ impl App {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.sidebar.focus = true;
-                if self.hits.side_hide.contains(pos) {
-                    self.sidebar.close();
-                } else if let Some(i) = self.hits.side_tabs.iter().position(|r| r.contains(pos)) {
+                if let Some(i) = self.hits.side_tabs.iter().position(|r| r.contains(pos)) {
                     self.show_side(if i == 0 { SideView::Playing } else { SideView::Library });
                 } else if let Some(&(_, i)) = self.hits.side_rows.iter().find(|(r, _)| r.contains(pos)) {
                     self.side_run(i);
@@ -3176,6 +3418,37 @@ mod tests {
         // Space still plays / pauses while the sidebar has the keys.
         app.on_key(KeyEvent::from(KeyCode::Char(' ')));
         assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Toggle)));
+    }
+
+    #[test]
+    fn undo_tree_keeps_branches_and_reopens_closed_pages() {
+        let (mut app, _rx) = test_app();
+        app.typing = false;
+        app.switch_tab(Tab::Liked);
+        app.open_artist("a1".into(), "Radiohead".into());
+        // Backspace goes back; a new place from there starts a branch.
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.loc(), Loc::Base(Tab::Liked));
+        app.open_artist("a2".into(), "Portishead".into());
+        let liked = app.nav.nodes.iter().position(|n| n.loc == Loc::Base(Tab::Liked)).unwrap();
+        assert_eq!(app.nav.nodes[liked].children.len(), 2);
+        // Close Portishead, then open the tree with Ctrl+Backspace (^H, as ghostty sends it).
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        let cursor = app.undo.expect("the tree is open");
+        let rows = app.nav.rows();
+        assert_eq!(rows[cursor].node, app.nav.cur, "the cursor starts where you are");
+        // Go to Portishead: its tab opens again.
+        let i = rows.iter().position(|r| app.nav.nodes[r.node].label.ends_with("Portishead")).unwrap();
+        app.undo = Some(i);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.undo.is_none());
+        assert!(matches!(app.page(), Some(Page::Artist(a)) if a.name == "Portishead"));
+        // Ctrl+Backspace while typing a search does not open it.
+        app.switch_tab(Tab::Search);
+        app.typing = true;
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert!(app.undo.is_none());
     }
 
     #[test]

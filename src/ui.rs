@@ -208,6 +208,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_now_playing(f, app, now);
     draw_footer(f, app, footer);
+    if app.tabs_list.is_some() {
+        draw_tabs_list(f, app, header);
+    }
     if let Some((area, shown)) = side {
         crate::sidebar::draw(f, app, area, shown);
     } else if side_fits && !app.sidebar.visible() {
@@ -225,6 +228,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_confirm(f, app);
     } else if app.palette.is_some() {
         draw_palette(f, app);
+    } else if app.undo.is_some() {
+        draw_undo(f, app);
     }
     if app.help {
         draw_help(f);
@@ -682,6 +687,55 @@ fn draw_palette(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// The undo tree (Ctrl+Backspace): every place you went, as branches; where you are is marked.
+/// Closed pages show dim and open again when chosen.
+fn draw_undo(f: &mut Frame, app: &mut App) {
+    let Some(cursor) = app.undo else { return };
+    let rows = app.nav.rows();
+    let t = theme::c();
+    let height = (rows.len() as u16 + 4).clamp(6, f.area().height.saturating_sub(4));
+    let area = popup_area(f, 64, height);
+    let block = popup_block("Where you went".into())
+        .title_bottom(Line::from(Span::styled(" ⏎ go · click a place · esc close ", theme::faint())).right_aligned());
+    let inner = block.inner(area).inner(Margin::new(1, 1));
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    app.hits.popup = area;
+    let h = inner.height as usize;
+    let cursor = cursor.min(rows.len().saturating_sub(1));
+    let start = cursor.saturating_sub(h.saturating_sub(1).min(h / 2)).min(rows.len().saturating_sub(h));
+    let open: std::collections::HashSet<String> = app.pages.iter().map(|p| p.key()).collect();
+    for (n, (i, row)) in rows.iter().enumerate().skip(start).take(h).enumerate() {
+        let node = &app.nav.nodes[row.node];
+        let r = Rect::new(inner.x, inner.y + n as u16, inner.width, 1);
+        let current = row.node == app.nav.cur;
+        let closed = matches!(&node.loc, Loc::Page(k) if !open.contains(k));
+        let selected = i == cursor;
+        let base = if selected { Style::new().bg(t.selected) } else { Style::new() };
+        let (dot, dot_style) = if current { ("●", theme::accent()) } else { ("○", theme::faint()) };
+        let label_style = match (current, closed) {
+            (true, _) => theme::accent().add_modifier(Modifier::BOLD),
+            (_, true) => theme::faint(),
+            _ if selected => theme::bright(),
+            _ => theme::text(),
+        };
+        let when = crate::undo::ago(node.at);
+        let note = if current { "  you are here" } else if closed { "  closed" } else { "" };
+        let room = (r.width as usize).saturating_sub(row.prefix.width() + 2 + note.width() + when.width() + 2);
+        let mut spans = vec![
+            Span::styled(row.prefix.clone(), Style::new().fg(t.border).patch(base)),
+            Span::styled(format!("{dot} "), dot_style.patch(base)),
+            Span::styled(fit(&node.label, room), label_style.patch(base)),
+            Span::styled(note, theme::faint().patch(base)),
+        ];
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        spans.push(Span::styled(" ".repeat((r.width as usize).saturating_sub(used + when.width() + 1)), base));
+        spans.push(Span::styled(format!("{when} "), theme::faint().patch(base)));
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+        app.hits.popup_rows.push((r, i));
+    }
+}
+
 fn draw_confirm(f: &mut Frame, app: &mut App) {
     let Some(confirm) = app.confirm.as_ref() else { return };
     let width = (confirm.text.width() as u16 + 8).clamp(36, 70);
@@ -951,7 +1005,10 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         left.extend(spans);
         left.push(Span::raw(gap_str.clone()));
     }
-    // Open pages, after a rule. Those that do not fit show as "+N" (keys and H/L still reach them).
+    // Open pages, after a rule. When they do not fit, the names of the other pages get shorter
+    // (18, then 10 letters), then show only their number and glyph; the page shown keeps its
+    // name and always shows. Pages that still do not fit go into the "+N ▾" chip, whose list
+    // (hover or click) has every page.
     if !app.pages.is_empty() {
         left.push(Span::styled(" │ ", theme::faint()));
         x += 3;
@@ -959,26 +1016,84 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     // Room for the device dot.
     let end = area.x + area.width.saturating_sub(3);
     let n = app.pages.len();
-    for i in 0..n {
+    let chip = |i: usize, limit: Option<usize>| -> Vec<Span<'static>> {
         let (kind, name) = app.pages[i].title();
-        let name = if name.is_empty() { "…".to_owned() } else { fit(name, 18) };
+        let active = app.active == Some(i);
+        let name = match limit {
+            _ if name.is_empty() => "…".to_owned(),
+            _ if active => fit(name, 18),
+            Some(l) => fit(name, l),
+            None => String::new(),
+        };
         let glyph = match kind {
             "Artist" => '◉',
             "Album" => '◎',
             _ => '≋',
         };
         let key = i + Tab::ALL.len() + 1;
-        let spans = tab_chip((key <= 9).then_some(key), Some(glyph), &name, None, app.active == Some(i));
-        let w = Line::from(spans.clone()).width() as u16;
-        let more = n - i;
-        if x + w + if more > 1 { 5 } else { 0 } > end {
-            left.push(Span::styled(format!("+{more}"), theme::faint()));
+        if name.is_empty() {
+            // Glyph only: the glyph is the label.
+            tab_chip((key <= 9).then_some(key), None, &glyph.to_string(), None, active)
+        } else {
+            tab_chip((key <= 9).then_some(key), Some(glyph), &name, None, active)
+        }
+    };
+    let width = |spans: &Vec<Span<'static>>| Line::from(spans.clone()).width() as u16 + gap;
+    const MORE_W: u16 = 7;
+    let mut chosen: Vec<(usize, Vec<Span<'static>>)> = Vec::new();
+    let mut hidden = 0;
+    for limit in [Some(18), Some(10), None] {
+        let all: Vec<_> = (0..n).map(|i| (i, chip(i, limit))).collect();
+        let total: u16 = all.iter().map(|(_, c)| width(c)).sum();
+        if x + total <= end || limit.is_none() {
+            if x + total <= end {
+                chosen = all;
+            } else {
+                // Still too wide: pages in order while they fit beside the chip, the shown page
+                // always among them.
+                let room = end.saturating_sub(x + MORE_W);
+                let mut used = 0u16;
+                let mut keep: Vec<usize> = Vec::new();
+                for (i, c) in &all {
+                    if used + width(c) <= room {
+                        used += width(c);
+                        keep.push(*i);
+                    }
+                }
+                if let Some(a) = app.active.filter(|a| !keep.contains(a)) {
+                    let aw = width(&all[a].1);
+                    while used + aw > room {
+                        match keep.pop() {
+                            Some(i) => used -= width(&all[i].1),
+                            None => break,
+                        }
+                    }
+                    keep.push(a);
+                    keep.sort();
+                }
+                hidden = n - keep.len();
+                chosen = all.into_iter().filter(|(i, _)| keep.contains(i)).collect();
+            }
             break;
         }
+    }
+    for (i, spans) in chosen {
+        let w = Line::from(spans.clone()).width() as u16;
         app.hits.tabs.push((span_rect(area, x, w), Loc::Page(app.pages[i].key())));
         x += w + gap;
         left.extend(spans);
         left.push(Span::raw(gap_str.clone()));
+    }
+    if hidden > 0 {
+        let open = app.tabs_list.is_some();
+        let style = if open {
+            Style::new().bg(t.accent).fg(t.viz_low).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().bg(t.selected).fg(t.bright)
+        };
+        let label = format!(" +{hidden} ▾ ");
+        app.hits.tabs_more = span_rect(area, x, label.width() as u16);
+        left.push(Span::styled(label, style));
     }
 
     let active = app
@@ -1001,6 +1116,60 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(right.width() as u16)]).areas(area);
     f.render_widget(Line::from(left), l);
     f.render_widget(right, r);
+}
+
+/// The list under the "+N ▾" chip: every open page, its number key, glyph and whole name.
+/// A click goes there; "×" closes it. The row under the pointer is lit.
+fn draw_tabs_list(f: &mut Frame, app: &mut App, header: Rect) {
+    let Some(list) = app.tabs_list else { return };
+    let chip = app.hits.tabs_more;
+    if chip.width == 0 || app.pages.is_empty() {
+        app.tabs_list = None;
+        return;
+    }
+    let t = theme::c();
+    let screen = f.area();
+    let w = 46.min(screen.width.saturating_sub(2));
+    let h = (app.pages.len() as u16 + 2).min(screen.height.saturating_sub(header.bottom()));
+    let x = chip.x.min(screen.right().saturating_sub(w + 1));
+    let area = Rect::new(x, header.bottom(), w, h);
+    let block = popup_block("Open tabs".into());
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    app.hits.tabs_list = Rect { y: chip.y, height: area.bottom() - chip.y, ..area }.union(chip);
+    for (n, i) in (0..app.pages.len()).take(inner.height as usize).enumerate() {
+        let r = Rect::new(inner.x, inner.y + n as u16, inner.width, 1);
+        let (kind, name) = app.pages[i].title();
+        let glyph = match kind {
+            "Artist" => '◉',
+            "Album" => '◎',
+            _ => '≋',
+        };
+        let key = i + Tab::ALL.len() + 1;
+        let active = app.active == Some(i);
+        let hover = list.hover == Some(i);
+        let base = if hover { Style::new().bg(t.selected) } else { Style::new() };
+        let mark = if active { theme::marker() } else { " ".into() };
+        let num = if key <= 9 { format!("{key} ") } else { "  ".into() };
+        let name_style = if active { theme::accent().add_modifier(Modifier::BOLD) } else if hover { theme::bright() } else { theme::text() };
+        let room = (r.width as usize).saturating_sub(4 + num.width() + 2 + 9);
+        let spans = vec![
+            Span::styled(format!("{mark} "), theme::accent().patch(base)),
+            Span::styled(num, theme::faint().patch(base)),
+            Span::styled(format!("{glyph} "), Style::new().fg(t.accent2).patch(base)),
+            Span::styled(fit(name, room), name_style.patch(base)),
+        ];
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        let kind_label = format!("{} ", kind.to_lowercase());
+        let mut spans = spans;
+        spans.push(Span::styled(" ".repeat((r.width as usize).saturating_sub(used + kind_label.width() + 3)), base));
+        spans.push(Span::styled(kind_label, theme::faint().patch(base)));
+        spans.push(Span::styled(" × ", if hover { Style::new().fg(t.red).patch(base) } else { theme::faint() }));
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+        app.hits.tabs_rows.push((Rect { width: r.width.saturating_sub(3), ..r }, i));
+        app.hits.tabs_close.push((Rect { x: r.right().saturating_sub(3), width: 3, ..r }, i));
+    }
 }
 
 /// One tab in the header, in the theme's header style. `key` is its number key (faint).
@@ -1973,6 +2142,9 @@ fn hints(app: &App) -> &'static [(&'static str, &'static str)] {
     if app.typing {
         return &[("⏎", "search"), ("esc", "done"), ("^u", "clear")];
     }
+    if app.undo.is_some() {
+        return &[("↑↓", "move"), ("⏎", "go there"), ("click", "go there"), ("esc", "close")];
+    }
     if app.menu.is_some() || app.picker.is_some() || app.confirm.is_some() || app.palette.is_some() {
         return &[("↑↓", "move"), ("⏎", "choose"), ("esc", "close")];
     }
@@ -2039,7 +2211,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("tab", "next section (artist page)"),
         ("j k, ↑ ↓", "move"),
         ("g G, ^d ^u", "top, bottom, page"),
-        ("esc, h", "back to the last tab"),
+        ("esc h ⌫", "back to the last place"),
+        ("^⌫", "undo tree: every place, click to go"),
         ("c", "jump to the playing song"),
         ("/  t", "search, result type"),
         (":  ^p", "do anything (palette)"),
@@ -2256,6 +2429,67 @@ mod tests {
         let hide = app.hits.side_hide;
         app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: hide.x + 1, row: hide.y, modifiers: KeyModifiers::NONE });
         assert!(!app.sidebar.open);
+    }
+
+    #[test]
+    fn undo_tree_draws_and_clicks() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _rx) = test_app();
+        app.typing = false;
+        app.on_key(KeyEvent::from(KeyCode::Char('3')));
+        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        let out = screen(&mut app, 120, 40);
+        assert!(out.contains("Where you went") && out.contains("you are here"), "{out}");
+        assert!(out.contains("└─"), "{out}");
+        // Click the Liked row: go there, the tree closes.
+        let liked = app.hits.popup_rows.iter().find(|(_, i)| app.nav.nodes[app.nav.rows()[*i].node].label.contains("Liked")).map(|(r, _)| *r).unwrap();
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: liked.x + 4, row: liked.y, modifiers: KeyModifiers::NONE });
+        assert!(app.undo.is_none());
+        assert_eq!(app.loc(), crate::app::Loc::Base(crate::app::Tab::Liked));
+    }
+
+    #[test]
+    fn tabs_that_do_not_fit_go_in_a_hover_list() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let click = |x: u16, y: u16| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE };
+        let (mut app, _rx) = test_app();
+        app.typing = false;
+        let names = ["Radiohead", "Portishead", "Massive Attack", "Boards of Canada", "Aphex Twin", "Burial", "Bonobo", "Tycho"];
+        for (i, n) in names.iter().enumerate() {
+            app.open_artist(format!("a{i}"), n.to_string());
+        }
+        // The last one is shown: at 90 columns it keeps its name, and a chip holds the rest.
+        let out = screen(&mut app, 90, 30);
+        let top = out.lines().next().unwrap().to_owned();
+        assert!(top.contains("Tycho"), "{top}");
+        assert!(top.contains('▾'), "{top}");
+        assert!(app.tabs_list.is_none());
+        // Hover the chip: the list opens with every page.
+        let chip = app.hits.tabs_more;
+        assert!(app.on_hover(ratatui::layout::Position::new(chip.x + 1, chip.y)));
+        let out = screen(&mut app, 90, 30);
+        for n in names {
+            assert!(out.contains(n), "{n}: {out}");
+        }
+        // Leave it: it closes. Hover again, click Radiohead: it shows.
+        assert!(app.on_hover(ratatui::layout::Position::new(5, 25)));
+        assert!(app.tabs_list.is_none());
+        app.on_hover(ratatui::layout::Position::new(chip.x + 1, chip.y));
+        let _ = screen(&mut app, 90, 30);
+        let row = app.hits.tabs_rows[0].0;
+        app.on_mouse(click(row.x + 3, row.y));
+        assert!(matches!(app.page(), Some(crate::pages::Page::Artist(a)) if a.name == "Radiohead"));
+        // Click the chip (kept open), then × on Bonobo: it closes, the list stays.
+        let _ = screen(&mut app, 90, 30);
+        let chip = app.hits.tabs_more;
+        app.on_mouse(click(chip.x + 1, chip.y));
+        let _ = screen(&mut app, 90, 30);
+        let (x_rect, _) = *app.hits.tabs_close.iter().find(|(_, i)| *i == 6).unwrap();
+        app.on_mouse(click(x_rect.x + 1, x_rect.y));
+        assert_eq!(app.pages.len(), 7);
+        assert!(app.tabs_list.is_some());
+        assert!(matches!(app.page(), Some(crate::pages::Page::Artist(a)) if a.name == "Radiohead"), "the page shown stays");
     }
 
     #[test]

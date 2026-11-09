@@ -237,7 +237,20 @@ impl Worker {
                 }
                 self.find_device()?;
                 self.poll()?;
-                user.map(|_| ())
+                match user {
+                    Ok(_) => Ok(()),
+                    // Not an error to fix: playback works, and /me is asked again later.
+                    Err(e) => match e.downcast_ref::<ApiError>() {
+                        Some(ApiError::RateLimited(secs)) => {
+                            self.send(Msg::Info(format!(
+                                "Spotify limits the profile request for {} min. Playback works; spotlite asks again every 10 min.",
+                                secs.div_ceil(60)
+                            )));
+                            Ok(())
+                        }
+                        _ => Err(e),
+                    },
+                }
             }
             Cmd::Poll => self.poll(),
             Cmd::Load { list, offset } => self.load(list, offset),

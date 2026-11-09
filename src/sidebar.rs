@@ -324,6 +324,12 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, shown: u16) {
     match app.sidebar.motion() {
         None => {
             render(f.buffer_mut(), area, app, view, view.index() as f32, true);
+            // The hide handle, on the right edge, at the height of the open handle.
+            if area.height >= 7 {
+                // In the gap between the sidebar and the list, so the border stays whole.
+                let x = area.right() - 1;
+                app.hits.side_hide = handle(f.buffer_mut(), x, area.y + area.height / 2, "‹", 1);
+            }
         }
         Some((Motion::Open | Motion::Close, e)) => {
             let off_area = Rect::new(0, 0, area.width, area.height);
@@ -357,21 +363,33 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, shown: u16) {
 /// sidebar again.
 pub fn draw_tab(f: &mut Frame, app: &mut App, body: Rect) {
     let x = f.area().x;
-    if body.height < 5 || body.x <= x {
+    if body.height < 7 || body.x <= x {
         return;
     }
-    let mid = body.y + body.height / 2;
-    let buf = f.buffer_mut();
+    app.hits.side_open = handle(f.buffer_mut(), x, body.y + body.height / 2, "›", 0);
+}
+
+/// The handle that opens (›) or hides (‹) the sidebar: a thin line 5 rows tall with the chevron
+/// in the middle, centred on row `mid`. Both handles sit at the same height, so the one hand
+/// finds the other. The click area is 2 columns wide (`glyph_col` is the line's column in it).
+fn handle(buf: &mut Buffer, x: u16, mid: u16, glyph: &str, glyph_col: u16) -> Rect {
     let t = theme::c();
+    let top = mid.saturating_sub(2);
+    let line = Style::new().fg(theme::blend(t.faint, t.accent, 0.35));
+    let gx = x + glyph_col;
     for (dy, sym, style) in [
-        (-1i32, "╷", Style::new().fg(t.faint)),
-        (0, "›", theme::accent().add_modifier(Modifier::BOLD)),
-        (1, "╵", Style::new().fg(t.faint)),
+        (0, "╷", line),
+        (1, "│", line),
+        (2, glyph, theme::accent().add_modifier(Modifier::BOLD)),
+        (3, "│", line),
+        (4, "╵", line),
     ] {
-        let y = (mid as i32 + dy) as u16;
-        buf[(x, y)].set_symbol(sym).set_style(style);
+        let pos = ratatui::layout::Position::new(gx, top + dy);
+        if buf.area.contains(pos) {
+            buf[(gx, top + dy)].set_symbol(sym).set_style(style);
+        }
     }
-    app.hits.side_open = Rect::new(x, mid - 1, 2, 3);
+    Rect::new(x, top, 2, 5).intersection(buf.area)
 }
 
 /// The ripple at the moving edge: rows stick out by a few columns, most in the middle of the
@@ -469,13 +487,6 @@ fn render(buf: &mut Buffer, area: Rect, app: &mut App, view: SideView, ind: f32,
     if live {
         app.hits.side = area;
     }
-    // The hide button at the right end of the switch row.
-    let hide = Rect::new(inner.right() - 2, inner.y, 2, 1);
-    Paragraph::new(Line::styled(" «", theme::muted())).render(hide, buf);
-    if live {
-        app.hits.side_hide = hide;
-    }
-    let inner = Rect { width: inner.width - 3, ..inner };
     // The switch: two halves, the active one bright, an underline that slides between them.
     let half = inner.width / 2;
     let segs = [("♪", "Playing"), ("≡", "Library")];
@@ -502,7 +513,6 @@ fn render(buf: &mut Buffer, area: Rect, app: &mut App, view: SideView, ind: f32,
             buf[(x, line_y)].set_symbol("━").set_style(Style::new().fg(t.accent));
         }
     }
-    let inner = Rect { width: inner.width + 3, ..inner };
     let content = Rect::new(inner.x, inner.y + 3, inner.width, inner.height.saturating_sub(3));
     match view {
         SideView::Playing => render_playing(buf, content, app, live),
