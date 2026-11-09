@@ -447,18 +447,26 @@ impl Worker {
                 let tx = self.tx.clone();
                 thread::Builder::new().name("spotlite-genres".into()).spawn(move || {
                     // The first artist MusicBrainz has genres for (a song's guests count too).
-                    let mut result = Ok(Vec::new());
-                    let first = artists.first().map(|a| a.1.clone()).unwrap_or_default();
+                    // An artist MusicBrainz does not know (or an error) moves on to the next; the
+                    // error shows only when no artist gave an answer.
+                    let mut error = None;
+                    let mut answered = false;
                     for (uri, name) in &artists {
-                        result = crate::genre::of_artist(uri, name).map_err(|e| format!("{e:#}"));
-                        if let Ok(g) = &result {
-                            if !g.is_empty() {
-                                let _ = tx.send(Msg::Genres { artist: name.clone(), result });
+                        match crate::genre::of_artist(uri, name) {
+                            Ok(g) if !g.is_empty() => {
+                                let _ = tx.send(Msg::Genres { artist: name.clone(), result: Ok(g) });
                                 return;
                             }
+                            Ok(_) => answered = true,
+                            Err(e) => error = error.or(Some(format!("{e:#}"))),
                         }
                     }
-                    let _ = tx.send(Msg::Genres { artist: first, result });
+                    let names = artists.iter().map(|a| a.1.as_str()).collect::<Vec<_>>().join(", ");
+                    let result = match error {
+                        Some(e) if !answered => Err(e),
+                        _ => Ok(Vec::new()),
+                    };
+                    let _ = tx.send(Msg::Genres { artist: names, result });
                 })?;
                 Ok(())
             }

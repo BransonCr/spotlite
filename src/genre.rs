@@ -28,7 +28,7 @@ const MB: &str = "https://musicbrainz.org/ws/2";
 /// The genres of an artist, most voted first (from a copy on disk when there is one).
 pub fn of_artist(artist_uri: &str, name: &str) -> Result<Vec<String>> {
     let mut cache: HashMap<String, Vec<String>> = crate::store::read("genres.json").unwrap_or_default();
-    if let Some(g) = cache.get(artist_uri) {
+    if let Some(g) = cache.get(artist_uri).filter(|g| !g.is_empty()) {
         return Ok(g.clone());
     }
     let genres = musicbrainz(name)?;
@@ -40,17 +40,39 @@ pub fn of_artist(artist_uri: &str, name: &str) -> Result<Vec<String>> {
     Ok(genres)
 }
 
+/// The time of the last MusicBrainz request, for all threads: it allows one a second, and
+/// answers 503 to more.
+static LAST_ASK: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// A MusicBrainz GET, at most one a second; a 503 (too fast, or busy) waits and tries again.
+fn ask(agent: &ureq::Agent, path: &str, query: &[(&str, &str)]) -> Result<Value> {
+    let gap = Duration::from_millis(1100);
+    for attempt in 0..3 {
+        {
+            let mut last = LAST_ASK.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = *last {
+                std::thread::sleep(gap.saturating_sub(at.elapsed()));
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let mut req = agent.get(&format!("{MB}{path}"));
+        for (k, v) in query {
+            req = req.query(k, v);
+        }
+        match req.call() {
+            Ok(resp) => return Ok(resp.into_json()?),
+            Err(ureq::Error::Status(503, _)) if attempt < 2 => std::thread::sleep(Duration::from_secs(2 << attempt)),
+            Err(ureq::Error::Status(503, _)) => return Err(anyhow!("MusicBrainz is busy; try again in a minute")),
+            Err(e) => return Err(e).context("asking MusicBrainz"),
+        }
+    }
+    unreachable!()
+}
+
 fn musicbrainz(name: &str) -> Result<Vec<String>> {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).user_agent(UA).build();
     let query = format!("artist:\"{}\"", name.replace('"', ""));
-    let found: Value = agent
-        .get(&format!("{MB}/artist/"))
-        .query("query", &query)
-        .query("limit", "5")
-        .query("fmt", "json")
-        .call()
-        .context("asking MusicBrainz")?
-        .into_json()?;
+    let found = ask(&agent, "/artist/", &[("query", &query), ("limit", "5"), ("fmt", "json")])?;
     let artists = found["artists"].as_array().cloned().unwrap_or_default();
     // The same name first (search also finds near names), else the best score.
     let pick = artists
@@ -59,15 +81,7 @@ fn musicbrainz(name: &str) -> Result<Vec<String>> {
         .or_else(|| artists.first())
         .ok_or_else(|| anyhow!("MusicBrainz does not know {name}"))?;
     let id = pick["id"].as_str().ok_or_else(|| anyhow!("MusicBrainz gave no id for {name}"))?;
-    // MusicBrainz allows one request a second.
-    std::thread::sleep(Duration::from_millis(1100));
-    let artist: Value = agent
-        .get(&format!("{MB}/artist/{id}"))
-        .query("inc", "genres+tags")
-        .query("fmt", "json")
-        .call()
-        .context("asking MusicBrainz")?
-        .into_json()?;
+    let artist = ask(&agent, &format!("/artist/{id}"), &[("inc", "genres+tags"), ("fmt", "json")])?;
     let mut genres = ranked(&artist["genres"]);
     if genres.is_empty() {
         genres = ranked(&artist["tags"]);
