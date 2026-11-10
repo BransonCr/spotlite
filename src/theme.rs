@@ -50,6 +50,8 @@ pub struct Theme {
     pub nerd: bool,
     pub select: Select,
     pub viz: Viz,
+    /// The liquid of the sidebar effect (V).
+    pub liquid: Liquid,
     pub progress: Progress,
     pub volume: Volume,
     /// Dotted leaders from each song title to its time, like a printed track list.
@@ -113,6 +115,41 @@ pub enum Select {
     Block,
     Underline,
     Arrow,
+}
+
+/// The liquid in the sidebar (V): each built-in theme has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liquid {
+    /// Slow and thick, warm, with drips from the top.
+    Honey,
+    /// Pastel and lively, full of fizz.
+    Soda,
+    /// Blocky, with a glowing crust and rising blobs.
+    Lava,
+    /// Grey shades, with drops that fall in.
+    Ink,
+    /// Calm and cold, light stripes under the surface, ice on top.
+    Ice,
+    /// Braille dots, with slow sparkles.
+    Dew,
+    /// A dark body under a bright line, sparks off the splashes.
+    Neon,
+}
+
+impl Liquid {
+    pub const ALL: [(&'static str, Liquid); 7] = [
+        ("honey", Liquid::Honey),
+        ("soda", Liquid::Soda),
+        ("lava", Liquid::Lava),
+        ("ink", Liquid::Ink),
+        ("ice", Liquid::Ice),
+        ("dew", Liquid::Dew),
+        ("neon", Liquid::Neon),
+    ];
+
+    pub fn name(self) -> &'static str {
+        Self::ALL.iter().find(|(_, l)| *l == self).map_or("honey", |(n, _)| n)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +228,7 @@ const AMBER: Theme = Theme {
     nerd: true,
     select: Select::Bar,
     viz: Viz::Wave,
+    liquid: Liquid::Honey,
     progress: Progress::Line,
     volume: Volume::Bar,
     leaders: false,
@@ -283,6 +321,7 @@ pub fn all() -> Vec<(String, String)> {
 pub fn parse(text: &str) -> Result<Theme, String> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.message().trim().to_owned())?;
     let mut t = AMBER;
+    let mut liquid = None;
     for (key, value) in &table {
         if let Some(b) = value.as_bool() {
             match key.as_str() {
@@ -350,6 +389,10 @@ pub fn parse(text: &str) -> Result<Theme, String> {
                 )?;
                 continue;
             }
+            "liquid" => {
+                liquid = Some(pick(key, s, &Liquid::ALL)?);
+                continue;
+            }
             "viz" => {
                 t.viz = pick(
                     key,
@@ -411,6 +454,14 @@ pub fn parse(text: &str) -> Result<Theme, String> {
         };
         *slot = hex(s).ok_or_else(|| format!("{key}: “{s}” is not a \"#rrggbb\" colour"))?;
     }
+    // A theme without a liquid gets one that fits its visualizer.
+    t.liquid = liquid.unwrap_or(match t.viz {
+        Viz::Wave => Liquid::Honey,
+        Viz::Bars => Liquid::Lava,
+        Viz::Mirror => Liquid::Ice,
+        Viz::Dots => Liquid::Dew,
+        Viz::None => Liquid::Ink,
+    });
     Ok(t)
 }
 
@@ -549,6 +600,10 @@ mod tests {
             })
             .collect();
         assert_eq!(looks.len(), BUILTIN.len(), "every theme has its own look, not only its own colours");
+        let liquids: std::collections::HashSet<&str> = BUILTIN.iter().map(|(_, text)| parse(text).unwrap().liquid.name()).collect();
+        assert_eq!(liquids.len(), BUILTIN.len(), "every theme has its own liquid");
+        assert_eq!(parse("viz = \"bars\"").unwrap().liquid, Liquid::Lava, "a liquid that fits the visualizer");
+        assert!(parse("liquid = \"oil\"").is_err());
         let t = parse("accent = \"#ff0000\"").unwrap();
         assert_eq!((t.accent, t.text), (Color::Rgb(255, 0, 0), AMBER.text));
         assert!(parse("accent = \"red\"").is_err());

@@ -4,7 +4,7 @@ use crate::folders::Entry;
 use crate::images::Images;
 use crate::pages::{AlbumPage, ArtistPage, ArtistRow, FilterItem, Page, RadioPage, RandomPage};
 use crate::radio::Library;
-use crate::sidebar::{Item as SideItem, Pin, SideView, Sidebar, SongAct};
+use crate::sidebar::{Item as SideItem, Pin, SideFx, SideView, Sidebar, SongAct};
 use crate::state::{SavedPlayback, SavedTab, State};
 use crate::undo::{NavTree, Node as NavNode};
 use crate::viz::Visualizer;
@@ -213,18 +213,16 @@ pub enum Action {
     Artist { id: String, name: String },
     Album(Album),
     Radio,
-    /// Find the song's genres, to randomize one.
-    Genres,
-    /// 50 random songs of this genre.
-    Randomize(String),
-    /// Type the genre to randomize.
-    TypeGenre,
+    /// Open the genre picker, to randomize a genre.
+    PickGenre,
     AddToPlaylist,
     RemoveFromPlaylist,
     Like,
     Filter(FilterItem),
     /// A theme by name (the theme picker, `T`).
     Theme(String),
+    /// A sidebar effect (the effect menu, `V`).
+    SideFx(SideFx),
 }
 
 /// A pop-up list of actions: for a track (`.` or right-click), or the radio filters (`F`).
@@ -243,6 +241,50 @@ impl Menu {
     pub fn is_theme(&self) -> bool {
         matches!(self.items.first(), Some((_, _, Action::Theme(_))))
     }
+}
+
+/// A genre sample: about 10 s of a genre's top song, in the genre picker.
+pub struct Sample {
+    pub genre: String,
+    /// Which of the genre's top songs (Tab again on the same genre: the next one).
+    pub nth: usize,
+    /// The song, once it plays.
+    pub track: Option<Track>,
+    /// When it started playing; the sample ends `SAMPLE_LEN` later.
+    pub started: Option<Instant>,
+}
+
+/// How long a genre sample plays.
+pub const SAMPLE_LEN: Duration = Duration::from_secs(10);
+/// The volume fades out this fast before a switch,
+/// A visualizer sweeps in and out over these many seconds.
+const VIZ_IN: f32 = 0.6;
+const VIZ_OUT: f32 = 0.4;
+
+/// How far a visualizer is in (0..1), `on` or not since `at` (None: long ago).
+fn sweep(on: bool, at: Option<Instant>) -> f32 {
+    let since = at.map_or(f32::MAX, |t| t.elapsed().as_secs_f32());
+    if on {
+        (since / VIZ_IN).min(1.0)
+    } else {
+        (1.0 - since / VIZ_OUT).max(0.0)
+    }
+}
+const FADE_OUT: Duration = Duration::from_millis(150);
+/// waits this long after the switch for the new song to start (spotifyd starts it a moment
+/// after Spotify answers; fading in sooner makes it cut in loud),
+const SWITCH_WAIT: Duration = Duration::from_millis(450);
+/// and fades back in this slowly.
+const FADE_IN: Duration = Duration::from_millis(350);
+
+/// One step of a fade.
+#[derive(Debug)]
+pub enum FadeStep {
+    /// Volume to `to`, smoothly, over the time.
+    Ramp { to: u8, len: Duration },
+    Wait(Duration),
+    /// A command to send now (the switch).
+    Send(Cmd),
 }
 
 /// Choose a playlist to add a track to; type to narrow the list.
@@ -359,6 +401,16 @@ pub struct App {
     /// Sound visualizer (v); off by default.
     pub viz_on: bool,
     pub viz: Visualizer,
+    /// The effect over the sidebar's song (V), when it last changed, the one it replaced (it
+    /// sweeps out), and the one before the effect menu opened (Esc puts it back).
+    pub side_fx: SideFx,
+    pub side_fx_at: Option<Instant>,
+    side_fx_out: SideFx,
+    side_fx_before: Option<SideFx>,
+    pub liquid: crate::liquid::Liquid,
+    /// When the main visualizer (v) was last turned on or off, for its sweep.
+    pub viz_at: Option<Instant>,
+    pub side_peaks: crate::viz::Peaks,
     /// Quit and also stop spotifyd (Q): nothing keeps running.
     pub stop_services: bool,
     pub images: Images,
@@ -410,8 +462,17 @@ pub struct App {
     retries: Vec<(List, Instant)>,
     /// spotlite's own shuffle (Fisher-Yates over the whole list). Spotify's is kept off.
     pub true_shuffle: bool,
-    /// Randomize: a genre being typed (when MusicBrainz knows none, or you want another).
-    pub genre_prompt: Option<String>,
+    /// Randomize: the genre picker (quick picks, search, folder tree), and its genres.
+    pub genre_picker: Option<crate::genres::Picker>,
+    pub genre_list: Vec<crate::genres::Genre>,
+    /// A genre sample playing in the picker (Tab), and what played before it.
+    pub sample: Option<Sample>,
+    sample_restore: Option<crate::worker::Restore>,
+    sample_volume: Option<u8>,
+    /// Volume fades and the commands between them (a sample's switch), run by `tick`.
+    fade: std::collections::VecDeque<FadeStep>,
+    /// When the first step of `fade` began, and the volume then.
+    fade_at: Option<(Instant, u8)>,
     /// The list a true shuffle plays, and its songs: the player shows that list as the source.
     shuffled: Option<(String, std::collections::HashSet<String>)>,
     /// The theme in use when the picker opened (Esc goes back to it).
@@ -476,6 +537,13 @@ impl App {
             stop_services: false,
             viz_on: false,
             viz: Visualizer::default(),
+            side_fx: SideFx::Off,
+            side_fx_at: None,
+            side_fx_out: SideFx::Off,
+            side_fx_before: None,
+            liquid: Default::default(),
+            viz_at: None,
+            side_peaks: Default::default(),
             images,
             hits: Hits::default(),
             tx,
@@ -505,7 +573,13 @@ impl App {
             tabs_list: None,
             retries: Vec::new(),
             true_shuffle: false,
-            genre_prompt: None,
+            genre_picker: None,
+            genre_list: crate::genres::all(),
+            sample: None,
+            sample_restore: None,
+            sample_volume: None,
+            fade: Default::default(),
+            fade_at: None,
             shuffled: None,
             unloaded: Default::default(),
             theme_before: None,
@@ -765,6 +839,8 @@ impl App {
             || self.images.busy()
             || self.like_animating()
             || self.search_due.is_some()
+            || self.sample.is_some()
+            || !self.fade.is_empty()
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
@@ -910,7 +986,56 @@ impl App {
     /// True while the visualizer should move: on, and music playing. (Not tied to window
     /// focus: with focus-follows-mouse, focus leaves whenever the pointer does.)
     pub fn animating(&self) -> bool {
-        self.viz_on && self.playback.as_ref().is_some_and(|pb| pb.is_playing)
+        // Also while one sweeps out, so its bars have sound to leave with.
+        let side = self.sidebar.shows_song() && self.side_fx_shown().1 > 0.0;
+        (self.viz_reveal() > 0.0 || side) && self.playback.as_ref().is_some_and(|pb| pb.is_playing)
+    }
+
+    /// How far the main visualizer is in (0..1): it sweeps in from the left and out again.
+    pub fn viz_reveal(&self) -> f32 {
+        sweep(self.viz_on, self.viz_at)
+    }
+
+    /// The sidebar effect to draw, and how far it is in (0..1): the one chosen sweeps in; after
+    /// Off, the one before sweeps out.
+    pub fn side_fx_shown(&self) -> (SideFx, f32) {
+        if self.side_fx != SideFx::Off {
+            (self.side_fx, sweep(true, self.side_fx_at))
+        } else {
+            (self.side_fx_out, sweep(false, self.side_fx_at))
+        }
+    }
+
+    fn set_side_fx(&mut self, fx: SideFx) {
+        if fx == self.side_fx {
+            return;
+        }
+        self.side_fx_out = self.side_fx;
+        self.side_fx = fx;
+        self.side_fx_at = Some(Instant::now());
+    }
+
+    /// V: the menu of sidebar effects. Moving in it shows each one; Esc puts the old one back.
+    fn open_side_fx(&mut self) {
+        if !self.sidebar.shows_song() {
+            self.show_side(SideView::Playing);
+        }
+        let liquid = crate::theme::c().liquid.name();
+        let items = vec![
+            ("1", "Off".to_owned(), Action::SideFx(SideFx::Off)),
+            ("2", format!("Liquid · {liquid}, drops that move to each band"), Action::SideFx(SideFx::Liquid)),
+            ("3", "Spectrum · bars on their side".to_owned(), Action::SideFx(SideFx::Spectrum)),
+        ];
+        let cursor = items.iter().position(|(_, _, a)| *a == Action::SideFx(self.side_fx)).unwrap_or(0);
+        self.side_fx_before = Some(self.side_fx);
+        self.menu = Some(Menu { title: "Sidebar effect".into(), items, cursor, track: None, at: None });
+    }
+
+    /// True while a visualizer sweeps in or out.
+    fn viz_sweeping(&self) -> bool {
+        let r = self.side_fx_shown().1;
+        let main = self.viz_reveal();
+        (self.sidebar.shows_song() && r > 0.0 && r < 1.0) || (main > 0.0 && main < 1.0)
     }
 
     /// Called on every loop pass: polls the player and loads pages that are needed.
@@ -923,6 +1048,11 @@ impl App {
             self.viz.stop();
         }
         let now = Instant::now();
+        changed |= self.run_fade();
+        if self.sample.as_ref().and_then(|s| s.started).is_some_and(|at| at.elapsed() >= SAMPLE_LEN) {
+            self.stop_sample();
+            changed = true;
+        }
         if self.toast.as_ref().is_some_and(|t| now >= t.until) {
             self.toast = None;
             changed = true;
@@ -963,8 +1093,11 @@ impl App {
     /// step while a request is open or the heart bursts, a quarter second while music moves,
     /// else one second (the progress bar and toasts).
     pub fn frame_period(&self, viz_frame: Duration) -> Duration {
-        if self.sidebar.animating() {
+        if self.sidebar.animating() || self.viz_sweeping() {
             Duration::from_millis(16)
+        } else if !self.fade.is_empty() {
+            // A volume fade: small steps, so it sounds smooth.
+            Duration::from_millis(25)
         } else if self.animating() {
             viz_frame
         } else if self.in_flight > 0 || self.like_animating() {
@@ -1244,13 +1377,32 @@ impl App {
             Msg::Shuffled { context, uris } => {
                 self.shuffled = Some((context, uris.into_iter().collect()));
             }
-            Msg::Genres { artist, result } => match result {
-                Ok(genres) if genres.is_empty() => {
-                    self.info(format!("MusicBrainz has no genres for {artist}: type one."));
-                    self.genre_prompt = Some(String::new());
+            Msg::Sampling { genre, result } => match result {
+                Ok(track) => {
+                    if let Some(s) = self.sample.as_mut().filter(|s| s.genre == genre) {
+                        s.track = Some(track);
+                        // The 10 s count from when it can be heard.
+                        s.started = Some(Instant::now() + SWITCH_WAIT);
+                        if let Some(v) = self.sample_volume {
+                            self.fade.push_back(FadeStep::Wait(SWITCH_WAIT));
+                            self.fade.push_back(FadeStep::Ramp { to: v, len: FADE_IN });
+                        }
+                    }
+                    self.poll_soon();
                 }
-                Ok(genres) => self.offer_genres(&artist, genres),
-                Err(e) => self.error(format!("Genres of {artist}: {e}")),
+                Err(e) => {
+                    self.error(e);
+                    if self.sample.as_ref().is_some_and(|s| s.genre == genre) {
+                        self.sample = None;
+                        // Nothing changed: what played goes on, back at its volume.
+                        self.sample_restore = None;
+                        self.fade.clear();
+                        self.fade_at = None;
+                        if let Some(v) = self.sample_volume {
+                            self.fade.push_back(FadeStep::Ramp { to: v, len: FADE_IN / 2 });
+                        }
+                    }
+                }
             },
             Msg::Random { genre, result } => {
                 if let Err(e) = &result {
@@ -1486,7 +1638,7 @@ impl App {
             .map(|p| match p {
                 Page::Artist(a) => SavedTab::Artist { id: a.id.clone(), name: a.name.clone() },
                 Page::Album(a) => SavedTab::Album { album: a.album.clone() },
-                Page::Radio(r) => SavedTab::Radio { seed: r.seed.clone() },
+                Page::Radio(r) => SavedTab::Radio { seed: r.seed.clone(), tuned: r.saved() },
                 Page::Random(r) => SavedTab::Random { genre: r.genre.clone() },
             })
             .collect();
@@ -1500,6 +1652,7 @@ impl App {
             search: self.searched.clone(),
             search_kind: Some(self.search_kind),
             viz_on: self.viz_on,
+            side_fx: self.side_fx,
             sidebar: Some(crate::state::SavedSidebar { open: self.sidebar.open, view: self.sidebar.view }),
             pins: self.pins.clone(),
             // The live state (a shuffle just pressed counts), else the last one seen.
@@ -1522,6 +1675,7 @@ impl App {
             self.search_kind = kind;
         }
         self.viz_on |= state.viz_on;
+        self.side_fx = state.side_fx;
         if let Some(sb) = state.sidebar {
             self.sidebar.open = sb.open;
             self.sidebar.view = sb.view;
@@ -1537,7 +1691,7 @@ impl App {
                     Some(id) => Page::Album(AlbumPage { id, album, tracks: Listing::default() }),
                     None => continue,
                 },
-                SavedTab::Radio { seed } => Page::Radio(Box::new(RadioPage::new(seed))),
+                SavedTab::Radio { seed, tuned } => Page::Radio(Box::new(RadioPage::restored(seed, tuned))),
                 SavedTab::Random { genre } => Page::Random(RandomPage::new(genre)),
             };
             let key = page.key();
@@ -1585,7 +1739,7 @@ impl App {
                     let (glyph, saved) = match p {
                         Page::Artist(a) => ("◉", SavedTab::Artist { id: a.id.clone(), name: a.name.clone() }),
                         Page::Album(a) => ("◎", SavedTab::Album { album: a.album.clone() }),
-                        Page::Radio(r) => ("≋", SavedTab::Radio { seed: r.seed.clone() }),
+                        Page::Radio(r) => ("≋", SavedTab::Radio { seed: r.seed.clone(), tuned: r.saved() }),
                         Page::Random(r) => ("⚄", SavedTab::Random { genre: r.genre.clone() }),
                     };
                     (format!("{glyph} {}", p.title().1), Some(saved))
@@ -1603,7 +1757,7 @@ impl App {
                 Some(id) => Page::Album(AlbumPage { id, album, tracks: Listing::default() }),
                 None => return false,
             },
-            SavedTab::Radio { seed } => Page::Radio(Box::new(RadioPage::new(seed))),
+            SavedTab::Radio { seed, tuned } => Page::Radio(Box::new(RadioPage::restored(seed, tuned))),
             SavedTab::Random { genre } => Page::Random(RandomPage::new(genre)),
         };
         let key = page.key();
@@ -1788,7 +1942,7 @@ impl App {
             items.push(("o", "Start song radio".into(), Action::Radio));
         }
         if track.uri.starts_with("spotify:track:") && track.artists.iter().any(|a| a.uri.is_some()) {
-            items.push(("z", "Randomize this genre…".into(), Action::Genres));
+            items.push(("z", "Randomize a genre…".into(), Action::PickGenre));
         }
         items.push(("e", "Add to playlist…".into(), Action::AddToPlaylist));
         if let Some(pl) = self.editable_open_playlist() {
@@ -1874,6 +2028,9 @@ impl App {
         if let Some(name) = self.theme_before.take() {
             let _ = crate::theme::apply(&name);
         }
+        if let Some(fx) = self.side_fx_before.take() {
+            self.set_side_fx(fx);
+        }
         self.menu = None;
     }
 
@@ -1933,6 +2090,17 @@ impl App {
             self.try_theme(&name, true);
             return;
         }
+        if let Action::SideFx(fx) = action {
+            self.menu = None;
+            self.side_fx_before = None;
+            self.set_side_fx(fx);
+            self.info(match fx {
+                SideFx::Off => "Sidebar effect off".to_owned(),
+                SideFx::Liquid => format!("Sidebar effect: {}", crate::theme::c().liquid.name()),
+                SideFx::Spectrum => "Sidebar effect: spectrum".to_owned(),
+            });
+            return;
+        }
         if let Action::Filter(item) = action {
             // Filters stay open: change, see the list update, change again.
             if item == FilterItem::Discover {
@@ -1968,52 +2136,190 @@ impl App {
             Action::Artist { id, name } => self.open_artist(id, name),
             Action::Album(album) => self.open_album(album),
             Action::Radio => self.start_radio(track),
-            Action::Genres => self.find_genres(&track),
-            Action::Randomize(genre) => self.randomize(genre),
-            Action::TypeGenre => self.genre_prompt = Some(String::new()),
+            Action::PickGenre => self.open_genre_picker(),
             Action::AddToPlaylist => self.open_picker(track),
             Action::RemoveFromPlaylist => self.ask_remove(track),
             Action::Like => self.toggle_like(Some(track)),
-            Action::Filter(_) | Action::Theme(_) => {}
+            Action::Filter(_) | Action::Theme(_) | Action::SideFx(_) => {}
         }
     }
 
-    /// `z`: randomize the genre of the radio's seed, the selected song, or the playing one.
+    /// `z`: the genre picker (on a Randomize page, it rolls again).
     fn randomize_key(&mut self) {
-        let track = match self.page() {
-            Some(Page::Radio(r)) => Some(r.seed.clone()),
-            Some(Page::Random(_)) => {
-                self.reroll();
-                return;
-            }
-            _ => self.selected_track().or_else(|| self.playback.as_ref().and_then(|p| p.item.clone())),
-        };
-        match track {
-            Some(t) => self.find_genres(&t),
-            None => self.info("Select a song first."),
+        if let Some(Page::Random(_)) = self.page() {
+            self.reroll();
+        } else {
+            self.open_genre_picker();
         }
     }
 
-    /// Asks for the genres of the song's artist (Randomize, `z`).
-    fn find_genres(&mut self, track: &Track) {
-        let artists: Vec<(String, String)> =
-            track.artists.iter().filter_map(|a| Some((a.uri.clone()?, a.name.clone()))).take(3).collect();
-        let Some((_, name)) = artists.first() else {
-            self.genre_prompt = Some(String::new());
-            return;
-        };
-        self.info(format!("Finding the genres of {name}…"));
-        self.send(Cmd::Genres { artists });
+    pub fn open_genre_picker(&mut self) {
+        self.menu = None;
+        self.genre_picker = Some(crate::genres::Picker::new());
     }
 
-    /// The genres to randomize: a menu to pick one, or straight on when there is one.
-    fn offer_genres(&mut self, artist: &str, genres: Vec<String>) {
-        let mut items: Vec<(&'static str, String, Action)> =
-            genres.into_iter().map(|g| ("", g.clone(), Action::Randomize(g))).collect();
-        items.push(("", "Type another genre…".into(), Action::TypeGenre));
-        // A track, so the choice runs as a song action.
-        let track = Track { uri: String::new(), name: artist.to_owned(), duration_ms: 0, artists: Vec::new(), album: None, show: None, images: Vec::new() };
-        self.menu = Some(Menu { title: format!("Randomize · genres of {artist}"), items, cursor: 0, track: Some(track), at: None });
+    /// Keys of the genre picker: type to search, ↑↓ move, → ← open and close, ⏎ choose.
+    fn genre_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let genres = std::mem::take(&mut self.genre_list);
+        if self.genre_picker.is_some() {
+            match key.code {
+                KeyCode::Tab => {
+                    let genre = self.genre_picker.as_ref().and_then(|p| p.genre_at(&genres, p.cursor));
+                    if let Some(g) = genre {
+                        self.start_sample(g);
+                    }
+                    self.genre_list = genres;
+                    return;
+                }
+                KeyCode::Esc if self.sample.is_some() => {
+                    self.stop_sample();
+                    self.genre_list = genres;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if let Some(p) = self.genre_picker.as_mut() {
+            match key.code {
+                KeyCode::Esc if !p.query.is_empty() => p.set_query(String::new()),
+                KeyCode::Esc => {
+                    self.genre_picker = None;
+                    self.stop_sample();
+                }
+                KeyCode::Down => p.move_by(&genres, 1),
+                KeyCode::Up => p.move_by(&genres, -1),
+                KeyCode::Char('n') if ctrl => p.move_by(&genres, 1),
+                KeyCode::Char('p') if ctrl => p.move_by(&genres, -1),
+                KeyCode::PageDown => p.move_by(&genres, 10),
+                KeyCode::PageUp => p.move_by(&genres, -10),
+                KeyCode::Right => p.open_close(&genres, true),
+                KeyCode::Left => p.open_close(&genres, false),
+                KeyCode::Enter => {
+                    let at = p.cursor;
+                    self.genre_choose(&genres, at);
+                }
+                _ if is_ctrl_backspace(&key) => {
+                    let mut q = p.query.clone();
+                    delete_word(&mut q);
+                    p.set_query(q);
+                }
+                KeyCode::Backspace => {
+                    let mut q = p.query.clone();
+                    q.pop();
+                    p.set_query(q);
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    let q = format!("{}{c}", p.query);
+                    p.set_query(q);
+                }
+                _ => {}
+            }
+        }
+        self.genre_list = genres;
+    }
+
+    /// Chooses picker row `i` (⏎ or a click): a genre randomizes, a folder opens or closes.
+    pub fn genre_choose(&mut self, genres: &[crate::genres::Genre], i: usize) {
+        let Some(p) = self.genre_picker.as_mut() else { return };
+        if let crate::genres::Choice::Randomize(genre) = p.choose(genres, i) {
+            self.genre_picker = None;
+            self.stop_sample();
+            self.randomize(genre);
+        }
+    }
+
+    /// Tab in the genre picker: about 10 s of the genre's top song (Tab again: the next one).
+    /// What plays now fades out, the sample fades in; when it ends, the same back.
+    fn start_sample(&mut self, genre: String) {
+        let nth = match &self.sample {
+            Some(s) if s.genre == genre => s.nth + 1,
+            _ => 0,
+        };
+        // A way back still waiting in a fade (Tab again while it went back): keep it.
+        let pending = self.fade.iter_mut().find_map(|step| match step {
+            FadeStep::Send(Cmd::Unsample { restore }) => Some(restore.take()),
+            _ => None,
+        });
+        if let Some(restore) = pending {
+            self.sample_restore = restore;
+        } else if self.sample.is_none() {
+            // What played before the first sample, and its volume.
+            let pb = self.playback.as_ref();
+            self.sample_volume = pb.and_then(|p| p.device.as_ref()).and_then(|d| d.volume_percent);
+            self.sample_restore = pb.and_then(|p| {
+                Some(crate::worker::Restore {
+                    context: p.context.as_ref().map(|c| c.uri.clone()),
+                    track: p.item.as_ref()?.uri.clone(),
+                    position_ms: self.progress_ms(),
+                    playing: p.is_playing,
+                })
+            });
+        }
+        let playing = self.playback.as_ref().is_some_and(|p| p.is_playing);
+        self.sample = Some(Sample { genre: genre.clone(), nth, track: None, started: None });
+        self.fade.clear();
+        self.fade_at = None;
+        if let (Some(v), true) = (self.sample_volume, playing) {
+            self.fade.push_back(FadeStep::Ramp { to: v / 10, len: FADE_OUT });
+        } else if let Some(v) = self.sample_volume {
+            // Nothing is heard now: start quiet, then fade in.
+            self.set_volume(v / 10);
+        }
+        self.fade.push_back(FadeStep::Send(Cmd::Sample { genre, nth }));
+    }
+
+    /// Ends the sample (time is up, Esc, or the picker closes): fades out, goes back to what
+    /// played, and fades it in.
+    fn stop_sample(&mut self) {
+        if self.sample.take().is_none() {
+            return;
+        }
+        let restore = self.sample_restore.take();
+        self.fade.clear();
+        self.fade_at = None;
+        match self.sample_volume {
+            Some(v) => {
+                self.fade.push_back(FadeStep::Ramp { to: v / 10, len: FADE_OUT });
+                self.fade.push_back(FadeStep::Send(Cmd::Unsample { restore }));
+                self.fade.push_back(FadeStep::Wait(SWITCH_WAIT));
+                self.fade.push_back(FadeStep::Ramp { to: v, len: FADE_IN });
+            }
+            None => self.fade.push_back(FadeStep::Send(Cmd::Unsample { restore })),
+        }
+        self.poll_soon();
+    }
+
+    /// Runs the fade steps that are due. True if the volume changed.
+    fn run_fade(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(step) = self.fade.front() {
+            let volume = self.volume().unwrap_or(0);
+            let (start, from) = *self.fade_at.get_or_insert((Instant::now(), volume));
+            let done = match step {
+                FadeStep::Send(_) => true,
+                FadeStep::Wait(len) => start.elapsed() >= *len,
+                FadeStep::Ramp { to, len } => {
+                    let t = (start.elapsed().as_secs_f32() / len.as_secs_f32().max(0.001)).min(1.0);
+                    // Ease in and out: it starts and ends gently.
+                    let eased = t * t * (3.0 - 2.0 * t);
+                    let v = (from as f32 + (*to as f32 - from as f32) * eased).round() as u8;
+                    if Some(v) != self.volume() {
+                        self.set_volume(v);
+                        changed = true;
+                    }
+                    t >= 1.0
+                }
+            };
+            if !done {
+                break;
+            }
+            self.fade_at = None;
+            if let Some(FadeStep::Send(cmd)) = self.fade.pop_front() {
+                self.send(cmd);
+            }
+        }
+        changed
     }
 
     /// Opens the Randomize page of `genre` (or goes to it) and rolls it.
@@ -2130,8 +2436,10 @@ impl App {
         let step = |c: usize| (c as isize + delta).rem_euclid(len as isize) as usize;
         if let Some(m) = self.menu.as_mut() {
             m.cursor = step(m.cursor);
-            if let Some((_, _, Action::Theme(name))) = m.items.get(m.cursor).cloned() {
-                self.try_theme(&name, false);
+            match m.items.get(m.cursor).cloned() {
+                Some((_, _, Action::Theme(name))) => self.try_theme(&name, false),
+                Some((_, _, Action::SideFx(fx))) => self.set_side_fx(fx),
+                _ => {}
             }
         } else if let Some(p) = self.picker.as_mut() {
             p.cursor = step(p.cursor.min(len - 1));
@@ -2646,6 +2954,34 @@ impl App {
             return;
         }
         // Pop-ups take the mouse while they are open; a click outside closes them.
+        if self.genre_picker.is_some() {
+            let genres = std::mem::take(&mut self.genre_list);
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    match self.hits.popup_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i) {
+                        Some(i) => self.genre_choose(&genres, i),
+                        None if !self.hits.popup.contains(pos) => {
+                            self.genre_picker = None;
+                            self.stop_sample();
+                        }
+                        None => {}
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(p) = self.genre_picker.as_mut() {
+                        p.move_by(&genres, 3);
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Some(p) = self.genre_picker.as_mut() {
+                        p.move_by(&genres, -3);
+                    }
+                }
+                _ => {}
+            }
+            self.genre_list = genres;
+            return;
+        }
         if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.palette.is_some() || self.undo.is_some() {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -2856,7 +3192,17 @@ impl App {
                 KeyCode::Char('p') if ctrl => self.move_palette(-1),
                 KeyCode::Backspace => {
                     if let Some(p) = self.palette.as_mut() {
-                        p.query.pop();
+                        if is_ctrl_backspace(&key) {
+                            delete_word(&mut p.query);
+                        } else {
+                            p.query.pop();
+                        }
+                        p.cursor = 0;
+                    }
+                }
+                _ if is_ctrl_backspace(&key) => {
+                    if let Some(p) = self.palette.as_mut() {
+                        delete_word(&mut p.query);
                         p.cursor = 0;
                     }
                 }
@@ -2870,22 +3216,8 @@ impl App {
             }
             return;
         }
-        if let Some(text) = self.genre_prompt.as_mut() {
-            match key.code {
-                KeyCode::Esc => self.genre_prompt = None,
-                KeyCode::Enter => {
-                    let genre = text.trim().to_lowercase();
-                    self.genre_prompt = None;
-                    if !genre.is_empty() {
-                        self.randomize(genre);
-                    }
-                }
-                KeyCode::Backspace => {
-                    text.pop();
-                }
-                KeyCode::Char(c) if !ctrl => text.push(c),
-                _ => {}
-            }
+        if self.genre_picker.is_some() {
+            self.genre_key(key);
             return;
         }
         if self.picker.is_some() {
@@ -2898,7 +3230,17 @@ impl App {
                 KeyCode::Char('p') if ctrl => self.move_popup(-1),
                 KeyCode::Backspace => {
                     if let Some(p) = self.picker.as_mut() {
-                        p.query.pop();
+                        if is_ctrl_backspace(&key) {
+                            delete_word(&mut p.query);
+                        } else {
+                            p.query.pop();
+                        }
+                        p.cursor = 0;
+                    }
+                }
+                _ if is_ctrl_backspace(&key) => {
+                    if let Some(p) = self.picker.as_mut() {
+                        delete_word(&mut p.query);
                         p.cursor = 0;
                     }
                 }
@@ -2919,6 +3261,7 @@ impl App {
                     self.close_menu()
                 }
                 KeyCode::Char('T') if self.menu.as_ref().is_some_and(Menu::is_theme) => self.close_menu(),
+                KeyCode::Char('V') if self.side_fx_before.is_some() => self.close_menu(),
                 KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') => self.run_menu(),
                 KeyCode::Down | KeyCode::Char('j') => self.move_popup(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_popup(-1),
@@ -2953,6 +3296,11 @@ impl App {
                 }
                 KeyCode::Down => self.typing = false,
                 KeyCode::Enter => self.submit_search(),
+                // Ctrl+Backspace (and Alt+Backspace, Ctrl+W): the last word.
+                _ if is_ctrl_backspace(&key) => {
+                    delete_word(&mut self.query);
+                    self.search_due = Some(Instant::now() + SEARCH_DELAY);
+                }
                 KeyCode::Backspace => {
                     self.query.pop();
                     self.search_due = Some(Instant::now() + SEARCH_DELAY);
@@ -2975,6 +3323,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('v') => {
                 self.viz_on = !self.viz_on;
+                self.viz_at = Some(Instant::now());
                 self.info(if self.viz_on { "Visualizer on" } else { "Visualizer off" });
             }
             KeyCode::Char('Q') => {
@@ -3090,6 +3439,15 @@ impl App {
 
 /// Ctrl+Backspace, as terminals send it: ^H (most, ghostty too), ^W (some), or Backspace with
 /// Ctrl or Alt (kitty keyboard protocol, or Alt as a fallback).
+/// Deletes the last word of `text`, and the spaces after it (as Ctrl+Backspace does in most
+/// text boxes). Punctuation counts as part of the word.
+pub fn delete_word(text: &mut String) {
+    let trimmed = text.trim_end().len();
+    text.truncate(trimmed);
+    let start = text.rfind(char::is_whitespace).map_or(0, |i| i + text[i..].chars().next().map_or(1, char::len_utf8));
+    text.truncate(start);
+}
+
 fn is_ctrl_backspace(key: &KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
@@ -3308,6 +3666,10 @@ impl App {
             }
             KeyCode::Char('>') => {
                 self.show_side(SideView::Library);
+                return true;
+            }
+            KeyCode::Char('V') => {
+                self.open_side_fx();
                 return true;
             }
             _ => {}
@@ -3724,6 +4086,87 @@ mod tests {
         app.typing = true;
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
         assert!(app.undo.is_none());
+    }
+
+    #[test]
+    fn tab_samples_a_genre_then_goes_back_to_the_song() {
+        let (mut app, rx) = test_app();
+        app.on_msg(playing_in("spotify:playlist:p1"));
+        app.on_key(KeyEvent::from(KeyCode::Char('z')));
+        drain(&rx);
+        // Tab on the first quick pick: pop, its top song, at the volume playing now.
+        // Runs the fade to its end (each step as if its time were up), with the commands it sends.
+        let fade = |app: &mut App| -> Vec<Cmd> {
+            let mut out = Vec::new();
+            for _ in 0..10 {
+                if let Some((_, v)) = app.fade_at {
+                    app.fade_at = Some((Instant::now() - Duration::from_secs(60), v));
+                }
+                app.tick();
+                out.extend(drain(&rx).into_iter().filter(|c| !matches!(c, Cmd::Volume(_) | Cmd::Poll)));
+            }
+            out
+        };
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert!(drain(&rx).is_empty(), "the music fades out first");
+        let cmds = fade(&mut app);
+        assert!(matches!(cmds.as_slice(), [Cmd::Sample { genre, nth: 0 }] if genre == "pop"), "{cmds:?}");
+        assert_eq!(app.volume(), Some(5), "quiet for the switch");
+        // Tab again: the next song of the genre.
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(fade(&mut app).as_slice(), [Cmd::Sample { nth: 1, .. }]));
+        app.on_msg(Msg::Sampling { genre: "pop".into(), result: Ok(track(7)) });
+        assert!(app.sample.as_ref().is_some_and(|s| s.started.is_some()));
+        fade(&mut app);
+        assert_eq!(app.volume(), Some(50), "faded in after the switch");
+        // Ten seconds later it ends: back to the playlist, at the song and place it was.
+        app.sample.as_mut().unwrap().started = Some(Instant::now() - SAMPLE_LEN);
+        let cmds = fade(&mut app);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::Unsample { restore: Some(r) }
+                if r.context.as_deref() == Some("spotify:playlist:p1") && r.track == "spotify:track:x" && r.position_ms >= 30_000 && r.playing)),
+            "{cmds:?}"
+        );
+        assert_eq!(app.volume(), Some(50), "and back at its volume");
+        assert!(app.sample.is_none() && app.genre_picker.is_some(), "the picker stays open");
+        // Esc while a sample plays stops only the sample; Esc again closes the picker.
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.sample.is_none() && app.genre_picker.is_some());
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.genre_picker.is_none());
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_a_word_in_the_search() {
+        let mut t = String::from("daft punk  one more ");
+        delete_word(&mut t);
+        assert_eq!(t, "daft punk  one ");
+        delete_word(&mut t);
+        assert_eq!(t, "daft punk  ");
+        delete_word(&mut t);
+        assert_eq!(t, "daft ");
+        delete_word(&mut t);
+        assert_eq!(t, "");
+        delete_word(&mut t);
+        assert_eq!(t, "");
+        let mut t = String::from("Björk Jóga");
+        delete_word(&mut t);
+        assert_eq!(t, "Björk ");
+
+        let (mut app, _rx) = test_app();
+        app.switch_tab(Tab::Search);
+        app.typing = true;
+        app.query = "aphex twin xtal".into();
+        // As kitty's keyboard protocol sends it, and as ghostty sends it (^H).
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(app.query, "aphex twin ");
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(app.query, "aphex ");
+        assert!(app.undo.is_none() && app.typing, "the undo tree stays shut");
+        // A plain Backspace still deletes one letter.
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.query, "aphex");
     }
 
     #[test]
@@ -4177,11 +4620,15 @@ mod tests {
     #[test]
     fn randomize_picks_a_genre_then_fills_a_page() {
         let (mut app, rx) = test_app();
-        app.on_msg(Msg::Genres { artist: "Slowdive".into(), result: Ok(vec!["shoegaze".into(), "dream pop".into()]) });
-        let menu = app.menu.as_ref().expect("a genre menu");
-        assert_eq!(menu.items.len(), 3, "two genres and \"type another\"");
+        // z opens the picker; typing searches it.
+        app.on_key(KeyEvent::from(KeyCode::Char('z')));
+        assert!(app.genre_picker.is_some());
+        for c in "shoeg".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
         drain(&rx);
         app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.genre_picker.is_none());
         assert_eq!(app.view(), View::Random);
         assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Randomize(g) if g == "shoegaze")));
         app.on_msg(Msg::Random { genre: "shoegaze".into(), result: Ok((0..50).map(track).collect()) });
@@ -4475,6 +4922,22 @@ mod tests {
         assert_eq!(uris(&app), ["spotify:track:9"]);
         let Some(Page::Radio(r)) = app.page() else { panic!() };
         assert_eq!(r.round, 2);
+
+        // A restart keeps discover: the same round and songs once the radio loads again.
+        let saved: crate::state::State = serde_json::from_str(&serde_json::to_string(&app.saved_state()).unwrap()).unwrap();
+        let (mut again, _rx2) = test_app();
+        again.restore(saved);
+        again.on_msg(Msg::Library(Library {
+            tracks: ["spotify:track:1".to_owned()].into(),
+            artists: ["spotify:artist:liked".to_owned()].into(),
+            ..Default::default()
+        }));
+        let radio = vec![rt("1", "x"), rt("2", "liked"), rt("3", "ar1"), rt("4", "y"), rt("5", "z")];
+        again.on_msg(Msg::Radio { seed: "spotify:track:s".into(), result: Ok((rt("s", "ar1"), radio)) });
+        let Some(Page::Radio(r)) = again.page() else { panic!("the radio page is back") };
+        assert!(r.filters.discover);
+        assert_eq!(r.round, 2);
+        assert_eq!(uris(&again), ["spotify:track:9"]);
 
         // Reset goes back to the plain radio.
         app.on_key(KeyEvent::from(KeyCode::Char('F')));

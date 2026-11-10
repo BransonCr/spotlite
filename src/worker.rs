@@ -4,7 +4,7 @@ use crate::api::{Album, ApiError, Artist, Found, Page, Play, Playback, Playlist,
 use crate::radio::{Library, RadioTrack};
 use anyhow::{anyhow, Result};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -66,8 +66,11 @@ pub enum Cmd {
     /// Every Liked Songs track and artist, for the radio filters.
     Library,
     AddToPlaylist { playlist_id: String, playlist: String, uris: Vec<String>, what: String },
-    /// The genres of an artist (MusicBrainz, on its own thread), for Randomize.
-    Genres { artists: Vec<(String, String)> },
+    /// Plays a genre's `nth` most popular song (0: the top one), from 20% in. The app fades
+    /// the volume around it.
+    Sample { genre: String, nth: usize },
+    /// Ends a sample: plays what played before at its place (or pauses).
+    Unsample { restore: Option<Restore> },
     /// 50 random songs of a genre.
     Randomize(String),
     RemoveFromPlaylist { playlist_id: String, playlist: String, uri: String, what: String },
@@ -107,8 +110,9 @@ pub enum Msg {
     UpNext(Option<Track>),
     /// A true shuffle started: these songs play for `context`.
     Shuffled { context: String, uris: Vec<String> },
-    Genres { artist: String, result: Result<Vec<String>, String> },
     Random { genre: String, result: Result<Vec<Track>, String> },
+    /// A sample plays (or could not start).
+    Sampling { genre: String, result: Result<Track, String> },
     /// A playlist was created: the Playlists tab loads again.
     Created,
     /// Sent after every command.
@@ -139,6 +143,8 @@ pub fn spawn(api: Spotify) -> (Sender<Cmd>, Sender<Msg>, Receiver<Msg>) {
         song_searches: SearchCache::default(),
         found_searches: SearchCache::default(),
         me_tried: None,
+        samples: Vec::new(),
+        picked: HashMap::new(),
     };
     thread::Builder::new()
         .name("spotlite-api".into())
@@ -157,6 +163,10 @@ struct Worker {
     found_searches: SearchCache<Found>,
     /// When /me was last asked without an answer (it is asked again at most every 10 min).
     me_tried: Option<Instant>,
+    /// Genres sampled lately, and their songs, most popular first (Tab again is instant).
+    samples: Vec<(String, Vec<Track>)>,
+    /// Prepicked sample songs found so far, by their search (samples.rs).
+    picked: HashMap<String, Track>,
 }
 
 /// First pages of recent searches. Search as you type asks again for a text you had a moment
@@ -201,7 +211,7 @@ impl Worker {
                 // Init ends with the first player state, like a poll.
                 Cmd::Poll | Cmd::Init => Kind::Poll,
                 Cmd::Volume(_) => Kind::Volume,
-                Cmd::Play(_) | Cmd::PlayAt(..) | Cmd::PlayShuffled { .. } | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
+                Cmd::Sample { .. } | Cmd::Unsample { .. } | Cmd::Play(_) | Cmd::PlayAt(..) | Cmd::PlayShuffled { .. } | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
                 _ => Kind::Other,
             };
             let list = match &cmd {
@@ -443,35 +453,34 @@ impl Worker {
                 self.send(Msg::Library(library));
                 Ok(())
             }
-            Cmd::Genres { artists } => {
-                let tx = self.tx.clone();
-                thread::Builder::new().name("spotlite-genres".into()).spawn(move || {
-                    // The first artist MusicBrainz has genres for (a song's guests count too).
-                    // An artist MusicBrainz does not know (or an error) moves on to the next; the
-                    // error shows only when no artist gave an answer.
-                    let mut error = None;
-                    let mut answered = false;
-                    for (uri, name) in &artists {
-                        match crate::genre::of_artist(uri, name) {
-                            Ok(g) if !g.is_empty() => {
-                                let _ = tx.send(Msg::Genres { artist: name.clone(), result: Ok(g) });
-                                return;
-                            }
-                            Ok(_) => answered = true,
-                            Err(e) => error = error.or(Some(format!("{e:#}"))),
-                        }
-                    }
-                    let names = artists.iter().map(|a| a.1.as_str()).collect::<Vec<_>>().join(", ");
-                    let result = match error {
-                        Some(e) if !answered => Err(e),
-                        _ => Ok(Vec::new()),
-                    };
-                    let _ = tx.send(Msg::Genres { artist: names, result });
-                })?;
+            Cmd::Sample { genre, nth } => {
+                let result = self.sample(&genre, nth);
+                let msg = match result {
+                    Ok(track) => Msg::Sampling { genre: genre.clone(), result: Ok(track) },
+                    Err(e) => Msg::Sampling { genre: genre.clone(), result: Err(format!("{e:#}")) },
+                };
+                self.send(msg);
+                // Find the next prepicked song now, so Tab again plays it at once.
+                let _ = self.prepicked(&genre, nth + 1);
                 Ok(())
             }
+            Cmd::Unsample { restore } => match restore {
+                Some(r) => {
+                    let play = match r.context {
+                        Some(uri) => Play::Context { uri, from: Some(r.track) },
+                        None => Play::Tracks { uris: vec![r.track], offset: 0 },
+                    };
+                    self.player(|api, dev| api.play_at(dev, Some(&play), r.position_ms))?;
+                    if !r.playing {
+                        self.player(|api, dev| api.pause(dev))?;
+                    }
+                    Ok(())
+                }
+                None => self.player(|api, dev| api.pause(dev)),
+            },
             Cmd::Randomize(genre) => {
-                let result = crate::genre::random(&mut self.api, &genre).map_err(|e| format!("{e:#}"));
+                let term = crate::genres::term(&genre);
+                let result = crate::genre::random(&mut self.api, &term).map_err(|e| format!("{e:#}"));
                 self.send(Msg::Random { genre, result });
                 Ok(())
             }
@@ -488,6 +497,82 @@ impl Worker {
                 Ok(())
             }
         }
+    }
+
+    /// A genre's songs, most popular first, one per artist (Tab again: the next artist). Search
+    /// does not rank by popularity, so 30 results are ranked by Spotify's own popularity number.
+    fn top_of_genre(&mut self, genre: &str) -> Result<Vec<Track>> {
+        let term = crate::genres::term(genre).replace('"', "");
+        let mut found: Vec<Track> = Vec::new();
+        for offset in [0, 10, 20] {
+            let page = self.api.search_tracks(&format!("genre:\"{term}\""), offset)?;
+            let done = page.raw == 0;
+            found.extend(page.items);
+            if done {
+                break;
+            }
+        }
+        if found.len() < 10 {
+            found.extend(self.api.search_tracks(&term, 0)?.items);
+        }
+        let uris: Vec<String> = found.iter().map(|t| t.uri.clone()).collect();
+        if let Ok(pop) = crate::radio::popularity(&uris) {
+            // Stable: equal popularity keeps Spotify's order.
+            found.sort_by_key(|t| std::cmp::Reverse(pop.get(&t.uri).copied().unwrap_or(0)));
+        }
+        let mut artists = std::collections::HashSet::new();
+        found.retain(|t| artists.insert(t.artists.first().map(|a| a.name.clone()).unwrap_or_default()));
+        Ok(found)
+    }
+
+    /// The genre's `nth` prepicked song (samples.rs), found with one search; None past the
+    /// last one, or when Spotify does not find it.
+    fn prepicked(&mut self, genre: &str, nth: usize) -> Option<Track> {
+        let song = crate::samples::of(genre).into_iter().nth(nth)?;
+        let query = song.query();
+        if let Some(t) = self.picked.get(&query) {
+            return Some(t.clone());
+        }
+        let items = self.api.search_tracks(&query, 0).ok()?.items;
+        let artist = song.artist.to_lowercase();
+        let by = |t: &&Track| t.artists.iter().any(|a| a.name.to_lowercase() == artist);
+        let track = items.iter().find(by).or(items.first())?.clone();
+        self.picked.insert(query, track.clone());
+        Some(track)
+    }
+
+    /// Plays the genre's `nth` sample from 20% in: the prepicked songs first, then the genre's
+    /// most popular songs.
+    fn sample(&mut self, genre: &str, nth: usize) -> Result<Track> {
+        let known = crate::samples::of(genre).len();
+        let track = match self.prepicked(genre, nth) {
+            Some(t) => t,
+            None => self.popular_sample(genre, nth.saturating_sub(known))?,
+        };
+        // 20% in: past the intro, and 10 s from the end at least.
+        let position_ms = (track.duration_ms / 5).min(track.duration_ms.saturating_sub(12_000));
+        let play = Play::Tracks { uris: vec![track.uri.clone()], offset: 0 };
+        self.player(|api, dev| api.play_at(dev, Some(&play), position_ms))?;
+        Ok(track)
+    }
+
+    /// The genre's `nth` most popular song (one per artist).
+    fn popular_sample(&mut self, genre: &str, nth: usize) -> Result<Track> {
+        let found = match self.samples.iter().find(|(g, _)| g == genre) {
+            Some((_, tracks)) => tracks.clone(),
+            None => {
+                let tracks = self.top_of_genre(genre)?;
+                self.samples.push((genre.to_owned(), tracks.clone()));
+                if self.samples.len() > 20 {
+                    self.samples.remove(0);
+                }
+                tracks
+            }
+        };
+        found
+            .get(nth % found.len().max(1))
+            .cloned()
+            .ok_or_else(|| anyhow!("Spotify has no songs in the genre “{genre}”."))
     }
 
     /// Every song of a context, in its order.
@@ -640,6 +725,15 @@ impl Worker {
         }
         Ok(())
     }
+}
+
+/// What played before a sample, to go back to.
+#[derive(Debug, Clone)]
+pub struct Restore {
+    pub context: Option<String>,
+    pub track: String,
+    pub position_ms: u64,
+    pub playing: bool,
 }
 
 /// Songs Spotify takes in one play request (a random sample of a longer list).

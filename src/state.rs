@@ -25,6 +25,9 @@ pub struct State {
     pub search_kind: Option<crate::app::SearchKind>,
     #[serde(default)]
     pub viz_on: bool,
+    /// The effect over the sidebar's song (V).
+    #[serde(default)]
+    pub side_fx: crate::sidebar::SideFx,
     #[serde(default)]
     pub playback: Option<SavedPlayback>,
     #[serde(default)]
@@ -56,13 +59,28 @@ pub struct SavedPlayback {
     pub volume: Option<u8>,
 }
 
+/// A radio page's filters and discover rounds (the radio itself loads again from Spotify).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedRadio {
+    pub filters: crate::radio::Filters,
+    pub extra: Vec<crate::radio::RadioTrack>,
+    pub seen: Vec<String>,
+    pub rank: std::collections::HashMap<String, u32>,
+    pub round: u32,
+}
+
 /// An open page, with what is needed to load it again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SavedTab {
     Artist { id: String, name: String },
     Album { album: Album },
-    Radio { seed: Track },
+    Radio {
+        seed: Track,
+        /// The filters and the discover rounds, so a restart shows the same list.
+        #[serde(default)]
+        tuned: Option<Box<SavedRadio>>,
+    },
     Random { genre: String },
 }
 

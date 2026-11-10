@@ -10,7 +10,7 @@
 //! Discover mode goes further: it hides everything near your Liked Songs, pulls in the radios of
 //! a few songs it found, and shuffles. Each new round drops the songs of the round before.
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RadioTrack {
     pub uri: String,
     pub name: String,
@@ -55,14 +55,14 @@ impl RadioTrack {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Era {
     Any,
     /// Within 10 years of the seed's release year.
     NearSeed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Fame {
     Any,
     /// Popularity 55 and up.
@@ -72,7 +72,8 @@ pub enum Fame {
 }
 
 /// Which radio tracks to keep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Filters {
     /// Leave out songs that are already in Liked Songs.
     pub new_only: bool,
@@ -307,6 +308,21 @@ pub fn artist_seed(uri: &str) -> RadioTrack {
 #[cfg(not(feature = "client"))]
 pub fn fetch(_seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
     anyhow::bail!("song radio needs the `client` feature")
+}
+
+/// Popularity (0-100) of each track, from Spotify's client metadata in one request: the Web
+/// API no longer gives it. Blocks.
+#[cfg(feature = "client")]
+pub fn popularity(uris: &[String]) -> anyhow::Result<std::collections::HashMap<String, u8>> {
+    let (rt, session) = crate::client::connect()?;
+    let meta = rt.block_on(metadata(&session, uris));
+    session.shutdown();
+    Ok(meta?.into_iter().map(|t| (t.uri, t.popularity)).collect())
+}
+
+#[cfg(not(feature = "client"))]
+pub fn popularity(_uris: &[String]) -> anyhow::Result<std::collections::HashMap<String, u8>> {
+    anyhow::bail!("needs the `client` feature")
 }
 
 /// Track metadata for many URIs in one request, in the same order (unknown ones dropped).

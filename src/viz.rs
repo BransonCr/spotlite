@@ -45,6 +45,55 @@ impl Default for Frame {
     }
 }
 
+/// Peak markers for the side visualizer: each jumps to its band's level, rests a moment, then
+/// falls with gravity, so the caps hang over the bars and drop back.
+#[derive(Clone)]
+pub struct Peaks {
+    pub level: [f32; BANDS],
+    /// Seconds each peak still rests before it falls.
+    hold: [f32; BANDS],
+    /// Fall speed of each peak, in levels per second.
+    speed: [f32; BANDS],
+    at: Option<Instant>,
+}
+
+impl Default for Peaks {
+    fn default() -> Self {
+        Peaks { level: [0.0; BANDS], hold: [0.0; BANDS], speed: [0.0; BANDS], at: None }
+    }
+}
+
+/// A peak rests this long at its top.
+const PEAK_HOLD: f32 = 0.35;
+/// Gravity on a falling peak, in levels per second per second.
+const PEAK_GRAVITY: f32 = 2.4;
+
+impl Peaks {
+    /// Moves the peaks on to now, from the bands of `frame`.
+    pub fn update(&mut self, frame: &Frame) {
+        let now = Instant::now();
+        let dt = self.at.map_or(0.0, |t| (now - t).as_secs_f32()).min(0.1);
+        self.at = Some(now);
+        self.step(frame, dt);
+    }
+
+    fn step(&mut self, frame: &Frame, dt: f32) {
+        for b in 0..BANDS {
+            let l = frame.levels[b];
+            if l >= self.level[b] {
+                self.level[b] = l;
+                self.hold[b] = PEAK_HOLD;
+                self.speed[b] = 0.0;
+            } else if self.hold[b] > 0.0 {
+                self.hold[b] -= dt;
+            } else {
+                self.speed[b] += PEAK_GRAVITY * dt;
+                self.level[b] = (self.level[b] - self.speed[b] * dt).max(l);
+            }
+        }
+    }
+}
+
 pub struct Visualizer {
     frame: Arc<Mutex<Frame>>,
     stop: Arc<AtomicBool>,
@@ -296,6 +345,30 @@ mod tests {
             f = a.push(std::iter::repeat_n(0.0, HOP));
         }
         assert!(f.levels[band] < before, "falls on silence");
+    }
+
+    #[test]
+    fn peaks_rest_then_fall_with_gravity() {
+        let mut p = Peaks::default();
+        let mut f = Frame::default();
+        f.levels[3] = 0.8;
+        p.step(&f, 0.0);
+        f.levels[3] = 0.1;
+        p.step(&f, 0.2);
+        assert_eq!(p.level[3], 0.8, "rests");
+        p.step(&f, 0.2);
+        let mut before = p.level[3];
+        let mut drops = Vec::new();
+        for _ in 0..10 {
+            p.step(&f, 0.05);
+            drops.push(before - p.level[3]);
+            before = p.level[3];
+        }
+        assert!(drops[3] > drops[1], "falls faster and faster: {drops:?}");
+        for _ in 0..40 {
+            p.step(&f, 0.05);
+        }
+        assert_eq!(p.level[3], 0.1, "never under the bar");
     }
 
     #[test]

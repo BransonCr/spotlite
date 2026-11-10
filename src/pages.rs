@@ -261,6 +261,33 @@ impl RadioPage {
         self.refilter(library);
     }
 
+    /// What a restart needs to show the same list: None for a plain radio with no filters.
+    pub fn saved(&self) -> Option<Box<crate::state::SavedRadio>> {
+        if self.filters == Filters::default() && self.round == 0 {
+            return None;
+        }
+        Some(Box::new(crate::state::SavedRadio {
+            filters: self.filters,
+            extra: self.extra.clone(),
+            seen: self.seen.iter().cloned().collect(),
+            rank: self.rank.clone(),
+            round: self.round,
+        }))
+    }
+
+    /// A radio page from a restart: its filters and rounds come back; it loads again.
+    pub fn restored(seed: Track, tuned: Option<Box<crate::state::SavedRadio>>) -> Self {
+        let mut page = RadioPage::new(seed);
+        if let Some(t) = tuned {
+            page.filters = t.filters;
+            page.extra = t.extra;
+            page.seen = t.seen.into_iter().collect();
+            page.rank = t.rank;
+            page.round = t.round;
+        }
+        page
+    }
+
     /// Ends discover mode: back to the plain radio.
     pub fn stop_discover(&mut self) {
         self.filters.discover = false;

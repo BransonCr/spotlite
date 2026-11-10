@@ -1,111 +1,22 @@
 //! Randomize: 50 songs picked at random inside one genre, not by your taste.
 //!
-//! The Web API no longer gives an artist's genres, so they come from MusicBrainz (free, no key,
-//! one request a second). The songs come from Spotify's search with a `genre:"…"` filter: it
-//! reaches up to 1000 songs deep. spotlite finds how deep the genre goes, reads pages at random
+//! You pick the genre (genres.rs: quick picks, a search, a folder tree). The songs come from
+//! Spotify's search with a `genre:"…"` filter: it reaches up to 1000 songs deep. spotlite finds how deep the genre goes, reads pages at random
 //! places in it, takes a few songs from each at random, and shuffles them.
 
 use crate::api::{Page, Spotify, Track, SEARCH_PAGE};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use rand::seq::SliceRandom;
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 /// Songs in one randomize.
 pub const WANT: usize = 50;
 /// At most this many songs of one artist.
 const PER_ARTIST: usize = 2;
 /// At most this many search requests for one randomize.
-const MAX_REQUESTS: usize = 30;
+const MAX_REQUESTS: usize = 40;
 /// Spotify's search does not go past this offset.
 const DEEPEST: usize = 990;
-/// Genres shown for an artist.
-const MAX_GENRES: usize = 8;
-const UA: &str = "spotlite/0.1 (https://github.com/BransonCr/spotlite)";
-const MB: &str = "https://musicbrainz.org/ws/2";
-
-/// The genres of an artist, most voted first (from a copy on disk when there is one).
-pub fn of_artist(artist_uri: &str, name: &str) -> Result<Vec<String>> {
-    let mut cache: HashMap<String, Vec<String>> = crate::store::read("genres.json").unwrap_or_default();
-    if let Some(g) = cache.get(artist_uri).filter(|g| !g.is_empty()) {
-        return Ok(g.clone());
-    }
-    let genres = musicbrainz(name)?;
-    // None now may be some later: MusicBrainz grows.
-    if !genres.is_empty() {
-        cache.insert(artist_uri.to_owned(), genres.clone());
-        crate::store::write("genres.json", &cache);
-    }
-    Ok(genres)
-}
-
-/// The time of the last MusicBrainz request, for all threads: it allows one a second, and
-/// answers 503 to more.
-static LAST_ASK: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-
-/// A MusicBrainz GET, at most one a second; a 503 (too fast, or busy) waits and tries again.
-fn ask(agent: &ureq::Agent, path: &str, query: &[(&str, &str)]) -> Result<Value> {
-    let gap = Duration::from_millis(1100);
-    for attempt in 0..3 {
-        {
-            let mut last = LAST_ASK.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(at) = *last {
-                std::thread::sleep(gap.saturating_sub(at.elapsed()));
-            }
-            *last = Some(std::time::Instant::now());
-        }
-        let mut req = agent.get(&format!("{MB}{path}"));
-        for (k, v) in query {
-            req = req.query(k, v);
-        }
-        match req.call() {
-            Ok(resp) => return Ok(resp.into_json()?),
-            Err(ureq::Error::Status(503, _)) if attempt < 2 => std::thread::sleep(Duration::from_secs(2 << attempt)),
-            Err(ureq::Error::Status(503, _)) => return Err(anyhow!("MusicBrainz is busy; try again in a minute")),
-            Err(e) => return Err(e).context("asking MusicBrainz"),
-        }
-    }
-    unreachable!()
-}
-
-fn musicbrainz(name: &str) -> Result<Vec<String>> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).user_agent(UA).build();
-    let query = format!("artist:\"{}\"", name.replace('"', ""));
-    let found = ask(&agent, "/artist/", &[("query", &query), ("limit", "5"), ("fmt", "json")])?;
-    let artists = found["artists"].as_array().cloned().unwrap_or_default();
-    // The same name first (search also finds near names), else the best score.
-    let pick = artists
-        .iter()
-        .find(|a| a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))
-        .or_else(|| artists.first())
-        .ok_or_else(|| anyhow!("MusicBrainz does not know {name}"))?;
-    let id = pick["id"].as_str().ok_or_else(|| anyhow!("MusicBrainz gave no id for {name}"))?;
-    let artist = ask(&agent, &format!("/artist/{id}"), &[("inc", "genres+tags"), ("fmt", "json")])?;
-    let mut genres = ranked(&artist["genres"]);
-    if genres.is_empty() {
-        genres = ranked(&artist["tags"]);
-    }
-    if genres.is_empty() {
-        genres = ranked(&pick["tags"]);
-    }
-    genres.truncate(MAX_GENRES);
-    Ok(genres)
-}
-
-/// Names of a MusicBrainz genre or tag list, most votes first; ones nobody voted for go.
-fn ranked(list: &Value) -> Vec<String> {
-    let mut items: Vec<(i64, String)> = list
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|g| Some((g["count"].as_i64().unwrap_or(0), g["name"].as_str()?.to_lowercase())))
-        .filter(|(n, _)| *n > 0)
-        .collect();
-    items.sort_by_key(|g| std::cmp::Reverse(g.0));
-    let mut seen = HashSet::new();
-    items.into_iter().map(|(_, n)| n).filter(|n| seen.insert(n.clone())).collect()
-}
 
 /// Search pages, so the pick can be tested without Spotify.
 pub trait Search {
@@ -118,19 +29,52 @@ impl Search for Spotify {
     }
 }
 
-/// `WANT` songs at random from the genre (fewer if it has fewer), in random order.
+/// `WANT` songs at random from the genre (fewer if Spotify has fewer), in random order.
+///
+/// First the songs Spotify tags with the genre (`genre:"…"`). Spotify tags few songs with many
+/// sub-genres (synthwave, hardstyle, dream pop: under 50), so the rest come from a text search
+/// for the genre's name, which reaches 1000 songs deep.
 pub fn random(api: &mut impl Search, genre: &str) -> Result<Vec<Track>> {
-    let query = format!("genre:\"{}\"", genre.replace('"', ""));
+    let name = genre.replace('"', "");
+    let mut pick = Pick::default();
     let mut rng = rand::thread_rng();
-    let mut requests = 0;
-    // How deep the genre goes: `total` is not to be trusted, so look for the last full page.
+    let tagged = sample(api, &format!("genre:\"{name}\""), &mut pick, &mut rng);
+    if pick.picked.len() < WANT {
+        let named = sample(api, &name, &mut pick, &mut rng);
+        if pick.picked.is_empty() {
+            tagged.and(named)?;
+        }
+    } else {
+        tagged?;
+    }
+    let mut picked = pick.picked;
+    picked.truncate(WANT);
+    picked.shuffle(&mut rng);
+    if picked.is_empty() {
+        return Err(anyhow!("Spotify has no songs in the genre “{genre}”."));
+    }
+    Ok(picked)
+}
+
+/// The songs picked so far, and what is spent.
+#[derive(Default)]
+struct Pick {
+    picked: Vec<Track>,
+    seen: HashSet<String>,
+    by_artist: HashMap<String, usize>,
+    requests: usize,
+}
+
+/// Adds songs at random from one search to `pick`, until it has `WANT` or the requests run out.
+fn sample(api: &mut impl Search, query: &str, pick: &mut Pick, rng: &mut impl rand::Rng) -> Result<()> {
+    // How deep the search goes: `total` is not to be trusted, so look for the last full page.
     let mut pages: HashMap<usize, Vec<Track>> = HashMap::new();
     // The deepest page with songs (`lo`) and the first one past the end (`hi`).
     let mut lo = None;
     let mut hi = DEEPEST + SEARCH_PAGE;
     for probe in [DEEPEST, 490, 240, 90, 40, 0] {
-        let page = api.search_page(&query, probe)?;
-        requests += 1;
+        let page = api.search_page(query, probe)?;
+        pick.requests += 1;
         if page.items.is_empty() {
             hi = probe;
         } else {
@@ -139,14 +83,12 @@ pub fn random(api: &mut impl Search, genre: &str) -> Result<Vec<Track>> {
             break;
         }
     }
-    let Some((mut lo, mut lo_raw)) = lo else {
-        return Err(anyhow!("Spotify has no songs in the genre “{genre}”."));
-    };
+    let Some((mut lo, mut lo_raw)) = lo else { return Ok(()) };
     // Halve the gap between them.
-    while hi - lo > SEARCH_PAGE {
+    while hi - lo > SEARCH_PAGE && pick.requests < MAX_REQUESTS {
         let mid = (lo + hi) / 2 / SEARCH_PAGE * SEARCH_PAGE;
-        let page = api.search_page(&query, mid)?;
-        requests += 1;
+        let page = api.search_page(query, mid)?;
+        pick.requests += 1;
         if page.items.is_empty() {
             hi = mid;
         } else {
@@ -158,65 +100,52 @@ pub fn random(api: &mut impl Search, genre: &str) -> Result<Vec<Track>> {
     let depth = lo + lo_raw;
     let starts: Vec<usize> = (0..depth).step_by(SEARCH_PAGE).collect();
     let mut order = starts.clone();
-    order.shuffle(&mut rng);
-    // A small genre: read all of it. A big one: a few songs from each of many random pages,
-    // so the songs come from all through the genre, not from a few places.
-    let all = starts.len() <= MAX_REQUESTS - requests;
-    let per_page = if all { SEARCH_PAGE } else { 3 };
-    let mut picked: Vec<Track> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut by_artist: HashMap<String, usize> = HashMap::new();
+    order.shuffle(rng);
+    // A small pool: read all of it. A big one: a few songs from each of many random pages,
+    // so the songs come from all through it, not from a few places.
+    let all = starts.len() <= MAX_REQUESTS.saturating_sub(pick.requests);
     let mut pool: Vec<Track> = Vec::new();
     for start in order {
-        if !all && picked.len() >= WANT {
+        if !all && pick.picked.len() >= WANT {
             break;
         }
-        let items = match pages.remove(&start) {
+        let mut items = match pages.remove(&start) {
             Some(items) => items,
-            None if requests < MAX_REQUESTS => {
-                requests += 1;
-                match api.search_page(&query, start) {
+            None if pick.requests < MAX_REQUESTS => {
+                pick.requests += 1;
+                match api.search_page(query, start) {
                     Ok(page) => page.items,
-                    Err(e) if picked.is_empty() && pool.is_empty() => return Err(e),
                     Err(_) => break,
                 }
             }
             None => break,
         };
-        let mut items = items;
-        items.shuffle(&mut rng);
+        items.shuffle(rng);
         if all {
             pool.extend(items);
             continue;
         }
         let mut took = 0;
         for t in items {
-            if took >= per_page {
+            if took >= 3 {
                 break;
             }
-            if take(&t, &mut seen, &mut by_artist) {
-                picked.push(t);
+            if take(&t, &mut pick.seen, &mut pick.by_artist) {
+                pick.picked.push(t);
                 took += 1;
             }
         }
     }
-    if all {
-        pool.shuffle(&mut rng);
-        for t in pool {
-            if picked.len() >= WANT {
-                break;
-            }
-            if take(&t, &mut seen, &mut by_artist) {
-                picked.push(t);
-            }
+    pool.shuffle(rng);
+    for t in pool {
+        if pick.picked.len() >= WANT {
+            break;
+        }
+        if take(&t, &mut pick.seen, &mut pick.by_artist) {
+            pick.picked.push(t);
         }
     }
-    picked.truncate(WANT);
-    picked.shuffle(&mut rng);
-    if picked.is_empty() {
-        return Err(anyhow!("Spotify has no songs in the genre “{genre}”."));
-    }
-    Ok(picked)
+    Ok(())
 }
 
 /// True if `t` may join: a song not taken yet, by an artist not taken too often.
@@ -239,18 +168,22 @@ fn take(t: &Track, seen: &mut HashSet<String>, by_artist: &mut HashMap<String, u
 mod tests {
     use super::*;
 
-    /// A genre of `size` songs; each artist has 3 songs.
+    /// `tagged` songs tagged with the genre and `named` more found by its name; 3 songs per artist.
     struct Fake {
-        size: usize,
-        asked: Vec<usize>,
+        tagged: usize,
+        named: usize,
+        asked: Vec<(bool, usize)>,
     }
 
     impl Search for Fake {
         fn search_page(&mut self, query: &str, offset: usize) -> Result<Page<Track>> {
-            assert_eq!(query, "genre:\"shoegaze\"");
-            self.asked.push(offset);
-            let items: Vec<Track> = (offset..self.size.min(offset + SEARCH_PAGE))
+            let by_tag = query == "genre:\"shoegaze\"";
+            assert!(by_tag || query == "shoegaze", "{query}");
+            self.asked.push((by_tag, offset));
+            let (size, base) = if by_tag { (self.tagged, 0) } else { (self.named, 100_000) };
+            let items: Vec<Track> = (offset..size.min(offset + SEARCH_PAGE))
                 .map(|i| {
+                    let i = i + base;
                     serde_json::from_value(serde_json::json!({
                         "uri": format!("spotify:track:{i}"), "name": format!("song {i}"),
                         "artists": [{ "name": "a", "uri": format!("spotify:artist:{}", i / 3) }],
@@ -263,8 +196,8 @@ mod tests {
         }
     }
 
-    fn check(size: usize) -> (Vec<Track>, Vec<usize>) {
-        let mut api = Fake { size, asked: Vec::new() };
+    fn check(tagged: usize, named: usize) -> (Vec<Track>, Vec<(bool, usize)>) {
+        let mut api = Fake { tagged, named, asked: Vec::new() };
         let songs = random(&mut api, "shoegaze").unwrap();
         let uris: HashSet<_> = songs.iter().map(|t| t.uri.clone()).collect();
         assert_eq!(uris.len(), songs.len(), "no song twice");
@@ -277,32 +210,35 @@ mod tests {
         (songs, api.asked)
     }
 
+    fn number(t: &Track) -> usize {
+        t.uri.trim_start_matches("spotify:track:").parse().unwrap()
+    }
+
     #[test]
-    fn a_deep_genre_gives_50_songs_from_all_through_it() {
-        let (songs, asked) = check(1000);
+    fn a_deep_genre_gives_50_tagged_songs_from_all_through_it() {
+        let (songs, asked) = check(1000, 1000);
         assert_eq!(songs.len(), WANT);
-        let deep = songs.iter().filter(|t| t.uri.trim_start_matches("spotify:track:").parse::<usize>().unwrap() >= 500).count();
-        assert!(deep > 10, "songs from the deep half too: {deep}");
-        assert!(asked.len() >= 17);
+        assert!(songs.iter().all(|t| number(t) < 100_000), "all tagged with the genre");
+        let deep = songs.iter().filter(|t| number(t) >= 500).count();
+        assert!(deep > 5, "songs from the deep half too: {deep}");
+        assert!(asked.iter().all(|(tag, _)| *tag), "no text search needed");
     }
 
     #[test]
-    fn a_small_genre_is_read_whole() {
-        let (songs, asked) = check(36);
-        // 36 songs by 12 artists, 2 each at most.
-        assert_eq!(songs.len(), 24);
-        assert!(asked.contains(&0) && asked.contains(&30));
+    fn a_small_genre_is_filled_up_by_name() {
+        let (songs, asked) = check(36, 1000);
+        assert_eq!(songs.len(), WANT);
+        // 36 tagged songs by 12 artists, 2 each: all 24 are in, the rest found by name.
+        assert_eq!(songs.iter().filter(|t| number(t) < 100_000).count(), 24);
+        assert!(asked.contains(&(true, 0)) && asked.contains(&(true, 30)));
+        assert!(asked.iter().any(|(tag, _)| !tag));
     }
 
     #[test]
-    fn an_empty_genre_is_an_error() {
-        let mut api = Fake { size: 0, asked: Vec::new() };
+    fn a_genre_spotify_does_not_know_is_an_error() {
+        let mut api = Fake { tagged: 0, named: 0, asked: Vec::new() };
         assert!(random(&mut api, "shoegaze").is_err());
-    }
-
-    #[test]
-    fn genres_rank_by_votes() {
-        let v = serde_json::json!([{ "name": "Dream Pop", "count": 3 }, { "name": "shoegaze", "count": 9 }, { "name": "x", "count": 0 }]);
-        assert_eq!(ranked(&v), ["shoegaze", "dream pop"]);
+        let (songs, _) = check(0, 40);
+        assert!(!songs.is_empty(), "by name only");
     }
 }

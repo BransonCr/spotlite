@@ -35,7 +35,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
             add("Discover new music (another round)", "d", key('d'));
             add("Radio filters", "F", key('F'));
             add("Save this radio as a playlist", "S", key('S'));
-            add("Randomize the seed's genre", "z", key('z'));
+            add("Randomize a genre", "z", key('z'));
         }
         View::Random => {
             add("Roll again (50 new random songs)", "d", key('d'));

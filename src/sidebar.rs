@@ -28,6 +28,19 @@ const SWITCH_TIME: Duration = Duration::from_millis(280);
 /// Below this screen width there is no room for the sidebar beside a list.
 pub const MIN_SCREEN: u16 = 90;
 
+/// The effect over the song in the sidebar (V).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SideFx {
+    #[default]
+    Off,
+    /// Small drops of liquid over the panel, one per band of the visualizer, each swelling and
+    /// trembling with its band; each theme has its own.
+    Liquid,
+    /// The spectrum on its side: bars from the left edge.
+    Spectrum,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SideView {
@@ -323,7 +336,27 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, shown: u16) {
     let view = app.sidebar.view;
     match app.sidebar.motion() {
         None => {
-            render(f.buffer_mut(), area, app, view, view.index() as f32, true);
+            let content = render(f.buffer_mut(), area, app, view, view.index() as f32, true);
+            // The sidebar effect (V), over the song, in the cells nothing else uses.
+            let (fx, reveal) = app.side_fx_shown();
+            if view == SideView::Playing && reveal > 0.0 {
+                let frame = app.viz.frame();
+                match fx {
+                    SideFx::Liquid => {
+                        let kind = crate::theme::c().liquid;
+                        // Frozen when the theme turns motion off.
+                        if crate::theme::c().motion {
+                            app.liquid.update(&frame, content.width, content.height, kind);
+                        }
+                        crate::ui::draw_liquid(f.buffer_mut(), content, &app.liquid, kind, reveal);
+                    }
+                    SideFx::Spectrum => {
+                        app.side_peaks.update(&frame);
+                        crate::ui::draw_side_visualizer(f.buffer_mut(), content, &frame, &app.side_peaks, reveal);
+                    }
+                    SideFx::Off => {}
+                }
+            }
             // The hide handle, on the right edge, at the height of the open handle.
             if area.height >= 7 {
                 // In the gap between the sidebar and the list, so the border stays whole.
