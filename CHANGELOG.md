@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Windows and a built-in player
+- Windows support (Windows Terminal), released as snapshots tagged `win-v*` with a zip of
+  `spotlite.exe`. See `README-windows.md` and `docs/windows.md`.
+- Built-in player (`spotlite daemon`): librespot plays the audio, so spotifyd isn't needed.
+  Default on Windows; on Linux use `--features player` and `backend = "builtin"`. It runs in
+  the background, keeps playing after `q` and stops with `Q`. Fast controls, song changes and
+  the visualizer work as with spotifyd, and media keys work through MPRIS on Linux and the
+  media flyout on Windows.
+- The first run asks for the Client ID and writes `config.toml`.
+- New `config.toml` keys: `backend`, `daemon_port`, `nerd_font` (off by default on Windows).
+
 ### Looks
 - The sidebar effect Liquid (`V`) is gone. In its place: Aura, light that comes off the cover
   of the playing song, in the cover's colours, and moves to the music. Each theme has its own

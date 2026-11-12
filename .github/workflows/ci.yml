@@ -19,3 +19,37 @@ jobs:
         run: cargo test --locked
       - name: Build without the client protocol
         run: cargo build --no-default-features --locked
+
+  # The Windows port is a snapshot (see docs/windows.md): these two jobs show when Linux work
+  # has drifted from it, but never fail the run. Fix what they report at the next snapshot.
+  linux-player:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Audio headers (the built-in player's output)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Clippy with the built-in player
+        run: cargo clippy --all-targets --locked --features player -- -D warnings
+      - name: Tests with the built-in player
+        run: cargo test --locked --features player
+
+  windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked

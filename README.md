@@ -10,6 +10,9 @@ A small Spotify client for the terminal. It replaces the official Electron app
 
 `spotlite` is a small Rust binary (~4.3 MB release build).
 
+On Windows, see [README-windows.md](README-windows.md). The Windows build plays audio itself
+and does not need spotifyd.
+
 ## Requirements
 
 - Spotify **Premium**. spotifyd needs it, and since February 2026 every
@@ -103,7 +106,7 @@ selected song, so you do not need to remember the keys below.
 | `v` | Sound visualizer on / off |
 | `R` | Reload the list |
 | `q` | Quit (music keeps playing) |
-| `Q` | Quit and stop spotifyd: nothing keeps running (spotlite starts it again next time) |
+| `Q` | Quit and stop the player (spotifyd): nothing keeps running (spotlite starts it again next time) |
 
 Every key can be changed in `config.toml`, and `spotlite keys` lists the actions with
 their names and keys:
@@ -346,7 +349,8 @@ Set `SPOTLITE_NO_IMAGES=1` to turn pictures off.
 
 ```
 spotlite            terminal UI
-spotlite auth       log in (token in ~/.cache/spotlite/token.json, mode 600)
+spotlite auth       log in (token in ~/.cache/spotlite/token.json, mode 600; also the built-in player)
+spotlite daemon     the built-in player (spotlite starts it by itself)
 spotlite devices    list Spotify Connect devices
 spotlite folders    print your playlist folders
 spotlite theme ...  list, set, copy, make and check themes (see Themes)
@@ -377,6 +381,38 @@ bind = , XF86AudioPlay, exec, playerctl -p spotifyd play-pause
 bind = , XF86AudioNext, exec, playerctl -p spotifyd next
 bind = , XF86AudioPrev, exec, playerctl -p spotifyd previous
 ```
+
+## Built-in player
+
+spotlite can also play audio itself instead of using spotifyd. `spotlite daemon` is a
+librespot Spotify Connect device configured like `contrib/spotifyd.conf`. Windows builds
+always use it; on Linux, build with `--features player` (needs the ALSA headers) and enable it
+in `config.toml`:
+
+```toml
+backend = "builtin"     # "spotifyd" (Linux default) or "builtin" (Windows default)
+# daemon_port = 8899    # local control socket on 127.0.0.1
+```
+
+- spotlite starts the player in the background when needed. `q` leaves it running, `Q` stops
+  it. Only one instance runs at a time.
+- The player logs in once through the browser (`spotlite auth` repeats it). The login is
+  stored in `~/.cache/spotlite/librespot/` and is also used for playlist folders and song radio.
+- Commands, song changes and visualizer audio go over the local socket, about as fast as
+  spotifyd over MPRIS. Connections must present the token in
+  `~/.local/state/spotlite/daemon.token` (mode 600).
+- Media keys work through MPRIS under the name `spotlite` (`playerctl -p spotlite`, waybar
+  `"player": "spotlite"`).
+- Log: `~/.local/state/spotlite/daemon.log`.
+
+## Windows
+
+See [README-windows.md](README-windows.md) for installing and using spotlite on Windows. It
+is also the README inside the release zip.
+
+The Windows build comes from the same code: only `src/platform/` and `src/engine/` differ. It
+is released as occasional snapshots tagged `win-v*`. [docs/windows.md](docs/windows.md)
+explains how snapshots are tested and released.
 
 ## Web API limits (Development Mode, 2026)
 

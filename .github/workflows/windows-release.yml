@@ -1,0 +1,46 @@
+# Builds the Windows snapshot and attaches it to a GitHub Release. Runs for a `win-v*` tag
+# (see docs/windows.md); a manual run builds the zip as a workflow artifact only.
+name: windows-release
+
+on:
+  push:
+    tags: ["win-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Zip
+        shell: pwsh
+        run: |
+          $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "win-dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $zip = "spotlite-$name-x86_64-pc-windows-msvc.zip"
+          New-Item -ItemType Directory -Force dist/spotlite | Out-Null
+          Copy-Item target/release/spotlite.exe dist/spotlite/
+          Copy-Item README-windows.md dist/spotlite/README.md
+          Compress-Archive -Path dist/spotlite -DestinationPath "dist/$zip"
+          "ZIP=dist/$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spotlite-windows
+          path: ${{ env.ZIP }}
+      - name: Release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP" \
+            --title "spotlite $GITHUB_REF_NAME (Windows)" \
+            --notes "Windows snapshot of spotlite. Unzip it and read README.md. What changed: see CHANGELOG.md (Windows snapshots)."

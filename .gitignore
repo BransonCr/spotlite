@@ -1,3 +1,5 @@
 /target
 # personal config copies (the real one is ~/.config/spotlite/config.toml)
 /config.toml
+# Windows test builds (tools/windows-test.sh)
+/dist
