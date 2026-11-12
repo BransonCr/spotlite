@@ -1,3 +1,5 @@
+//! The app state and what changes it: keys, mouse, messages from the API threads, time.
+
 use crate::api::{Album, Found, Page as ApiPage, Play, Playback, Playlist, Track};
 use crate::control::Ctl;
 use crate::folders::Entry;
