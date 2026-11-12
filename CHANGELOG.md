@@ -8,6 +8,8 @@
   form: grooves (amber), stardust (rose-pine), pixels (gruvbox), aurora (nord), ribbons
   (catppuccin), traces (tokyo-night), halftone (mono). The colours fade from one cover to the
   next. The aura draws glyphs only, never over text or between words.
+- The aura fills the whole sidebar pane, to its bottom edge, while music plays. When the
+  music stops it goes back to the cover.
 - Theme key `aura` takes the place of `liquid`. A theme file with `liquid` still loads.
 
 ## 0.2.0

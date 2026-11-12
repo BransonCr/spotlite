@@ -123,6 +123,13 @@ impl Pen<'_> {
         }
     }
 
+    /// 0 in silence, 1 when any music sounds: the forms keep a little light all over the
+    /// panel in a quiet part of a song, and go back to the cover only when the music stops.
+    fn sound(&self) -> f32 {
+        let e = ((self.aura.energy - 0.02) / 0.08).clamp(0.0, 1.0);
+        e * e * (3.0 - 2.0 * e)
+    }
+
     fn free(&self, col: u16, row: u16) -> bool {
         self.clear[row as usize * self.area.width as usize + col as usize]
     }
@@ -136,7 +143,8 @@ impl Pen<'_> {
     /// slowly, and a beat's pulse lights them as it passes.
     fn grooves(&self, buf: &mut Buffer) {
         let g = self.geo;
-        let far = 9.0 + 16.0 * self.aura.energy;
+        // Bright near the cover; with music the rings go on to the far end of the panel.
+        let spread = (1.6 * self.aura.energy).min(0.7).max(0.3 * self.sound());
         let creep = self.aura.time * 0.3;
         let mut dots = Dots::new(self.area);
         for row in 0..self.area.height {
@@ -147,7 +155,7 @@ impl Pen<'_> {
                 let (cx, cy) = (col as f32 + 0.5, row as f32 * 2.0 + 1.0);
                 let d = g.dist(cx, cy);
                 let level = self.frame.at(g.band(cx, cy));
-                let a = ((0.42 + 0.5 * level) * (-d / far).exp() + 0.5 * self.aura.pulse_at(d) * (-d / 24.0).exp()) * self.gate(d);
+                let a = ((0.42 + 0.5 * level) * (-d / 9.0).exp().max(spread) + 0.4 * self.aura.pulse_at(d)) * self.gate(d);
                 if a < 0.06 {
                     continue;
                 }
@@ -177,7 +185,8 @@ impl Pen<'_> {
         let mut dots = Dots::new(self.area);
         let mut stars = Vec::new();
         for m in &self.aura.motes {
-            let fade = (m.age / 0.5).min(1.0) * (1.0 - m.age / m.life).max(0.0).powf(0.6);
+            // Bright for most of its life, so it still shows at the far end of the panel.
+            let fade = (m.age / 0.5).min(1.0) * ((1.0 - m.age / m.life) / 0.25).clamp(0.0, 1.0);
             let a = fade * (0.7 + 0.3 * self.aura.energy + 0.3 * treble) * self.gate(self.geo.dist(m.x, m.y));
             if a < 0.05 {
                 continue;
@@ -216,6 +225,7 @@ impl Pen<'_> {
     fn pixels(&self, buf: &mut Buffer) {
         let g = self.geo;
         let tick = (self.aura.time * 5.0) as u32;
+        let (far, quiet) = (g.far(), self.sound());
         let first = g.x0 as i32;
         for row in 0..self.area.height {
             for col in 0..self.area.width {
@@ -226,7 +236,8 @@ impl Pen<'_> {
                 let (cx, cy) = (col as f32 + 0.5, row as f32 * 2.0 + 1.0);
                 let d = g.dist(cx, cy);
                 let level = self.frame.at(g.band(cx, cy));
-                let reach = 1.6 + level * (4.0 + 12.0 * self.aura.energy) + 4.0 * self.aura.pulse_at(d);
+                // With loud music the loud bands reach the far end of the panel.
+                let reach = (1.6 + level * far * (0.5 + 1.1 * self.aura.energy)).max(far * 0.4 * quiet) + 4.0 * self.aura.pulse_at(d);
                 let end = d + hash(col as u32, row as u32, tick) * 2.2;
                 if end > reach {
                     continue;
@@ -249,7 +260,7 @@ impl Pen<'_> {
         // Thresholds for the dots of a cell, in an ordered pattern: more dots where it is bright.
         const ORDER: [[u8; 4]; 2] = [[0, 6, 1, 7], [4, 2, 5, 3]];
         let g = self.geo;
-        let flow = self.aura.flow;
+        let (flow, quiet) = (self.aura.flow, self.sound());
         let top = (g.y1 + 2.0).min(g.h);
         let (sw, sh) = (self.area.width as usize * 2, self.area.height as usize * 4);
         let sway: Vec<f32> = (0..sh).map(|sy| 1.6 * (sy as f32 * 0.055 + flow * 0.5).sin()).collect();
@@ -257,7 +268,10 @@ impl Pen<'_> {
         for sx in 0..sw {
             let px = (sx as f32 + 0.5) / 2.0;
             let level = self.frame.at(px / g.w);
-            let hem = (top + (g.h - top) * (0.12 + 0.88 * level)) * self.grow;
+            // The curtains hang into the lower panel with any music, and to the bottom where a
+            // band is loud; the hem waves slowly.
+            let least = 0.12 + 0.33 * quiet * (1.0 + 0.25 * (px * 0.35 + flow * 0.4).sin());
+            let hem = (top + (g.h - top) * (least + (1.0 - least) * level)) * self.grow;
             let under = g.has_cover() && px >= g.x0 && px < g.x1;
             for (sy, sway) in sway.iter().enumerate() {
                 let py = (sy as f32 + 0.5) / 2.0;
@@ -359,7 +373,8 @@ impl Pen<'_> {
     /// edge is light and where the band is loud. It has no motion of its own.
     fn halftone(&self, buf: &mut Buffer) {
         let g = self.geo;
-        let far = 4.0 + 14.0 * (0.3 + self.aura.energy);
+        // With loud music the print covers the whole panel.
+        let far = 4.0 + g.far() * (0.1 + 1.8 * self.aura.energy).max(0.55 * self.sound());
         for row in 0..self.area.height {
             for col in 0..self.area.width {
                 if (col + row) % 2 != 0 || !self.free(col, row) {

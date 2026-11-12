@@ -600,6 +600,18 @@ fn every_aura_moves_to_the_music() {
 }
 
 #[test]
+fn every_aura_fills_the_whole_pane() {
+    for (name, kind) in theme::Aura::ALL {
+        let buf = aura_drawn(kind, Some([200, 60, 30]), 12.0, aura_music, 1.0);
+        let drawn = |x: std::ops::Range<u16>, y: std::ops::Range<u16>| y.flat_map(|y| x.clone().map(move |x| (x, y))).filter(|&p| buf[p].symbol() != " ").count();
+        // Below the cover and the text: the lower part of the pane, in four strips.
+        let strips = (0..4).filter(|i| drawn(i * 9..i * 9 + 9, 18..30) >= 3).count();
+        assert!(strips >= 3, "{name}: light across the lower pane: {strips} of 4 strips");
+        assert!(drawn(0..36, 26..30) >= 6, "{name}: light at the bottom of the pane: {}", drawn(0..36, 26..30));
+    }
+}
+
+#[test]
 fn the_aura_has_the_colours_of_the_cover() {
     for (name, kind) in theme::Aura::ALL {
         let sum = |buf: &Buffer| {

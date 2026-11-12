@@ -8,7 +8,7 @@
 //!
 //! This file holds what must be kept between frames: the time, the beat, the cover's colours
 //! (they fade from one cover to the next), and the small parts some forms have (dust, wires).
-//! It is cheap: no fixed step, at most 110 pieces of dust or 3 pulses on each wire, and it runs
+//! It is cheap: no fixed step, at most 220 pieces of dust or 3 pulses on each wire, and it runs
 //! only while the effect shows.
 //!
 //! Space is in cell widths; a cell is about twice as tall as wide, so y is in half rows and
@@ -21,10 +21,12 @@ use ratatui::layout::Rect;
 use std::time::Instant;
 
 /// A pulse lives this long, and runs out from the cover this fast (cell widths per second).
-pub const PULSE_LIFE: f32 = 1.4;
+pub const PULSE_LIFE: f32 = 2.4;
 pub const PULSE_SPEED: f32 = 16.0;
 const MAX_PULSES: usize = 4;
-const MAX_MOTES: usize = 110;
+const MAX_MOTES: usize = 220;
+/// Dust put over the panel when the form starts.
+const SEED_MOTES: usize = 36;
 /// Pulses of light on one wire at a time.
 const MAX_HEADS: usize = 3;
 
@@ -61,6 +63,12 @@ impl Geo {
         let dx = (self.x0 - x).max(x - self.x1).max(0.0);
         let dy = (self.y0 - y).max(y - self.y1).max(0.0);
         dx.hypot(dy)
+    }
+
+    /// The distance from the cover to the corner of the panel farthest from it: how far the
+    /// light must go to fill the panel.
+    pub fn far(&self) -> f32 {
+        [(0.0, 0.0), (self.w, 0.0), (0.0, self.h), (self.w, self.h)].into_iter().map(|(x, y)| self.dist(x, y)).fold(1.0, f32::max)
     }
 
     /// The point of the cover nearest to (x, y), as shares of its width and height: the place
@@ -240,6 +248,19 @@ impl Aura {
             self.kind = Some(kind);
             self.motes.clear();
             self.wires = if kind == Kind::Traces { wires(geo) } else { Vec::new() };
+            if kind == Kind::Stardust {
+                // Dust all over the panel from the start: each piece is put where it would be
+                // some way into its life.
+                for _ in 0..SEED_MOTES {
+                    let Some(mut m) = self.mote() else { break };
+                    m.age = self.random() * m.life * 0.85;
+                    m.x += m.vx * m.age;
+                    m.y += m.vy * m.age;
+                    if m.x >= 0.0 && m.x < geo.w && m.y >= 0.0 && m.y < geo.h {
+                        self.motes.push(m);
+                    }
+                }
+            }
         }
         let mean = frame.levels.iter().sum::<f32>() / BANDS as f32;
         if dt <= 0.0 {
@@ -308,60 +329,73 @@ impl Aura {
         (x >> 8) as f32 / (1u32 << 24) as f32
     }
 
-    /// Stardust: dust leaves the cover's left, bottom and right edges (the top edge is the
-    /// panel's top), more of it when the music is loud, and drifts out; a beat pushes it.
+    /// A new piece of dust on an edge of the cover that has room next to it (left, bottom or
+    /// right; the top edge is the panel's top), on its way out. None if no edge has room.
+    fn mote(&mut self) -> Option<Mote> {
+        let g = self.geo;
+        let room = |free: f32, len: f32| if free >= 2.0 { len } else { 0.0 };
+        let (left, bottom, right) = (room(g.x0, g.y1 - g.y0), room(g.h - g.y1, g.x1 - g.x0), room(g.w - g.x1, g.y1 - g.y0));
+        let at = self.random() * (left + bottom + right);
+        // The place on the edge, and the way out from it.
+        let (x, y, nx, ny) = if !g.has_cover() {
+            let a = (self.random() - 0.5) * 2.4;
+            (g.x0, 0.0, a.sin(), a.cos())
+        } else if left + bottom + right <= 0.0 {
+            return None;
+        } else if at < left {
+            (g.x0 - 0.01, g.y0 + at, -1.0, 0.0)
+        } else if at < left + bottom {
+            (g.x0 + at - left, g.y1, 0.0, 1.0)
+        } else {
+            (g.x1, g.y0 + at - left - bottom, 1.0, 0.0)
+        };
+        let speed = 1.4 + self.random() * 1.8;
+        let side = (self.random() - 0.5) * 1.6;
+        let (u, v) = g.uv(x, y);
+        // It lives long enough to cross the panel.
+        let life = (g.far() / speed * (0.8 + self.random() * 0.6)).clamp(3.0, 40.0);
+        let star = self.random() < 0.1;
+        Some(Mote { x, y, vx: nx * speed - ny * side, vy: ny * speed + nx * side, age: 0.0, life, u, v, star })
+    }
+
+    /// Stardust: dust leaves the cover's edges, more of it when the music is loud and when the
+    /// panel is large, and drifts out to the far end of the panel; a beat pushes it.
     fn dust(&mut self, beat: f32, dt: f32) {
         let g = self.geo;
-        self.owed += (4.0 + 44.0 * self.energy) * dt;
+        self.owed += (0.06 + 0.8 * self.energy) * g.far() * dt;
         while self.owed >= 1.0 {
             self.owed -= 1.0;
-            if self.motes.len() >= MAX_MOTES {
-                continue;
+            if self.motes.len() < MAX_MOTES {
+                if let Some(m) = self.mote() {
+                    self.motes.push(m);
+                }
             }
-            // The edges with room for dust next to them: left, bottom, right.
-            let room = |free: f32, len: f32| if free >= 2.0 { len } else { 0.0 };
-            let (left, bottom, right) = (room(g.x0, g.y1 - g.y0), room(g.h - g.y1, g.x1 - g.x0), room(g.w - g.x1, g.y1 - g.y0));
-            let at = self.random() * (left + bottom + right);
-            // The place on the edge, and the way out from it.
-            let (x, y, nx, ny) = if !g.has_cover() {
-                let a = (self.random() - 0.5) * 2.4;
-                (g.x0, 0.0, a.sin(), a.cos())
-            } else if left + bottom + right <= 0.0 {
-                continue;
-            } else if at < left {
-                (g.x0 - 0.01, g.y0 + at, -1.0, 0.0)
-            } else if at < left + bottom {
-                (g.x0 + at - left, g.y1, 0.0, 1.0)
-            } else {
-                (g.x1, g.y0 + at - left - bottom, 1.0, 0.0)
-            };
-            let speed = 0.9 + self.random() * 1.6;
-            let side = (self.random() - 0.5) * 1.6;
-            let (u, v) = g.uv(x, y);
-            let life = 3.0 + self.random() * 4.0;
-            let star = self.random() < 0.1;
-            self.motes.push(Mote { x, y, vx: nx * speed - ny * side, vy: ny * speed + nx * side, age: 0.0, life, u, v, star });
         }
         let t = self.time;
         for m in &mut self.motes {
             m.age += dt;
             if beat > 0.0 {
-                m.vx *= 1.0 + beat;
-                m.vy *= 1.0 + beat;
+                m.vx *= 1.0 + 0.4 * beat;
+                m.vy *= 1.0 + 0.4 * beat;
             }
             // A slow turn, so the paths curve, and the air slows what a beat pushed.
             m.vx += (t * 0.7 + m.y * 0.21).sin() * 0.7 * dt;
             m.vy += (t * 0.5 + m.x * 0.17).cos() * 0.5 * dt;
             let speed = m.vx.hypot(m.vy);
-            if speed > 2.2 {
-                let slow = 1.0 - (1.2 * dt).min(1.0) * (1.0 - 2.2 / speed);
+            if speed > 3.4 {
+                let slow = 1.0 - (3.0 * dt).min(1.0) * (1.0 - 3.4 / speed);
                 m.vx *= slow;
                 m.vy *= slow;
             }
             m.x += m.vx * dt;
             m.y += m.vy * dt;
+            // The panel's sides turn it back, so it goes on to the far end and is not lost.
+            if (m.x < 0.0 && m.vx < 0.0) || (m.x >= g.w - 0.01 && m.vx > 0.0) {
+                m.vx = -m.vx * 0.6;
+                m.x = m.x.clamp(0.0, g.w - 0.01);
+            }
         }
-        self.motes.retain(|m| m.age < m.life && m.x >= 0.0 && m.x < g.w && m.y >= 0.0 && m.y < g.h);
+        self.motes.retain(|m| m.age < m.life && m.y >= 0.0 && m.y < g.h);
     }
 
     /// Traces: a pulse of light starts down a wire when its band jumps, or on a beat.
@@ -520,6 +554,7 @@ mod tests {
         let none = Geo::new(AREA, None);
         assert!(!none.has_cover());
         assert_eq!(none.dist(18.0, 6.0), 6.0, "without a cover: from the top's middle");
+        assert_eq!(g.far(), 32.0f32.hypot(4.0), "the bottom corners are the farthest");
     }
 
     #[test]
@@ -554,7 +589,7 @@ mod tests {
         run(&mut a, Kind::Grooves, 0.25, |_| loud);
         let d = a.pulses[0].age * PULSE_SPEED;
         assert!(a.pulse_at(d) > 0.3 && a.pulse_at(d + 8.0) < 0.01, "a ring at {d}");
-        run(&mut a, Kind::Grooves, 2.0, |_| Frame::default());
+        run(&mut a, Kind::Grooves, 3.0, |_| Frame::default());
         assert!(a.pulses.is_empty(), "it dies");
         run(&mut a, Kind::Grooves, 20.0, music);
         assert!(a.pulses.len() <= MAX_PULSES && a.energy > 0.3 && a.flow > 0.0);
@@ -563,14 +598,18 @@ mod tests {
     #[test]
     fn dust_leaves_the_cover_with_the_music() {
         let mut a = Aura::default();
-        run(&mut a, Kind::Stardust, 6.0, |_| Frame::default());
-        let quiet = a.motes.len();
-        assert!((1..40).contains(&quiet), "a little dust in silence: {quiet}");
-        run(&mut a, Kind::Stardust, 6.0, music);
-        assert!(a.motes.len() > quiet + 10 && a.motes.len() <= MAX_MOTES, "more with music: {}", a.motes.len());
         let g = geo();
+        a.advance(&Frame::default(), g, Kind::Stardust, 0.0);
+        let low = |a: &Aura| a.motes.iter().filter(|m| m.y > g.h * 0.75).count();
+        assert!(a.motes.len() >= 15 && low(&a) >= 2, "dust over the panel from the start: {} ({} low)", a.motes.len(), low(&a));
+        run(&mut a, Kind::Stardust, 12.0, |_| Frame::default());
+        let quiet = a.motes.len();
+        assert!((5..60).contains(&quiet), "a little dust in silence: {quiet}");
+        run(&mut a, Kind::Stardust, 12.0, music);
+        assert!(a.motes.len() > quiet * 2 && a.motes.len() <= MAX_MOTES, "more with music: {}", a.motes.len());
+        assert!(low(&a) >= 12, "the bottom of the panel has dust: {}", low(&a));
         assert!(a.motes.iter().all(|m| m.x >= 0.0 && m.x < g.w && m.y >= 0.0 && m.y < g.h));
-        assert!(a.motes.iter().any(|m| g.dist(m.x, m.y) > 4.0), "it drifts away from the cover");
+        assert!(a.motes.iter().any(|m| g.dist(m.x, m.y) > g.far() * 0.6), "it drifts to the far end of the panel");
         a.advance(&Frame::default(), g, Kind::Grooves, 0.03);
         assert!(a.motes.is_empty(), "another form has no dust");
     }
@@ -620,7 +659,7 @@ mod tests {
             a.advance(&music(i), geo(), Kind::Stardust, 0.0);
         }
         assert_eq!((a.time, a.flow), (0.0, 0.0));
-        assert!(a.motes.is_empty() && a.pulses.is_empty());
+        assert!(a.pulses.is_empty());
         assert!(a.energy > 0.3, "it still hears the music");
         assert!(a.colour(0.5, 0.5).is_some(), "and has the cover's colours");
     }

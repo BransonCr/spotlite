@@ -282,6 +282,9 @@ sends a pulse out. Each theme has its own form, set with `aura` in the theme fil
 | `traces` | tokyo-night | wires from the cover, with pulses of light on them |
 | `halftone` | mono | a print of dots, larger where the music is loud |
 
+While music plays the light fills the whole pane, to its bottom edge; when the music stops
+it goes back to the cover.
+
 It draws glyphs only, in empty cells and never between two words, so text stays readable
 and the terminal's background shows through. With `motion = false` it does not move in
 time; it follows only the levels of the music. `python3 tools/aura-preview.py` draws
