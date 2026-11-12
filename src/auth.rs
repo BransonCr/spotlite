@@ -48,7 +48,7 @@ impl Token {
     pub fn load() -> Result<Self> {
         let path = token_path();
         let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("no token at {}; run `spotlite auth` first", path.display()))?;
+            .with_context(|| format!("no token at {}; start `spotlite` to log in", path.display()))?;
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -160,40 +160,96 @@ fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
     bail!("callback listener closed")
 }
 
+/// Spotify answered a token request with a refusal (an HTTP status), not silence: the
+/// saved login does not work any more (revoked, or made for another client id).
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 fn token_request(form: &[(&str, &str)]) -> Result<TokenResponse> {
     match ureq::post(TOKEN_URL).send_form(form) {
         Ok(resp) => Ok(resp.into_json()?),
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
-            bail!("token request failed ({code}): {body}")
+            Err(Refused(format!("token request failed ({code}): {body}")).into())
         }
         Err(e) => Err(e.into()),
     }
 }
 
-/// Runs the Authorization Code + PKCE flow and saves the token.
-pub fn login(cfg: &Config) -> Result<Token> {
+/// A browser login that started: the page to open, and the local listener that waits for
+/// Spotify to send the browser back.
+pub struct Pending {
+    pub url: String,
+    listener: TcpListener,
+    verifier: String,
+    state: String,
+}
+
+/// Starts the Authorization Code + PKCE flow: listens for the callback and makes the URL.
+/// Opens nothing.
+pub fn begin(cfg: &Config) -> Result<Pending> {
     let verifier = random_string(64);
     let state = random_string(16);
     let listener = TcpListener::bind(("127.0.0.1", cfg.redirect_port))
         .with_context(|| format!("cannot listen on 127.0.0.1:{}", cfg.redirect_port))?;
-
     let url = authorize_url(cfg, &challenge_for(&verifier), &state);
-    println!("Log in to Spotify in your browser. If it does not open, go to:\n\n{url}\n");
-    let _ = open::that_detached(&url);
+    Ok(Pending { url, listener, verifier, state })
+}
 
-    let code = wait_for_code(&listener, &state)?;
-    let redirect_uri = cfg.redirect_uri();
-    let resp = token_request(&[
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", &redirect_uri),
-        ("client_id", &cfg.client_id),
-        ("code_verifier", &verifier),
-    ])?;
-    let token = Token::from_response(resp, None)?;
-    token.save()?;
-    Ok(token)
+impl Pending {
+    /// Waits for the browser to come back, then trades the code for a token and saves it.
+    /// Blocks until the login ends.
+    pub fn finish(self, cfg: &Config) -> Result<Token> {
+        let code = wait_for_code(&self.listener, &self.state)?;
+        let redirect_uri = cfg.redirect_uri();
+        let resp = token_request(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", &redirect_uri),
+            ("client_id", &cfg.client_id),
+            ("code_verifier", &self.verifier),
+        ])?;
+        let token = Token::from_response(resp, None)?;
+        token.save()?;
+        // Another account may have logged in: ask Spotify who it is again.
+        let _ = std::fs::remove_file(crate::config::user_path());
+        Ok(token)
+    }
+}
+
+/// Runs the Authorization Code + PKCE flow and saves the token (`spotlite auth`).
+pub fn login(cfg: &Config) -> Result<Token> {
+    let pending = begin(cfg)?;
+    println!("Log in to Spotify in your browser. If it does not open, go to:\n\n{}\n", pending.url);
+    let _ = open::that_detached(&pending.url);
+    pending.finish(cfg)
+}
+
+/// Why spotlite must log in again before it starts, or None when the saved login works.
+/// Asks Spotify only when the access token ran out. When Spotify does not answer (offline),
+/// the saved login is kept: it can still work later.
+pub fn needs_login(cfg: &Config) -> Option<String> {
+    let token = match Token::load() {
+        Ok(token) => token,
+        Err(_) => return Some("You are not logged in.".into()),
+    };
+    if !token.expired() {
+        return None;
+    }
+    match refresh(cfg, &token) {
+        Err(e) if e.downcast_ref::<Refused>().is_some() => {
+            Some("Spotify ended the saved login. Log in again.".into())
+        }
+        _ => None,
+    }
 }
 
 pub fn refresh(cfg: &Config, token: &Token) -> Result<Token> {
@@ -201,7 +257,11 @@ pub fn refresh(cfg: &Config, token: &Token) -> Result<Token> {
         ("grant_type", "refresh_token"),
         ("refresh_token", &token.refresh_token),
         ("client_id", &cfg.client_id),
-    ])?;
+    ])
+    .map_err(|e| match e.downcast_ref::<Refused>() {
+        Some(_) => e.context("Spotify ended the login; restart spotlite to log in again"),
+        None => e,
+    })?;
     let token = Token::from_response(resp, Some(token))?;
     token.save()?;
     Ok(token)
