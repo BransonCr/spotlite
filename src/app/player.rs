@@ -48,6 +48,15 @@ impl App {
     }
 
     pub(super) fn toggle_play(&mut self) {
+        if self.ghost {
+            // The last song, shown from before: start it again where it was.
+            if let Some(mut sp) = self.snapshot() {
+                sp.playing = true;
+                self.resume = None;
+                self.resume_from(sp);
+            }
+            return;
+        }
         let Some(playing) = self.playback.as_ref().filter(|pb| pb.item.is_some()).map(|pb| pb.is_playing) else {
             // Nothing loaded: the API thread moves playback to spotifyd and resumes there.
             self.send(Cmd::Toggle);
@@ -63,12 +72,134 @@ impl App {
     }
 
     pub(super) fn skip(&mut self, next: bool) {
+        if self.ghost {
+            self.info(format!("Nothing plays now: {} starts the last song again.", self.keys.show(Act::PlayPause)));
+            return;
+        }
+        // Back, after the first seconds, starts the same song again (Spotify does so).
+        let restart = !next && self.progress_ms() > 3000;
+        let up_next = if next { self.up_next.clone() } else { None };
         if let Some(pb) = self.playback.as_mut() {
             pb.progress_ms = Some(0);
         }
         self.polled_at = Instant::now();
-        self.seek_hold = None;
+        if restart {
+            self.seek_hold = Some(Instant::now());
+        } else {
+            self.seek_hold = None;
+            // The next song shows at once when spotlite knows it; either way polls come fast
+            // until Spotify shows the change.
+            self.expect_switch(up_next, true);
+        }
         self.player(if next { Ctl::Next } else { Ctl::Prev });
+    }
+
+    /// A song change starts: show `track` at once (when known) and poll fast until Spotify
+    /// agrees. `same_list`: it plays from the list that plays now (a skip), so the "from"
+    /// stays.
+    pub(super) fn expect_switch(&mut self, track: Option<Track>, same_list: bool) {
+        let from = self.playing_uri().map(str::to_owned);
+        let want = track.as_ref().map(|t| t.uri.clone());
+        if let Some(t) = track {
+            self.show_song(t, true, same_list);
+        }
+        self.ghost = false;
+        self.switch = Some(Switch { from, want, at: Instant::now(), len: SWITCH_HOLD });
+        self.poll_soon();
+    }
+
+    /// Puts `track` in the player and the sidebar now, from its start.
+    pub(super) fn show_song(&mut self, track: Track, playing: bool, same_list: bool) {
+        let uri = track.uri.clone();
+        let shuffle = self.true_shuffle;
+        let pb = self.playback.get_or_insert_with(|| Playback {
+            device: None,
+            is_playing: playing,
+            progress_ms: Some(0),
+            shuffle_state: shuffle,
+            repeat_state: "off".into(),
+            context: None,
+            item: None,
+        });
+        pb.item = Some(track);
+        pb.progress_ms = Some(0);
+        pb.is_playing = playing;
+        if !same_list {
+            pb.context = None;
+        }
+        self.polled_at = Instant::now();
+        self.seek_hold = None;
+        self.play_hold = None;
+        self.seek_preview = None;
+        // The ♥ from the Liked index, else ask (quietly) now, not after Spotify agrees.
+        if self.saved.as_ref().is_none_or(|(u, _)| *u != uri) {
+            self.saved = self.library.as_ref().map(|l| (uri.clone(), l.tracks.contains(&uri)));
+            if self.saved.is_none() && uri.starts_with("spotify:track:") {
+                self.send(Cmd::CheckSaved(uri));
+            }
+        }
+    }
+
+    /// Sends a play command whose first song is `first` (when known), and shows the change.
+    pub(super) fn play(&mut self, cmd: Cmd, first: Option<Track>) {
+        self.send(cmd);
+        self.expect_switch(first, false);
+    }
+
+    /// Spotify's state shows a song it did not show before: its ♥, and what plays next.
+    pub(super) fn new_song(&mut self, uri: &str) {
+        if self.saved.as_ref().is_none_or(|(u, _)| u != uri) {
+            // The ♥: from the Liked index when it is there (no request).
+            self.saved = self.library.as_ref().map(|l| (uri.to_owned(), l.tracks.contains(uri)));
+            if self.saved.is_none() && uri.starts_with("spotify:track:") {
+                self.send(Cmd::CheckSaved(uri.to_owned()));
+            }
+        }
+        self.song_changed(uri);
+    }
+
+    /// spotifyd says what it plays (MPRIS): a new song or play/pause shows at once (an end of
+    /// a song, a media key, a skip from a phone), and a poll confirms it.
+    pub(super) fn on_mpris(&mut self, playing: bool, track: Option<Track>) {
+        let Some(track) = track else { return };
+        let device_known = self.playback.as_ref().is_some_and(|pb| pb.device.is_some());
+        // spotifyd keeps its last state when another device plays: only ours counts. Before
+        // the first poll, only a song that plays counts.
+        if !(self.local() || (!device_known && playing)) {
+            return;
+        }
+        if self.playing_uri() != Some(track.uri.as_str()) {
+            let full = self
+                .up_next
+                .iter()
+                .chain(self.queue.iter())
+                .find(|t| t.uri == track.uri)
+                .cloned()
+                .or_else(|| self.find_track(&track.uri));
+            let from = self.playing_uri().map(str::to_owned);
+            let uri = track.uri.clone();
+            self.show_song(full.unwrap_or(track), playing, true);
+            self.ghost = false;
+            self.switch = Some(Switch { from, want: Some(uri), at: Instant::now(), len: SWITCH_HOLD });
+            self.poll_soon();
+            return;
+        }
+        let shown = self.playback.as_ref().is_some_and(|pb| pb.is_playing);
+        if shown != playing && self.play_hold.is_none() && self.switch.is_none() {
+            self.bake_progress();
+            if let Some(pb) = self.playback.as_mut() {
+                pb.is_playing = playing;
+            }
+            self.ghost = false;
+            self.poll_soon();
+        }
+    }
+
+    /// The window has the focus again: a look at the player, if the last one is not fresh.
+    pub fn on_focus(&mut self) {
+        if self.polled_at.elapsed() > Duration::from_secs(2) && !self.poll_pending {
+            self.next_poll = self.next_poll.min(Instant::now());
+        }
     }
 
     /// With true shuffle on, a play command plays the whole list in a random order instead.
@@ -199,7 +330,9 @@ impl App {
     /// The time between polls, from what the player does now.
     pub(super) fn poll_every(&self) -> Duration {
         match &self.playback {
-            Some(pb) if pb.is_playing => POLL_PLAYING,
+            // Our spotifyd tells of its changes itself (MPRIS); another device does not.
+            Some(pb) if pb.is_playing && self.follow.is_some() && self.local() => POLL_PLAYING,
+            Some(pb) if pb.is_playing => POLL_REMOTE,
             Some(pb) if pb.item.is_some() => POLL_PAUSED,
             _ => POLL_IDLE,
         }
@@ -218,11 +351,45 @@ impl App {
             shuffle: pb.shuffle_state,
             repeat: pb.repeat_state.clone(),
             volume: self.volume().filter(|v| *v > 0),
+            item: Some(t.clone()),
         })
     }
 
+    /// Shows the song of the last run (paused, at its place) before Spotify answers, so the
+    /// player and the sidebar are not empty at start.
+    pub(super) fn show_saved(&mut self, sp: &SavedPlayback) {
+        let Some(item) = sp.item.clone() else { return };
+        self.playback = Some(Playback {
+            device: None,
+            is_playing: false,
+            progress_ms: Some(sp.position_ms),
+            shuffle_state: sp.shuffle,
+            repeat_state: sp.repeat.clone(),
+            context: sp.context.clone().map(|uri| crate::api::Context { uri }),
+            item: Some(item),
+        });
+        self.polled_at = Instant::now();
+        self.ghost = true;
+    }
+
+    /// Starts `sp` again (its song, place, shuffle, repeat, volume), shown at once.
+    pub(super) fn resume_from(&mut self, sp: SavedPlayback) {
+        let uri = sp.track.clone();
+        let from = self.playing_uri().map(str::to_owned);
+        if let Some(pb) = self.playback.as_mut() {
+            pb.is_playing = sp.playing;
+        }
+        self.polled_at = Instant::now();
+        self.play_hold = Some((sp.playing, Instant::now()));
+        self.ghost = false;
+        self.switch = Some(Switch { from, want: Some(uri), at: Instant::now(), len: RESUME_HOLD });
+        self.send(Cmd::Resume(Box::new(sp)));
+        self.poll_soon();
+    }
+
     /// Starts again what played at the last quit, if nothing plays now. It waits for the first
-    /// player state and for spotifyd to show up as a device (up to 20 s after start).
+    /// player state and for spotifyd to show up as a device (up to 20 s after start), and
+    /// looks for the device every 2 s meanwhile (spotifyd may have just started).
     pub(super) fn try_resume(&mut self) {
         let Some((_, since)) = &self.resume else { return };
         if since.elapsed() > Duration::from_secs(20) {
@@ -232,17 +399,20 @@ impl App {
         if !self.polled_once {
             return;
         }
-        if self.playback.as_ref().is_some_and(|pb| pb.item.is_some()) {
+        if !self.ghost && self.playback.as_ref().is_some_and(|pb| pb.item.is_some()) {
             // Something plays already (spotifyd kept going): leave it alone.
             self.resume = None;
             return;
         }
         if self.device.is_none() {
+            if self.find_device_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
+                self.find_device_at = Some(Instant::now());
+                self.send(Cmd::FindDevice);
+            }
             return;
         }
         if let Some((sp, _)) = self.resume.take() {
-            self.send(Cmd::Resume(sp));
-            self.poll_soon();
+            self.resume_from(sp);
         }
     }
 
@@ -284,45 +454,43 @@ impl App {
     }
 
     pub(super) fn play_selected(&mut self) {
+        // The song that starts, shown at once.
+        let first = self.selected_track();
         match self.view() {
             View::Album | View::Liked | View::Playlist if self.tracks().is_some_and(|l| l.reshaped()) => {
                 // Filtered or sorted: the songs play as they show.
                 let Some(l) = self.tracks() else { return };
                 let (uris, offset) = shown_play(l);
                 if !uris.is_empty() {
-                    self.send(Cmd::Play(Play::Tracks { uris, offset }));
-                    self.poll_soon();
+                    self.play(Cmd::Play(Play::Tracks { uris, offset }), first);
                 }
             }
             View::Album => {
                 let Some(Page::Album(a)) = self.page() else { return };
                 let Some(t) = a.tracks.current() else { return };
                 let uri = a.album.uri.clone().unwrap_or_else(|| format!("spotify:album:{}", a.id));
-                self.send(Cmd::Play(Play::Context { uri, from: Some(t.uri.clone()) }));
-                self.poll_soon();
+                let cmd = Cmd::Play(Play::Context { uri, from: Some(t.uri.clone()) });
+                self.play(cmd, first);
             }
             View::Recent => {
                 // The same song can be in the list twice; play the list as it is.
                 let (uris, offset) = shown_play(&self.recent);
                 if !uris.is_empty() {
-                    self.send(Cmd::Play(Play::Tracks { uris, offset }));
-                    self.poll_soon();
+                    self.play(Cmd::Play(Play::Tracks { uris, offset }), first);
                 }
             }
             View::Random => {
                 let Some(Page::Random(r)) = self.page() else { return };
                 let (uris, offset) = shown_play(&r.tracks);
                 if !uris.is_empty() {
-                    self.send(Cmd::Play(Play::Tracks { uris, offset }));
-                    self.poll_soon();
+                    self.play(Cmd::Play(Play::Tracks { uris, offset }), first);
                 }
             }
             View::Radio => {
                 let Some(Page::Radio(r)) = self.page() else { return };
                 let (uris, offset) = shown_play(&r.tracks);
                 if !uris.is_empty() {
-                    self.send(Cmd::Play(Play::Tracks { uris, offset }));
-                    self.poll_soon();
+                    self.play(Cmd::Play(Play::Tracks { uris, offset }), first);
                 }
             }
             View::Artist => {
@@ -340,8 +508,7 @@ impl App {
                         let top = a.top_tracks();
                         let offset = top.iter().position(|x| x.uri == t.uri).unwrap_or(0);
                         let uris = top.iter().map(|t| t.uri.clone()).collect();
-                        self.send(Cmd::Play(Play::Tracks { uris, offset }));
-                        self.poll_soon();
+                        self.play(Cmd::Play(Play::Tracks { uris, offset }), first);
                     }
                     Some(ArtistRow::Header(_)) | None => {}
                 }
@@ -350,15 +517,13 @@ impl App {
             View::Search => {
                 let (uris, offset) = shown_play(&self.search);
                 if !uris.is_empty() {
-                    self.send(Cmd::Play(Play::Tracks { uris, offset }));
-                    self.poll_soon();
+                    self.play(Cmd::Play(Play::Tracks { uris, offset }), first);
                 }
             }
             View::Liked => {
                 if let Some(t) = self.liked.current() {
                     let from = t.uri.clone();
-                    self.send(Cmd::PlayLiked { from });
-                    self.poll_soon();
+                    self.play(Cmd::PlayLiked { from }, first);
                 }
             }
             View::Playlist => {
@@ -368,8 +533,7 @@ impl App {
                         uri: open.playlist.uri.clone(),
                         from: Some(t.uri.clone()),
                     };
-                    self.send(Cmd::Play(play));
-                    self.poll_soon();
+                    self.play(Cmd::Play(play), first);
                 }
             }
             View::Playlists => {
@@ -390,16 +554,14 @@ impl App {
 
     pub(super) fn play_playlist(&mut self, pl: Playlist) {
         self.info(format!("Playing {}", pl.name));
-        self.send(Cmd::Play(Play::Context { uri: pl.uri, from: None }));
-        self.poll_soon();
+        self.play(Cmd::Play(Play::Context { uri: pl.uri, from: None }), None);
     }
 
     pub(super) fn play_whole_playlist(&mut self) {
         if let Some(Page::Album(a)) = self.page() {
             let uri = a.album.uri.clone().unwrap_or_else(|| format!("spotify:album:{}", a.id));
             self.info(format!("Playing {}", a.album.name));
-            self.send(Cmd::Play(Play::Context { uri, from: None }));
-            self.poll_soon();
+            self.play(Cmd::Play(Play::Context { uri, from: None }), None);
             return;
         }
         let pl = match self.view() {
@@ -527,6 +689,10 @@ impl App {
             pb.progress_ms = Some(target);
         }
         self.polled_at = Instant::now();
+        if self.ghost {
+            // Nothing plays: the place is where Space starts the song.
+            return;
+        }
         self.seek_hold = Some(Instant::now());
         self.player(Ctl::Seek(target));
     }

@@ -200,7 +200,15 @@ pub(super) fn draw_tabs_list(f: &mut Frame, app: &mut App, header: Rect) {
         let mut spans = spans;
         spans.push(Span::styled(" ".repeat((r.width as usize).saturating_sub(used + kind_label.width() + 3)), base));
         spans.push(Span::styled(kind_label, theme::faint().patch(base)));
-        spans.push(Span::styled(" × ", if hover { Style::new().fg(t.red).patch(base) } else { theme::faint() }));
+        let close = if hover && list.over_close {
+            // The × under the pointer: a red pill, so it is clear what a click does.
+            Style::new().bg(t.red).fg(t.viz_low).add_modifier(Modifier::BOLD)
+        } else if hover {
+            Style::new().fg(t.red).patch(base)
+        } else {
+            theme::faint()
+        };
+        spans.push(Span::styled(" × ", close));
         f.render_widget(Paragraph::new(Line::from(spans)), r);
         app.hits.tabs_rows.push((Rect { width: r.width.saturating_sub(3), ..r }, i));
         app.hits.tabs_close.push((Rect { x: r.right().saturating_sub(3), width: 3, ..r }, i));

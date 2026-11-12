@@ -63,6 +63,9 @@ pub struct SavedPlayback {
     /// "off", "context" or "track".
     pub repeat: String,
     pub volume: Option<u8>,
+    /// The song itself, so it shows at the next start before Spotify answers.
+    #[serde(default)]
+    pub item: Option<Track>,
 }
 
 /// A radio page's filters and discover rounds (the radio itself loads again from Spotify).

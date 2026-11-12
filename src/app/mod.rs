@@ -58,6 +58,14 @@ const VOLUME_HOLD: Duration = Duration::from_millis(2500);
 const PLAYER_HOLD: Duration = Duration::from_millis(2500);
 /// How soon to confirm a player command with a poll.
 const CONFIRM_AFTER: Duration = Duration::from_millis(500);
+/// Playing somewhere else (a phone): no player events come from there, so poll more often.
+const POLL_REMOTE: Duration = Duration::from_secs(5);
+/// After a play or a skip, a poll that still shows the song before is Spotify being late, not
+/// the truth, for this long. Meanwhile the poll runs every `SWITCH_POLL`.
+const SWITCH_HOLD: Duration = Duration::from_secs(4);
+const SWITCH_POLL: Duration = Duration::from_millis(400);
+/// A resume can start spotifyd first: it is waited for longer.
+const RESUME_HOLD: Duration = Duration::from_secs(12);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Rows one mouse-wheel step moves.
 const WHEEL_ROWS: isize = 3;
@@ -306,6 +314,32 @@ pub struct TabsList {
     pub pinned: bool,
     /// The page row under the pointer.
     pub hover: Option<usize>,
+    /// The pointer is on that row's "×".
+    pub over_close: bool,
+}
+
+/// How the clickable thing under the pointer lights up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hot {
+    /// A button, a tab, a slider: brighter and bold.
+    Control,
+    /// A row of the sidebar or a pop-up: a filled background.
+    Row,
+    /// A name that opens a page: underlined.
+    Link,
+}
+
+/// A song change that spotlite started (or saw first, from spotifyd) and Spotify's state does
+/// not show yet. The screen shows the change at once; polls come fast until they agree.
+#[derive(Debug, Clone)]
+struct Switch {
+    /// The song shown before the change.
+    from: Option<String>,
+    /// The song that will play, when known.
+    want: Option<String>,
+    at: Instant,
+    /// How long to wait for Spotify to agree.
+    len: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +510,9 @@ pub struct App {
     open_cache: Vec<OpenPlaylist>,
     /// The list row under the mouse pointer (it gets a faint highlight).
     pub hover: Option<usize>,
+    /// Where the pointer is, and the clickable thing lit under it at the last move.
+    pub pointer: Option<Position>,
+    hot: Option<(Rect, Hot)>,
     /// The player shows the time left instead of the time played (a click on it).
     pub remaining: bool,
     /// When Recently played last loaded, and the song playing then.
@@ -486,6 +523,17 @@ pub struct App {
     resume: Option<(SavedPlayback, Instant)>,
     /// The first player state has arrived.
     polled_once: bool,
+    /// The song shown is the last one known, not a live one: Spotify has no player session
+    /// (at start, or after it dropped an idle one). It shows paused; Space starts it again.
+    pub ghost: bool,
+    /// A song change Spotify does not show yet.
+    switch: Option<Switch>,
+    /// The song Spotify's state last showed: a new one asks for its ♥ and what plays next.
+    confirmed_uri: Option<String>,
+    /// When the device was last looked for while a resume waits for it.
+    find_device_at: Option<Instant>,
+    /// spotifyd's player events (MPRIS), when playerctl is there.
+    follow: Option<crate::control::Follow>,
     /// The heart's animation: when it started, and whether the song became liked.
     pub like_burst: Option<(Instant, bool)>,
     /// A like asked for without knowing the state: the animation waits for Spotify's answer.
@@ -601,11 +649,18 @@ impl App {
             pending_jump: None,
             open_cache: Vec::new(),
             hover: None,
+            pointer: None,
+            hot: None,
             remaining: false,
             recent_at: None,
             last_playback: None,
             resume: None,
             polled_once: false,
+            ghost: false,
+            switch: None,
+            confirmed_uri: None,
+            find_device_at: None,
+            follow: None,
             like_burst: None,
             like_pending: None,
             confirm: None,
@@ -626,6 +681,18 @@ impl App {
         self
     }
 
+    /// Takes spotifyd's player events (song changes, play and pause) from `follow`.
+    pub fn follow_player(&mut self, follow: crate::control::Follow) {
+        self.follow = Some(follow);
+    }
+
+    /// Stops following spotifyd's player events (at quit).
+    pub fn stop_follow(&mut self) {
+        if let Some(f) = self.follow.take() {
+            f.stop();
+        }
+    }
+
     fn send(&mut self, cmd: Cmd) {
         let cmd = self.with_true_shuffle(cmd);
         if self.tx.send(cmd).is_ok() {
@@ -633,10 +700,11 @@ impl App {
         }
     }
 
-    /// True while the API thread has work, so the UI should check for replies often.
+    /// True while something is due soon that sends no message when it is (a picture that
+    /// loads, a search after typing stops, the end of a sample), so the loop wakes often.
+    /// Answers from Spotify wake the loop themselves.
     pub fn busy(&self) -> bool {
-        self.in_flight > 0
-            || self.vol_target.is_some()
+        self.vol_target.is_some()
             || self.images.busy()
             || self.like_animating()
             || self.search_due.is_some()
@@ -777,10 +845,16 @@ impl App {
             self.search_due = None;
             changed |= self.live_search();
         }
-        // A track ended: ask for the new state now instead of at the next poll.
-        let ended = self.playback.as_ref().is_some_and(|pb| {
-            pb.is_playing && pb.item.as_ref().is_some_and(|t| self.progress_ms() >= t.duration_ms)
-        });
+        // A track ended: ask for the new state now instead of at the next poll, and keep asking
+        // fast (the switch) until Spotify shows the next song.
+        let ended = self.switch.is_none()
+            && self.playback.as_ref().is_some_and(|pb| {
+                pb.is_playing && pb.item.as_ref().is_some_and(|t| self.progress_ms() >= t.duration_ms)
+            });
+        if ended {
+            let from = self.playing_uri().map(str::to_owned);
+            self.switch = Some(Switch { from, want: None, at: now, len: SWITCH_HOLD });
+        }
         if !self.vol_in_flight {
             if let Some(v) = self.vol_target.take() {
                 self.vol_in_flight = true;
@@ -961,7 +1035,6 @@ impl App {
             }
             Msg::Playback(pb) => {
                 let mut pb = pb.map(|b| *b);
-                let new_uri = pb.as_ref().and_then(|p| p.item.as_ref()).map(|t| t.uri.clone());
                 if let (Some((v, at)), Some(d)) = (self.vol_set, pb.as_mut().and_then(|p| p.device.as_mut())) {
                     if at.elapsed() < VOLUME_HOLD {
                         d.volume_percent = Some(v);
@@ -996,6 +1069,46 @@ impl App {
                         p.progress_ms = Some(local_now);
                     }
                 }
+                // A song change Spotify does not show yet: keep what the screen shows, and
+                // poll again soon. The change is there when the poll shows the wanted song (or
+                // any song but the one before), or the wait is over.
+                let polled = pb.as_ref().and_then(|p| p.item.as_ref()).map(|t| t.uri.clone());
+                let mut hold = false;
+                if let Some(sw) = &self.switch {
+                    let arrived = match (&polled, &sw.want) {
+                        (None, _) => false,
+                        (Some(u), Some(w)) if u == w => true,
+                        (Some(u), _) => sw.from.as_ref() != Some(u),
+                    };
+                    if arrived || sw.at.elapsed() >= sw.len {
+                        self.switch = None;
+                    } else {
+                        hold = true;
+                    }
+                }
+                if hold {
+                    let device = pb.and_then(|p| p.device);
+                    let mut keep = self.playback.clone();
+                    if let Some(k) = keep.as_mut() {
+                        k.progress_ms = Some(local_now);
+                        if device.is_some() {
+                            k.device = device;
+                        }
+                    }
+                    pb = keep;
+                } else if pb.as_ref().is_none_or(|p| p.item.is_none()) {
+                    // Spotify has no song (it dropped an idle session, or none started yet):
+                    // the last song stays, paused, so the player and sidebar are never empty.
+                    if let Some(mut keep) = self.playback.take().filter(|p| p.item.is_some()) {
+                        keep.progress_ms = Some(local_now);
+                        keep.is_playing = false;
+                        keep.device = pb.and_then(|p| p.device);
+                        pb = Some(keep);
+                        self.ghost = true;
+                    }
+                } else {
+                    self.ghost = false;
+                }
                 self.playback = pb;
                 self.polled_once = true;
                 if let Some(snap) = self.snapshot() {
@@ -1003,23 +1116,32 @@ impl App {
                 }
                 self.polled_at = Instant::now();
                 self.poll_pending = false;
-                self.next_poll = Instant::now() + if std::mem::take(&mut self.repoll) { CONFIRM_AFTER } else { self.poll_every() };
+                let wait = match &self.switch {
+                    Some(sw) if sw.at.elapsed() < Duration::from_secs(2) => SWITCH_POLL,
+                    Some(_) => SWITCH_POLL * 2,
+                    None if std::mem::take(&mut self.repoll) => CONFIRM_AFTER,
+                    None => self.poll_every(),
+                };
+                self.next_poll = Instant::now() + wait;
                 if let Some(d) = self.playback.as_ref().and_then(|p| p.device.as_ref()) {
                     self.device = Some(d.name.clone());
                 }
-                match new_uri {
-                    Some(uri) if self.saved.as_ref().is_none_or(|(u, _)| *u != uri) => {
-                        // The ♥: from the Liked index when it is there (no request).
-                        self.saved = self.library.as_ref().map(|l| (uri.clone(), l.tracks.contains(&uri)));
-                        if self.saved.is_none() && uri.starts_with("spotify:track:") {
-                            self.send(Cmd::CheckSaved(uri.clone()));
-                        }
-                        self.song_changed(&uri);
+                if !hold && !self.ghost {
+                    if let Some(uri) = polled.filter(|u| self.confirmed_uri.as_ref() != Some(u)) {
+                        self.confirmed_uri = Some(uri.clone());
+                        self.new_song(&uri);
                     }
-                    Some(_) => {}
-                    None => self.saved = None,
                 }
             }
+            Msg::PlayerFailed => {
+                // What was shown for the command is not true: ask Spotify what is.
+                self.switch = None;
+                self.play_hold = None;
+                self.seek_hold = None;
+                self.next_poll = Instant::now();
+            }
+            Msg::Mpris { playing, track } => self.on_mpris(playing, track.map(|t| *t)),
+            Msg::Term(_) => {}
             Msg::Tracks { list: List::Album(id), offset, mut page } => {
                 if let Some(a) = self.pages.iter().rev().find_map(|p| match p {
                     Page::Album(a) if a.id == id => Some(a),
@@ -1077,6 +1199,8 @@ impl App {
                             self.fade.push_back(FadeStep::Wait(SWITCH_WAIT));
                             self.fade.push_back(FadeStep::Ramp { to: v, len: FADE_IN });
                         }
+                        let shown = s.track.clone();
+                        self.expect_switch(shown, false);
                     }
                     self.poll_soon();
                 }
@@ -1155,6 +1279,12 @@ impl App {
                 for p in self.pages.iter_mut() {
                     if let Page::Radio(r) = p {
                         r.refilter(&library);
+                    }
+                }
+                // The ♥ of the song shown, if it was not known yet.
+                if let Some(uri) = self.playing_uri().map(str::to_owned) {
+                    if self.saved.as_ref().is_none_or(|(u, _)| *u != uri) {
+                        self.saved = Some((uri.clone(), library.tracks.contains(&uri)));
                     }
                 }
                 self.library = Some(library);

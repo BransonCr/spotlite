@@ -3,7 +3,7 @@
 
 use crate::api::{pick_image, Found, ImageRef, Playlist, Track};
 use crate::keys::Act;
-use crate::app::{Action, App, Hits, Listing, Loc, Row as PlRow, SearchKind, Tab, View, SAMPLE_LEN};
+use crate::app::{Action, App, Hits, Hot, Listing, Loc, Row as PlRow, SearchKind, Tab, View, SAMPLE_LEN};
 use crate::pages::{ArtistRow, Page};
 use crate::images::Images;
 use crate::viz;
@@ -188,6 +188,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.help {
         draw_help(f, app);
     }
+    // What a click would do lights up under the pointer (from this frame's click targets).
+    if let Some((r, kind)) = app.pointer.and_then(|p| app.hot_at(p)) {
+        draw_hot(f.buffer_mut(), r, kind);
+    }
     let playing = app.playback.as_ref().is_some_and(|pb| pb.is_playing);
     let area = f.area();
     frame_fx(f.buffer_mut(), area, playing);
@@ -200,3 +204,31 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+
+/// Lights up the clickable thing under the pointer: a button gets brighter and bold, a row
+/// gets the selection background, a name that opens a page gets underlined.
+fn draw_hot(buf: &mut Buffer, r: Rect, kind: Hot) {
+    let t = theme::c();
+    let r = r.intersection(buf.area);
+    let quiet = [t.text, t.muted, t.faint];
+    for y in r.top()..r.bottom() {
+        for x in r.left()..r.right() {
+            let cell = &mut buf[(x, y)];
+            match kind {
+                Hot::Row => {
+                    cell.set_bg(t.selected);
+                }
+                Hot::Control => {
+                    cell.modifier.insert(Modifier::BOLD);
+                }
+                Hot::Link => {
+                    cell.modifier.insert(Modifier::UNDERLINED);
+                }
+            }
+            // The empty part of a bar keeps its dim colour, so the bar still reads right.
+            if quiet.contains(&cell.fg) {
+                cell.set_fg(t.bright);
+            }
+        }
+    }
+}

@@ -330,7 +330,9 @@ fn liked_plays_as_collection_and_search_as_uris() {
     drain(&rx);
     app.play_selected();
     let cmds = drain(&rx);
-    assert!(matches!(cmds.as_slice(), [Cmd::PlayLiked { from }] if from == "spotify:track:2"), "{cmds:?}");
+    // The song shows at once, and its ♥ is asked for at once.
+    assert!(matches!(cmds.as_slice(), [Cmd::PlayLiked { from }, Cmd::CheckSaved(c)] if from == "spotify:track:2" && c == from), "{cmds:?}");
+    assert_eq!(app.playing_uri(), Some("spotify:track:2"));
 
     app.switch_tab(Tab::Search);
     app.searched = "x".into();
@@ -338,7 +340,7 @@ fn liked_plays_as_collection_and_search_as_uris() {
     app.play_selected();
     let cmds = drain(&rx);
     assert!(
-        matches!(cmds.as_slice(), [Cmd::Play(Play::Tracks { uris, offset: 0 })] if uris.len() == SEARCH_PAGE),
+        matches!(cmds.as_slice(), [Cmd::Play(Play::Tracks { uris, offset: 0 }), Cmd::CheckSaved(_)] if uris.len() == SEARCH_PAGE),
         "{cmds:?}"
     );
 }
@@ -1094,7 +1096,8 @@ fn the_poll_slows_down_when_nothing_plays() {
     assert_eq!(app.poll_every(), POLL_IDLE);
     let mut pb = playing_song("spotify:track:a");
     app.on_msg(Msg::Playback(Some(Box::new(pb.clone()))));
-    assert_eq!(app.poll_every(), POLL_PLAYING);
+    // No player events from spotifyd here (no playerctl): polls come more often.
+    assert_eq!(app.poll_every(), POLL_REMOTE);
     pb.is_playing = false;
     app.on_msg(Msg::Playback(Some(Box::new(pb))));
     assert_eq!(app.poll_every(), POLL_PAUSED);
@@ -1404,7 +1407,11 @@ fn mouse_selects_plays_and_drags() {
     assert!(drain(&rx).is_empty(), "one click only selects");
     app.on_mouse(click(10, 7));
     let cmds = drain(&rx);
-    assert!(matches!(cmds.as_slice(), [Cmd::PlayLiked { from }] if from == "spotify:track:6"), "{cmds:?}");
+    assert!(matches!(cmds.as_slice(), [Cmd::PlayLiked { from }, ..] if from == "spotify:track:6"), "{cmds:?}");
+    assert_eq!(app.playing_uri(), Some("spotify:track:6"), "shown at once");
+    // Back to a song with a length, for the progress bar below.
+    app.switch = None;
+    app.on_msg(playing(50, 200_000));
 
     app.on_mouse(click(10, 14 + 5));
     assert_eq!(app.liked.selected(), 6, "click below the list does nothing");
@@ -1434,4 +1441,182 @@ fn typing_keys_go_to_the_query() {
     }
     assert!(!app.quit);
     assert_eq!(app.query, "q1 /");
+}
+
+fn poll(pb: Option<Playback>) -> Msg {
+    Msg::Playback(pb.map(Box::new))
+}
+
+#[test]
+fn a_late_poll_does_not_put_the_old_song_back() {
+    let (mut app, rx) = test_app();
+    app.on_msg(poll(Some(playing_song("spotify:track:old"))));
+    app.up_next = Some(track(7));
+    drain(&rx);
+    app.skip(true);
+    assert_eq!(app.playing_uri(), Some("spotify:track:7"), "the next song shows at once");
+    // Spotify is late: the poll still has the old song. The new one stays; the next poll is soon.
+    app.on_msg(poll(Some(playing_song("spotify:track:old"))));
+    assert_eq!(app.playing_uri(), Some("spotify:track:7"));
+    assert!(app.next_poll <= Instant::now() + SWITCH_POLL);
+    // Spotify agrees: done, and normal polls again.
+    app.on_msg(poll(Some(playing_song("spotify:track:7"))));
+    assert!(app.switch.is_none());
+    assert!(app.next_poll > Instant::now() + Duration::from_secs(2));
+    // Another song than the one expected (a phone changed it) is taken at once.
+    app.up_next = Some(track(8));
+    app.skip(true);
+    app.on_msg(poll(Some(playing_song("spotify:track:9"))));
+    assert_eq!(app.playing_uri(), Some("spotify:track:9"));
+    // A command that failed: the truth comes back with the next poll.
+    app.up_next = Some(track(10));
+    app.skip(true);
+    app.on_msg(Msg::PlayerFailed);
+    assert!(app.next_poll <= Instant::now());
+    app.on_msg(poll(Some(playing_song("spotify:track:9"))));
+    assert_eq!(app.playing_uri(), Some("spotify:track:9"));
+    // After the wait, a poll is the truth even if it shows the song before.
+    app.up_next = Some(track(11));
+    app.skip(true);
+    app.switch.as_mut().unwrap().at -= SWITCH_HOLD;
+    app.on_msg(poll(Some(playing_song("spotify:track:9"))));
+    assert_eq!(app.playing_uri(), Some("spotify:track:9"));
+}
+
+#[test]
+fn the_end_of_a_song_polls_fast_until_the_next_one_shows() {
+    let (mut app, rx) = test_app();
+    let mut pb = playing_song("spotify:track:a");
+    pb.progress_ms = Some(200_000);
+    app.on_msg(poll(Some(pb.clone())));
+    app.poll_pending = false;
+    drain(&rx);
+    app.tick();
+    assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Poll)), "polls at the end");
+    app.on_msg(poll(Some(pb)));
+    assert!(app.next_poll <= Instant::now() + SWITCH_POLL, "and again soon");
+    app.on_msg(poll(Some(playing_song("spotify:track:b"))));
+    assert_eq!(app.playing_uri(), Some("spotify:track:b"));
+    assert!(app.switch.is_none());
+}
+
+#[test]
+fn the_last_song_stays_when_spotify_has_none() {
+    let (mut app, rx) = test_app();
+    app.on_msg(poll(Some(playing_song("spotify:track:a"))));
+    drain(&rx);
+    // Spotify dropped the idle session: the song stays, paused.
+    app.on_msg(poll(None));
+    assert_eq!(app.playing_uri(), Some("spotify:track:a"));
+    assert!(app.ghost);
+    assert!(!app.playback.as_ref().unwrap().is_playing);
+    // Space starts it again where it was, and shows it playing at once.
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+    let cmds = drain(&rx);
+    assert!(matches!(cmds.as_slice(), [Cmd::Resume(sp)] if sp.track == "spotify:track:a" && sp.playing), "{cmds:?}");
+    assert!(app.playback.as_ref().unwrap().is_playing);
+    // A poll before Spotify has it does not stop it on screen.
+    app.on_msg(poll(None));
+    assert!(app.playback.as_ref().unwrap().is_playing);
+    app.on_msg(poll(Some(playing_song("spotify:track:a"))));
+    assert!(!app.ghost && app.switch.is_none());
+}
+
+#[test]
+fn the_song_of_the_last_run_shows_at_start_and_starts_again() {
+    let (mut app, rx) = test_app();
+    let mut song = track(5);
+    song.duration_ms = 180_000;
+    let state = crate::state::State {
+        playback: Some(SavedPlayback {
+            track: song.uri.clone(),
+            name: song.name.clone(),
+            context: None,
+            position_ms: 60_000,
+            playing: true,
+            shuffle: false,
+            repeat: "off".into(),
+            volume: None,
+            item: Some(song),
+        }),
+        ..Default::default()
+    };
+    app.restore(state);
+    // Before any answer from Spotify: the song, paused, at its place.
+    assert_eq!(app.playing_uri(), Some("spotify:track:5"));
+    assert_eq!(app.progress_ms(), 60_000);
+    assert!(app.ghost);
+    drain(&rx);
+    // Spotify has nothing, and no device yet: it looks for the device.
+    app.on_msg(Msg::Device(None));
+    app.on_msg(poll(None));
+    app.tick();
+    assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::FindDevice)));
+    assert_eq!(app.playing_uri(), Some("spotify:track:5"), "still shown");
+    // spotifyd shows up: the song starts again, and polls come fast until it plays.
+    app.on_msg(Msg::Device(Some("spotlite".into())));
+    app.poll_pending = false;
+    app.tick();
+    let cmds = drain(&rx);
+    assert!(cmds.iter().any(|c| matches!(c, Cmd::Resume(sp) if sp.position_ms == 60_000)), "{cmds:?}");
+    assert!(app.switch.is_some());
+    // The state saved now has the song itself, for the next start.
+    assert!(app.saved_state().playback.unwrap().item.is_some());
+}
+
+#[test]
+fn spotifyd_events_show_a_new_song_at_once() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ctl_tx, _ctl_rx) = std::sync::mpsc::channel();
+    let mut app = App::new(tx, true, Images::disabled()).with_control(ctl_tx, "spotlite".into());
+    app.on_msg(poll(Some(playing_song("spotify:track:a"))));
+    app.up_next = Some(track(3));
+    drain(&rx);
+    app.on_msg(Msg::Mpris { playing: true, track: Some(Box::new(track(3))) });
+    assert_eq!(app.playing_uri(), Some("spotify:track:3"));
+    assert_eq!(app.progress_ms(), 0);
+    // A pause from a media key shows at once too.
+    app.on_msg(poll(Some(playing_song("spotify:track:3"))));
+    app.on_msg(Msg::Mpris { playing: false, track: Some(Box::new(track(3))) });
+    assert!(!app.playback.as_ref().unwrap().is_playing);
+    // Another device plays: spotifyd's old state does not count.
+    let mut phone = playing_song("spotify:track:p");
+    phone.device.as_mut().unwrap().name = "Phone".into();
+    app.on_msg(poll(Some(phone)));
+    app.on_msg(Msg::Mpris { playing: false, track: Some(Box::new(track(3))) });
+    assert_eq!(app.playing_uri(), Some("spotify:track:p"));
+}
+
+#[test]
+fn a_drag_ends_wherever_the_button_is_let_go() {
+    let (mut app, rx) = test_app();
+    app.on_msg(playing(50, 200_000));
+    app.hits.progress = Rect::new(10, 29, 101, 1);
+    app.hits.side = Rect::new(0, 2, 30, 20);
+    app.sidebar.open = true;
+    drain(&rx);
+    app.on_mouse(click(60, 29));
+    // Dragged over the sidebar, and let go there.
+    app.on_mouse(MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), ..click(10, 10) });
+    app.on_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), ..click(10, 10) });
+    assert!(app.drag.is_none() && app.seek_preview.is_none());
+    assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Seek(0))));
+    // A release outside the window is lost: the next click forgets the drag.
+    app.on_mouse(click(60, 29));
+    app.on_mouse(click(10, 10));
+    assert!(app.drag.is_none() && app.seek_preview.is_none());
+}
+
+#[test]
+fn buttons_light_up_under_the_pointer() {
+    let (mut app, _rx) = test_app();
+    app.on_msg(playing(50, 200_000));
+    app.hits.play = Rect::new(20, 30, 2, 1);
+    app.hits.np_artist = Rect::new(20, 28, 8, 1);
+    assert!(app.on_hover(Position::new(21, 30)));
+    assert_eq!(app.hot_at(Position::new(21, 30)), Some((app.hits.play, Hot::Control)));
+    assert!(!app.on_hover(Position::new(20, 30)), "the same button: no new frame");
+    assert_eq!(app.hot_at(Position::new(22, 28)).map(|h| h.1), Some(Hot::Link));
+    assert!(app.on_hover(Position::new(50, 10)));
+    assert_eq!(app.hot_at(Position::new(50, 10)), None);
 }

@@ -18,8 +18,44 @@ impl App {
         Some((f * duration as f64) as u64)
     }
 
+    /// A drag of the progress bar, the volume or the scrollbar follows the pointer wherever it
+    /// goes (over the sidebar, a pop-up, out of the window) and always ends on release.
+    /// True if the event was used.
+    fn drag_mouse(&mut self, m: MouseEvent) -> bool {
+        let Some(drag) = self.drag else { return false };
+        match m.kind {
+            MouseEventKind::Drag(_) => {
+                match drag {
+                    Drag::Volume => self.set_volume((fraction(self.hits.volume, m.column) * 100.0).round() as u8),
+                    Drag::Progress => self.seek_preview = self.seek_to_fraction(fraction(self.hits.progress, m.column)),
+                    Drag::Scroll => self.scroll_to(m.row),
+                }
+                true
+            }
+            MouseEventKind::Up(_) => {
+                self.drag = None;
+                if drag == Drag::Progress {
+                    if let Some(ms) = self.seek_preview.take() {
+                        self.seek_absolute(ms);
+                    }
+                }
+                true
+            }
+            MouseEventKind::Down(_) => {
+                // The release was lost (outside the terminal): forget the drag, then click.
+                self.drag = None;
+                self.seek_preview = None;
+                false
+            }
+            _ => false,
+        }
+    }
+
     pub fn on_mouse(&mut self, m: MouseEvent) {
         let pos = Position::new(m.column, m.row);
+        if self.drag_mouse(m) {
+            return;
+        }
         if self.help {
             if matches!(m.kind, MouseEventKind::Down(_)) {
                 self.help = false;
@@ -142,21 +178,6 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => self.on_click(pos),
-            MouseEventKind::Drag(MouseButton::Left) => match self.drag {
-                Some(Drag::Volume) => self.set_volume((fraction(self.hits.volume, m.column) * 100.0).round() as u8),
-                Some(Drag::Progress) => {
-                    self.seek_preview = self.seek_to_fraction(fraction(self.hits.progress, m.column));
-                }
-                Some(Drag::Scroll) => self.scroll_to(m.row),
-                None => {}
-            },
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.drag.take() == Some(Drag::Progress) {
-                    if let Some(ms) = self.seek_preview.take() {
-                        self.seek_absolute(ms);
-                    }
-                }
-            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 if self.hits.volume.contains(pos) {
@@ -238,29 +259,94 @@ impl App {
     }
 
     /// The pointer moved (no button). True if the screen changes: the list opens, closes, or
-    /// another row is under the pointer.
+    /// another row or button is under the pointer.
     pub fn on_hover(&mut self, pos: Position) -> bool {
+        self.pointer = Some(pos);
         // The list row under the pointer (only when no pop-up covers the list).
-        let popup = self.menu.is_some() || self.picker.is_some() || self.palette.is_some() || self.genre_picker.is_some() || self.help;
-        let row = if popup { None } else { self.row_at(pos) };
+        let row = if self.popup_open() || self.help { None } else { self.row_at(pos) };
         let row_changed = row != self.hover;
         self.hover = row;
-        row_changed | self.hover_tabs(pos)
+        let tabs_changed = self.hover_tabs(pos);
+        let hot = self.hot_at(pos);
+        let hot_changed = hot != self.hot;
+        self.hot = hot;
+        row_changed | tabs_changed | hot_changed
+    }
+
+    fn popup_open(&self) -> bool {
+        self.menu.is_some()
+            || self.picker.is_some()
+            || self.palette.is_some()
+            || self.genre_picker.is_some()
+            || self.confirm.is_some()
+            || self.undo.is_some()
+    }
+
+    /// The clickable thing under the pointer, where it was drawn, and how it lights up. It
+    /// follows the order clicks are routed in (`on_mouse`), so what lights up is what a click
+    /// does. List rows and the open-tabs list light up on their own.
+    pub fn hot_at(&self, pos: Position) -> Option<(Rect, Hot)> {
+        let h = &self.hits;
+        let at = |r: Rect| r.contains(pos).then_some(r);
+        if self.help || self.drag.is_some() {
+            return None;
+        }
+        if self.tabs_list.is_some() && h.tabs_list.contains(pos) {
+            return None;
+        }
+        if let Some(r) = at(h.tabs_more) {
+            return Some((r, Hot::Control));
+        }
+        if self.popup_open() {
+            return h.popup_rows.iter().find(|(r, _)| r.contains(pos)).map(|(r, _)| (*r, Hot::Row));
+        }
+        if !self.sidebar.open {
+            if let Some(r) = at(h.side_open) {
+                return Some((r, Hot::Control));
+            }
+        } else {
+            if let Some(r) = at(h.side_hide) {
+                return Some((r, Hot::Control));
+            }
+            if h.side.contains(pos) {
+                if let Some(r) = h.side_tabs.iter().copied().find(|r| r.contains(pos)) {
+                    return Some((r, Hot::Control));
+                }
+                return h.side_rows.iter().find(|(r, _)| r.contains(pos)).map(|(r, _)| (*r, Hot::Row));
+            }
+        }
+        if let Some(r) = at(h.np_artist) {
+            return Some((r, Hot::Link));
+        }
+        let controls = [h.time, h.back, h.play, h.prev, h.next, h.shuffle, h.repeat, h.like, h.volume, h.progress];
+        if let Some(r) = controls.into_iter().find(|r| r.contains(pos)) {
+            return Some((r, Hot::Control));
+        }
+        h.search_kinds
+            .iter()
+            .map(|(r, _)| *r)
+            .chain(h.tabs.iter().map(|(r, _)| *r))
+            .find(|r| r.contains(pos))
+            .map(|r| (r, Hot::Control))
     }
 
     pub(super) fn hover_tabs(&mut self, pos: Position) -> bool {
         let over_chip = self.hits.tabs_more.contains(pos);
         let over_list = self.hits.tabs_list.contains(pos);
-        let row = self.hits.tabs_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i);
+        // The row stays lit while the pointer is on its ×; the × is marked then.
+        let close = self.hits.tabs_close.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i);
+        let row = self.hits.tabs_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i).or(close);
+        let over_close = close.is_some();
         match self.tabs_list.as_mut() {
             None if over_chip => {
-                self.tabs_list = Some(TabsList { pinned: false, hover: None });
+                self.tabs_list = Some(TabsList { pinned: false, hover: None, over_close: false });
                 true
             }
             None => false,
             Some(l) if over_chip || over_list => {
-                let changed = l.hover != row;
+                let changed = l.hover != row || l.over_close != over_close;
                 l.hover = row;
+                l.over_close = over_close;
                 changed
             }
             Some(l) if !l.pinned => {
@@ -270,6 +356,7 @@ impl App {
             Some(l) => {
                 let changed = l.hover.is_some();
                 l.hover = None;
+                l.over_close = false;
                 changed
             }
         }
@@ -284,7 +371,7 @@ impl App {
             // A click keeps it open (or shuts it if it was kept open).
             self.tabs_list = match self.tabs_list {
                 Some(l) if l.pinned => None,
-                _ => Some(TabsList { pinned: true, hover: None }),
+                _ => Some(TabsList { pinned: true, hover: None, over_close: false }),
             };
             return true;
         }

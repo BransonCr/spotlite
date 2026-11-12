@@ -816,3 +816,33 @@ fn a_loading_list_shows_skeleton_rows_and_popups_dim_the_rest() {
     let buf = terminal.backend().buffer().clone();
     assert!(buf[(1, 1)].modifier.contains(Modifier::DIM), "behind help is dim");
 }
+
+#[test]
+fn the_row_stays_lit_over_its_close_button() {
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Position;
+    let (mut app, _rx) = test_app();
+    app.typing = false;
+    for i in 0..8 {
+        app.open_artist(format!("a{i}"), format!("Artist number {i}"));
+    }
+    let _ = screen(&mut app, 90, 30);
+    let chip = app.hits.tabs_more;
+    app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: chip.x + 1, row: chip.y, modifiers: KeyModifiers::NONE });
+    let _ = screen(&mut app, 90, 30);
+    let (row, _) = app.hits.tabs_rows[2];
+    assert!(app.on_hover(Position::new(row.x + 4, row.y)));
+    assert_eq!(app.tabs_list.map(|l| (l.hover, l.over_close)), Some((Some(2), false)));
+    let (x, _) = *app.hits.tabs_close.iter().find(|(_, i)| *i == 2).unwrap();
+    assert!(app.on_hover(Position::new(x.x + 1, x.y)), "the × lights up");
+    assert_eq!(app.tabs_list.map(|l| (l.hover, l.over_close)), Some((Some(2), true)), "and the row stays lit");
+    let _ = screen(&mut app, 90, 30);
+    let sel = crate::theme::c().selected;
+    let buf_bg = {
+        let backend = TestBackend::new(90, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.backend().buffer()[(row.x + 4, row.y)].bg
+    };
+    assert_eq!(buf_bg, sel);
+}

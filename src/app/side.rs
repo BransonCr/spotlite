@@ -147,8 +147,8 @@ impl App {
             SideItem::Pin(p) => match self.pins.get(p).cloned() {
                 Some(Pin::Song { track }) => {
                     self.info(format!("Playing {}", track.name));
-                    self.send(Cmd::Play(Play::Tracks { uris: vec![track.uri], offset: 0 }));
-                    self.poll_soon();
+                    let uris = vec![track.uri.clone()];
+                    self.play(Cmd::Play(Play::Tracks { uris, offset: 0 }), Some(track));
                 }
                 Some(Pin::Album { album }) => self.open_album(album),
                 Some(Pin::Playlist { uri, name, .. }) => self.open_playlist_uri(&uri, &name),
@@ -177,8 +177,7 @@ impl App {
             }
             _ => {
                 self.info(format!("Playing {name}"));
-                self.send(Cmd::Play(Play::Context { uri: uri.to_owned(), from: None }));
-                self.poll_soon();
+                self.play(Cmd::Play(Play::Context { uri: uri.to_owned(), from: None }), None);
             }
         }
     }

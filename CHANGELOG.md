@@ -12,6 +12,27 @@
   music stops it goes back to the cover.
 - Theme key `aura` takes the place of `liquid`. A theme file with `liquid` still loads.
 
+### Playback feels instant
+- The song of the last run shows at start (cover, sidebar, player), paused at its place,
+  before Spotify answers. When Spotify drops an idle session, the song stays too. Space starts
+  it again where it was.
+- A new song shows the moment you play it, skip, or it starts by itself. When Spotify is
+  late, polls come every 0.4 s until it agrees, instead of 8 s later. A failed command
+  shows the truth again at once.
+- spotifyd's own player events (MPRIS, through `playerctl --follow`) show song changes and
+  play/pause from media keys and phones at once.
+- Answers from Spotify show at once (the UI no longer waits for its next frame to read them).
+  Coming back to the window checks the player.
+- At start, spotlite looks for spotifyd again every 2 s while it starts, so the last song
+  resumes even when spotifyd was not running.
+
+### Mouse
+- The row in the open-tabs list stays lit while the pointer is on its ×; the × turns red.
+- Buttons, tabs, sliders, sidebar rows and menu rows light up under the pointer; the artist
+  name is underlined.
+- A drag of the progress bar, the volume or the scrollbar always ends when you let go, also
+  over the sidebar or outside the window (before, the progress bar could freeze).
+
 ## 0.2.0
 
 ### Find and act faster

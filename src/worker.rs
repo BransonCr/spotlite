@@ -26,6 +26,8 @@ pub enum List {
 pub enum Cmd {
     /// Fetch the user, find the device, read the player state.
     Init,
+    /// Look for our device again (spotifyd may have started since).
+    FindDevice,
     Poll,
     Load { list: List, offset: usize },
     Play(Play),
@@ -49,7 +51,7 @@ pub enum Cmd {
     /// What plays next (for the stage column's "Up next").
     UpNext,
     /// Starts what played at the last quit: the song at its position, shuffle, repeat, volume.
-    Resume(crate::state::SavedPlayback),
+    Resume(Box<crate::state::SavedPlayback>),
     /// Likes a song, or unlikes it if it is liked (asks Spotify which first).
     ToggleSaved(String),
     /// A new private playlist with these songs.
@@ -136,6 +138,13 @@ pub enum Msg {
     Online,
     /// Sent after every command.
     Done(Kind),
+    /// A player command failed: what was shown for it is not true.
+    PlayerFailed,
+    /// spotifyd's own player changed (MPRIS): it plays or not, and the song, if one is loaded.
+    Mpris { playing: bool, track: Option<Box<Track>> },
+    /// A key, a click, a paste or a resize from the terminal (the input thread). Every kind of
+    /// event comes through this one channel, so the UI wakes at once for any of them.
+    Term(ratatui::crossterm::event::Event),
 }
 
 /// Which kind of command finished, for the UI's in-flight bookkeeping.
@@ -161,6 +170,7 @@ fn control_lane(cmd: &Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Init
+            | Cmd::FindDevice
             | Cmd::Poll
             | Cmd::Play(_)
             | Cmd::PlayLiked { .. }
@@ -389,7 +399,7 @@ impl Worker {
                 // Init ends with the first player state, like a poll.
                 Cmd::Poll | Cmd::Init => Kind::Poll,
                 Cmd::Volume(_) => Kind::Volume,
-                Cmd::Sample { .. } | Cmd::Unsample { .. } | Cmd::Play(_) | Cmd::PlayAt(..) | Cmd::PlayShuffled { .. } | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
+                Cmd::Sample { .. } | Cmd::Unsample { .. } | Cmd::Resume(_) | Cmd::Play(_) | Cmd::PlayAt(..) | Cmd::PlayShuffled { .. } | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
                 _ => Kind::Other,
             };
             let list = match &cmd {
@@ -403,6 +413,9 @@ impl Worker {
                     self.send(Msg::Offline(self.offline));
                 }
                 self.report(err, list, kind, quiet);
+                if kind == Kind::Player {
+                    self.send(Msg::PlayerFailed);
+                }
             }
             if self.tx.send(Msg::Done(kind)).is_err() {
                 return; // UI has quit
@@ -473,6 +486,7 @@ impl Worker {
                 }
             }
             Cmd::Poll => self.poll(),
+            Cmd::FindDevice => self.find_device().map(|_| ()),
             Cmd::Load { list, offset } => self.load(list, offset),
             Cmd::Play(play) => self.player(|api, dev| api.play(dev, Some(&play))),
             Cmd::PlayLiked { from } => {

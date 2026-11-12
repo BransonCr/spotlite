@@ -30,13 +30,14 @@ use anyhow::{bail, Result};
 use api::Spotify;
 use config::Config;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyEventKind,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
+    EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui_image::picker::Picker;
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::time::Duration;
+use worker::Msg;
 
 const USAGE: &str = "\
 spotlite - lightweight Spotify client (plays through spotifyd)
@@ -248,7 +249,7 @@ fn run_tui() -> Result<()> {
     // ratatui's panic hook restores the screen; also give the mouse back to the terminal.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
         // A note for a bug report, beside the saved state (the release build stops at once).
         let path = state::path().with_file_name("crash.log");
         let note = format!(
@@ -261,14 +262,24 @@ fn run_tui() -> Result<()> {
         hook(info);
         eprintln!("A note about this crash is in {}", path.display());
     }));
-    // Paste arrives as one piece of text (not as keys that would run actions).
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    // Paste arrives as one piece of text (not as keys that would run actions). Focus changes
+    // tell spotlite to look at the player again when you come back to it.
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
     // Ask the terminal which graphics protocol it speaks (kitty in ghostty); half blocks if none.
     let images = if std::env::var_os("SPOTLITE_NO_IMAGES").is_some() {
         images::Images::disabled()
     } else {
         images::Images::new(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()))
     };
+    // From here on only the input thread reads the terminal (the picture query above is done).
+    let input_tx = msg_tx.clone();
+    std::thread::Builder::new().name("spotlite-input".into()).spawn(move || {
+        while let Ok(ev) = event::read() {
+            if input_tx.send(Msg::Term(ev)).is_err() {
+                return;
+            }
+        }
+    })?;
     let mut app = app::App::new(tx.clone(), can_like, images);
     app.viz_on = std::env::var_os("SPOTLITE_VIZ").is_some();
     let (keys, problems) = keys::Keys::new(&cfg_keys);
@@ -306,6 +317,7 @@ fn run_tui() -> Result<()> {
     }
     if control::available() {
         app = app.with_control(control::spawn(msg_tx.clone(), tx), device_name);
+        app.follow_player(control::follow(msg_tx.clone()));
     }
     let fps: u64 = std::env::var("SPOTLITE_VIZ_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let viz_frame = Duration::from_millis(1000 / fps.clamp(1, 60));
@@ -342,16 +354,21 @@ fn run_tui() -> Result<()> {
                     }
                 }
             }
+            // Take every message and event that waits, then draw one time: a wheel burst or a
+            // held key does not queue up frames.
             let mut dirty = std::mem::take(&mut input);
-            loop {
+            for _ in 0..512 {
                 match rx.try_recv() {
-                    Ok(msg) => {
-                        app.on_msg(msg);
-                        dirty = true;
-                    }
+                    Ok(msg) => dirty |= on_message(&mut app, msg),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => anyhow::bail!("the API thread stopped"),
                 }
+                if app.quit {
+                    break;
+                }
+            }
+            if app.quit {
+                break;
             }
             dirty |= app.images.poll();
             dirty |= app.tick();
@@ -369,46 +386,22 @@ fn run_tui() -> Result<()> {
                 }
             }
             // Sleep until the next frame is due (1 s idle, faster while music or the visualizer
-            // moves). While a request or a picture is open, wake often so its result shows at
-            // once. Input always wakes us.
+            // moves), or until anything arrives: a key, a click, an answer from Spotify, a
+            // player change. Pictures load on threads that do not post here, and a search or
+            // a sample is due at its own time: wake often then.
             let due = (last_draw + period).saturating_duration_since(std::time::Instant::now());
             let wait = if app.busy() { due.min(Duration::from_millis(30)) } else { due };
-            if event::poll(wait)? {
-                // Take every event that waits, then draw one time: a wheel burst or a held
-                // key does not queue up frames.
-                for _ in 0..256 {
-                    match event::read()? {
-                        Event::Key(key) if key.kind == KeyEventKind::Press => {
-                            app.on_key(key);
-                            input = true;
-                        }
-                        // Pointer motion draws only when it changes something (a hover list).
-                        Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
-                            if app.on_hover(ratatui::layout::Position::new(m.column, m.row)) {
-                                input = true;
-                            }
-                        }
-                        Event::Mouse(m) => {
-                            app.on_mouse(m);
-                            input = true;
-                        }
-                        Event::Paste(text) => {
-                            app.on_paste(&text);
-                            input = true;
-                        }
-                        Event::Resize(..) => input = true,
-                        _ => {}
-                    }
-                    if app.quit || !event::poll(Duration::ZERO)? {
-                        break;
-                    }
-                }
+            match rx.recv_timeout(wait) {
+                Ok(msg) => input |= on_message(&mut app, msg),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => anyhow::bail!("the API thread stopped"),
             }
         }
         Ok(())
     })();
     app.viz.stop();
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+    app.stop_follow();
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
     ratatui::restore();
     // A trial run (SPOTLITE_THEME) saves nothing, so it never replaces your tabs or theme.
     if theme::env_override().is_none() {
@@ -421,6 +414,29 @@ fn run_tui() -> Result<()> {
         stop_spotifyd();
     }
     result
+}
+
+/// One message for the UI: a terminal event, or news from a background thread. True when the
+/// screen must be drawn again.
+fn on_message(app: &mut app::App, msg: Msg) -> bool {
+    let Msg::Term(ev) = msg else {
+        app.on_msg(msg);
+        return true;
+    };
+    match ev {
+        Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+        // Pointer motion draws only when it changes something (what is lit under it).
+        Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
+            return app.on_hover(ratatui::layout::Position::new(m.column, m.row));
+        }
+        Event::Mouse(m) => app.on_mouse(m),
+        Event::Paste(text) => app.on_paste(&text),
+        Event::FocusGained => app.on_focus(),
+        Event::FocusLost => return false,
+        Event::Resize(..) => {}
+        _ => return false,
+    }
+    true
 }
 
 /// Ends spotlite if it does not stop by itself within 1.5 s of being told to (SIGHUP, SIGTERM)

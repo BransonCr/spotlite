@@ -276,6 +276,9 @@ impl App {
             self.liked.fill(songs);
         }
         self.last_playback = state.playback.clone();
+        if let Some(sp) = &state.playback {
+            self.show_saved(sp);
+        }
         self.true_shuffle = state.playback.as_ref().is_some_and(|p| p.shuffle);
         self.resume = state.playback.map(|p| (p, Instant::now()));
         for tab in state.tabs.into_iter().take(MAX_PAGES) {

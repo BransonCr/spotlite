@@ -97,8 +97,7 @@ impl App {
             Found::Playlist(p) => {
                 // Spotify lists only your own playlists' songs to dev-mode apps: play it.
                 self.info(format!("Playing {}", p.name));
-                self.send(Cmd::Play(Play::Context { uri: p.uri, from: None }));
-                self.poll_soon();
+                self.play(Cmd::Play(Play::Context { uri: p.uri, from: None }), None);
             }
         }
     }

@@ -133,7 +133,7 @@ pub struct Artist {
     pub images: Vec<ImageRef>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub uri: String,
     pub name: String,
