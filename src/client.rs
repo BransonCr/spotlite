@@ -13,9 +13,10 @@ mod imp {
     use std::time::{Duration, Instant};
     use tokio::runtime::Runtime;
 
-    /// spotifyd's saved librespot login (written by `spotifyd authenticate`).
+    /// The player engine's saved librespot login: spotifyd's (written by `spotifyd
+    /// authenticate`), or the built-in player's.
     fn spotifyd_credentials() -> Option<librespot_core::authentication::Credentials> {
-        let base = dirs::cache_dir()?.join("spotifyd");
+        let base = crate::engine::credentials_dir()?;
         ["oauth", "zeroconf", ""].iter().find_map(|sub| {
             let file = base.join(sub).join("credentials.json");
             serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()
@@ -26,7 +27,7 @@ mod imp {
     /// connects.
     fn connect() -> Result<(Runtime, Session)> {
         let credentials = spotifyd_credentials()
-            .ok_or_else(|| anyhow::anyhow!("no spotifyd login found; run `spotifyd authenticate`"))?;
+            .ok_or_else(|| anyhow::anyhow!("no {} login found; {}", crate::engine::name(), crate::engine::hint_login()))?;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let session = rt.block_on(async {
             let session = Session::new(SessionConfig::default(), None);

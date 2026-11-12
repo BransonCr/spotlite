@@ -4,6 +4,9 @@ mod auth;
 mod client;
 mod config;
 mod control;
+#[cfg(builtin_player)]
+mod daemon;
+mod engine;
 mod folders;
 mod genre;
 mod genres;
@@ -16,6 +19,7 @@ mod log;
 mod login;
 mod pages;
 mod palette;
+mod platform;
 mod card;
 mod radio;
 mod samples;
@@ -42,11 +46,12 @@ use std::time::Duration;
 use worker::Msg;
 
 const USAGE: &str = "\
-spotlite - lightweight Spotify client (plays through spotifyd)
+spotlite - lightweight Spotify client (plays through spotifyd, or its own player)
 
 usage:
   spotlite            open the terminal UI
   spotlite auth       log in to Spotify in the browser (spotlite asks by itself when it must)
+  spotlite daemon     run spotlite's own player (backend = builtin; spotlite starts it itself)
   spotlite devices    list Spotify Connect devices
   spotlite folders    show your playlist folders
   spotlite radio URI  list the radio for a song or artist (spotify:track:... or spotify:artist:...)
@@ -63,6 +68,10 @@ usage:
 
 fn main() -> Result<()> {
     let arg = std::env::args().nth(1);
+    // The player engine, for every command (a bad `backend` shows in the UI).
+    if let Ok(cfg) = Config::load() {
+        let _ = engine::init(&cfg);
+    }
     match arg.as_deref() {
         None => {
             // Not `?`: Rust's own report panics if the terminal is gone (window closed).
@@ -74,15 +83,20 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("auth") => {
-            auth::login(&Config::load()?)?;
+            config::first_run()?;
+            let cfg = Config::load()?;
+            let _ = engine::init(&cfg);
+            auth::login(&cfg)?;
             println!("Logged in. Token saved to {}", config::token_path().display());
-            Ok(())
+            engine::ensure_login(true)
         }
+        #[cfg(builtin_player)]
+        Some("daemon") => daemon::run(&Config::load()?),
         Some("devices") => {
             let mut api = Spotify::new(Config::load()?)?;
             let devices = api.devices()?;
             if devices.is_empty() {
-                println!("No devices. Start spotifyd (systemctl --user start spotifyd).");
+                println!("No devices. {}", engine::hint_no_device());
             }
             for d in devices {
                 let active = if d.is_active { " (active)" } else { "" };
@@ -236,10 +250,16 @@ fn theme_cmd(args: Vec<String>) -> Result<()> {
 }
 
 fn run_tui() -> Result<()> {
+    config::first_run()?;
     let cfg = Config::load()?;
+    // SPOTLITE_NERD=0 or 1 tries the plain or the Nerd Font glyphs for one run.
+    let nerd_env = std::env::var("SPOTLITE_NERD").ok().map(|v| v != "0");
+    theme::set_nerd_font(nerd_env.or(cfg.nerd_font).unwrap_or(platform::NERD_DEFAULT));
+    let engine_problem = engine::init(&cfg).err();
+    engine::ensure_login(false)?;
     let cfg_keys = cfg.keys.clone();
     let login_reason = auth::needs_login(&cfg);
-    start_spotifyd();
+    engine::start();
     let mut terminal = ratatui::init();
     // No saved login, or Spotify ended it: the login screen, before anything else.
     if let Some(reason) = login_reason {
@@ -322,6 +342,9 @@ fn run_tui() -> Result<()> {
         }
     }
     app.restore(saved);
+    if let Some(p) = engine_problem {
+        app.error(format!("{p} (config.toml)"));
+    }
     if !can_taste {
         app.info("Run `spotlite auth` again to turn on Recent and a stronger discover.");
     }
@@ -341,12 +364,10 @@ fn run_tui() -> Result<()> {
     }
     let fps: u64 = std::env::var("SPOTLITE_VIZ_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let viz_frame = Duration::from_millis(1000 / fps.clamp(1, 60));
-    // Closing the terminal window sends SIGHUP (a shutdown, SIGTERM): stop the loop cleanly,
-    // so the state below is saved instead of lost.
+    // Closing the terminal window (or a shutdown) stops the loop cleanly, so the state below
+    // is saved instead of lost.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for sig in [signal_hook::consts::SIGHUP, signal_hook::consts::SIGTERM] {
-        let _ = signal_hook::flag::register(sig, stop.clone());
-    }
+    platform::on_close(stop.clone());
     watchdog(stop.clone());
     let trial = theme::env_override().is_some();
     let mut saved_json = String::new();
@@ -359,9 +380,9 @@ fn run_tui() -> Result<()> {
         // The program that started spotlite (the terminal, or a shell in it). If it goes away
         // the terminal is gone too, even when no SIGHUP came (a shell in between does not pass
         // it on): stop, instead of spinning on a dead terminal.
-        let parent = std::os::unix::process::parent_id();
+        let parent = platform::parent_id();
         while !app.quit && !stop.load(std::sync::atomic::Ordering::Relaxed) {
-            if std::os::unix::process::parent_id() != parent {
+            if platform::parent_id() != parent {
                 break;
             }
             // Every 5 s, save what changed: a crash or a kill loses at most a few seconds.
@@ -431,7 +452,7 @@ fn run_tui() -> Result<()> {
         }
     }
     if app.stop_services {
-        stop_spotifyd();
+        engine::stop();
     }
     result
 }
@@ -465,12 +486,12 @@ fn on_message(app: &mut app::App, msg: Msg) -> bool {
 /// returns, at full CPU; the main loop then never sees the signal. The state was saved at most
 /// 5 s before.
 fn watchdog(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    let parent = std::os::unix::process::parent_id();
+    let parent = platform::parent_id();
     let _ = std::thread::Builder::new().name("spotlite-watch".into()).spawn(move || {
         let mut since: Option<std::time::Instant> = None;
         loop {
             std::thread::sleep(Duration::from_millis(250));
-            let told = stop.load(std::sync::atomic::Ordering::Relaxed) || std::os::unix::process::parent_id() != parent;
+            let told = stop.load(std::sync::atomic::Ordering::Relaxed) || platform::parent_id() != parent;
             if told {
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 let at = *since.get_or_insert_with(std::time::Instant::now);
@@ -496,38 +517,4 @@ fn draw(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> Result<(
     let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);
     drawn?;
     Ok(())
-}
-
-/// Starts the spotifyd user service if it is not running (after `Q` stopped it). Does not wait.
-/// True when it was not running and was asked to start.
-pub fn start_spotifyd() -> bool {
-    let running = std::process::Command::new("systemctl")
-        .args(["--user", "--quiet", "is-active", "spotifyd"])
-        .status()
-        .is_ok_and(|s| s.success());
-    if !running {
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "--no-block", "start", "spotifyd"])
-            .status();
-    }
-    !running
-}
-
-/// How long spotifyd runs (None: it does not run).
-pub fn spotifyd_age() -> Option<std::time::Duration> {
-    let out = std::process::Command::new("systemctl")
-        .args(["--user", "show", "spotifyd", "-p", "MainPID", "--value"])
-        .output()
-        .ok()?;
-    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().ok().filter(|p| *p > 0)?;
-    let out = std::process::Command::new("ps").args(["-o", "etimes=", "-p", &pid.to_string()]).output().ok()?;
-    let secs: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
-    Some(std::time::Duration::from_secs(secs))
-}
-
-/// `Q`: stop spotifyd too, so no part of spotlite keeps running or playing.
-fn stop_spotifyd() {
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "spotifyd"])
-        .status();
 }

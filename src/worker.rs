@@ -938,10 +938,11 @@ impl Worker {
         // spotifyd needs from a few seconds to about 30 s (a slow network) to log in and show
         // up: wait while it is that young, and not when it ran for long and is lost.
         if !cfg!(test) {
-            let started = crate::start_spotifyd();
-            let age = if started { Some(Duration::ZERO) } else { crate::spotifyd_age() };
+            let started = crate::engine::start();
+            let age = if started { Some(Duration::ZERO) } else { crate::engine::age() };
             if let Some(age) = age.filter(|a| *a < SPOTIFYD_LOGIN) {
-                self.send(Msg::Info(if started { "Starting spotifyd…" } else { "Waiting for spotifyd to log in…" }.into()));
+                let name = crate::engine::name();
+                self.send(Msg::Info(if started { format!("Starting {name}…") } else { format!("Waiting for {name} to log in…") }));
                 let until = Instant::now() + (SPOTIFYD_LOGIN - age);
                 while Instant::now() < until {
                     thread::sleep(Duration::from_secs(1));
@@ -952,8 +953,9 @@ impl Worker {
             }
         }
         Err(anyhow!(
-            "Spotify does not see the device '{}'. Check spotifyd: `systemctl --user status spotifyd`",
-            self.api.config().device_name
+            "Spotify does not see the device '{}'. {}",
+            self.api.config().device_name,
+            crate::engine::hint_check()
         ))
     }
 

@@ -62,7 +62,7 @@ pub(super) fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(track) = track else {
         f.render_widget(Line::from(Span::styled("Nothing playing", theme::muted())), l1);
         let hint = if app.device_checked && app.device.is_none() {
-            Span::styled("spotifyd not found. Start it: systemctl --user start spotifyd", Style::new().fg(theme::c().red))
+            Span::styled(crate::engine::hint_no_device(), Style::new().fg(theme::c().red))
         } else {
             Span::styled("Pick a track and press Enter, or Space to resume.", theme::faint())
         };
@@ -293,7 +293,7 @@ pub(super) fn draw_player_compact(f: &mut Frame, app: &mut App, inner: Rect) {
     let Some((pb, track)) = pb.as_ref().and_then(|p| p.item.as_ref().map(|t| (p, t))) else {
         f.render_widget(Line::from(Span::styled("Nothing playing · Space resumes", theme::muted())), l1);
         if app.device_checked && app.device.is_none() {
-            let hint = "spotifyd not found. Start it: systemctl --user start spotifyd";
+            let hint = crate::engine::hint_no_device();
             f.render_widget(Line::from(Span::styled(hint, Style::new().fg(theme::c().red))), l2);
         }
         return;

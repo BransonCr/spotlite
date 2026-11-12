@@ -283,7 +283,17 @@ fn with<R>(f: impl FnOnce(&RwLock<(Theme, String)>) -> R) -> R {
 
 /// The theme in use.
 pub fn c() -> Theme {
-    with(|c| c.read().map(|t| t.0).unwrap_or(AMBER))
+    let mut t = with(|c| c.read().map(|t| t.0).unwrap_or(AMBER));
+    t.nerd &= NERD_FONT.load(std::sync::atomic::Ordering::Relaxed);
+    t
+}
+
+/// False when the terminal's font has no Nerd Font glyphs (`nerd_font` in config.toml; off by
+/// default on Windows): every theme then uses the plain glyphs.
+static NERD_FONT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_nerd_font(on: bool) {
+    NERD_FONT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Name of the theme in use.

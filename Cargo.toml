@@ -12,6 +12,13 @@ librespot-core = { version = "=0.8.0", default-features = false, features = ["ru
 librespot-protocol = { version = "=0.8.0", optional = true }
 protobuf = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
+librespot-playback = { version = "=0.8.0", default-features = false, features = ["rodio-backend", "rustls-tls-webpki-roots"], optional = true }
+librespot-connect = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+librespot-oauth = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+# Media keys and the system's media controls for the built-in player (MPRIS on Linux, the
+# media flyout on Windows).
+souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 open = "5"
 rand = "0.8"
@@ -20,18 +27,34 @@ ratatui-image = { version = "=9.0.0", default-features = false, features = ["cro
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-signal-hook = "0.3"
 toml = "0.8"
 unicode-width = "0.2"
 ureq = { version = "2.12", features = ["json"] }
 url = "2"
 ab_glyph = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
+# Windows has no spotifyd: spotlite's own player (the `player` feature) is always built there.
+[target.'cfg(windows)'.dependencies]
+librespot-core = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-playback = { version = "=0.8.0", default-features = false, features = ["rodio-backend", "rustls-tls-webpki-roots"] }
+librespot-connect = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-oauth = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync"] }
+souvlaki = { version = "0.8", default-features = false }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging"] }
+
 [features]
 default = ["client"]
 # Spotify's client protocol (librespot): playlist folders and song radio, which the Web API
 # does not offer.
 client = ["dep:librespot-core", "dep:librespot-protocol", "dep:protobuf", "dep:tokio"]
+# spotlite's own player (`spotlite daemon`, `backend = "builtin"`): librespot plays the audio,
+# so spotifyd is not needed. Always on in Windows builds.
+player = ["client", "dep:librespot-playback", "dep:librespot-connect", "dep:librespot-oauth", "dep:librespot-metadata", "dep:souvlaki", "tokio/rt-multi-thread", "tokio/sync"]
 # Old name of `client`.
 folders = ["client"]
 
