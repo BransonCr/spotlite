@@ -10,7 +10,9 @@ A small Spotify client for the terminal. It replaces the official Electron app
 
 `spotlite` is a small Rust binary (~4.3 MB release build).
 
-On Windows, see [README-windows.md](README-windows.md). The Windows build plays audio itself
+On Windows, download `spotlite.exe` from the
+[releases page](https://github.com/BransonCr/spotlite/releases) and see
+[README-windows.md](README-windows.md). The Windows build plays audio itself
 and does not need spotifyd.
 
 ## Requirements

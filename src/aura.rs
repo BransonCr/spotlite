@@ -661,9 +661,8 @@ mod tests {
     /// Music: every band sounds, and the bass beats.
     fn music(i: usize) -> Frame {
         let mut f = Frame { levels: [0.35; BANDS] };
-        for b in 0..6 {
-            f.levels[b] = if i % 15 < 2 { 0.95 } else { 0.3 };
-        }
+        let bass = if i % 15 < 2 { 0.95 } else { 0.3 };
+        f.levels[..6].fill(bass);
         f
     }
 

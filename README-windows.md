@@ -16,8 +16,9 @@ The Windows build is a snapshot of the Linux version. New snapshots are publishe
 
 ## Install
 
-1. Download `spotlite-win-v<version>.zip` from the
-   [releases page](https://github.com/BransonCr/spotlite/releases) and unzip it.
+1. Download `spotlite.exe` from the
+   [releases page](https://github.com/BransonCr/spotlite/releases). The zip next to it has the
+   same `spotlite.exe` and this README.
 2. Move `spotlite.exe` to a folder you keep, for example `%LOCALAPPDATA%\Programs\spotlite`.
 3. Add that folder to your `PATH` so `spotlite` works from any terminal. In PowerShell:
 
