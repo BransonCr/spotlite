@@ -32,7 +32,7 @@ nerd     = true        # Nerd Font glyphs (powerline arrows, the like heart); fa
 select   = "arrow"     # bar (marker + soft background) | block (inverse) | underline | arrow (❯)
 marker   = "▍"         # one character before the selected row (select = bar or underline)
 viz      = "mirror"    # wave | bars | mirror | dots | none
-liquid   = "ice"       # sidebar effect (V): honey | soda | lava | ink | ice | dew | neon
+aura     = "aurora"    # sidebar effect (V): grooves | stardust | pixels | aurora | ribbons | traces | halftone
 progress = "line"      # line | knob (●) | blocks (stepped gradient) | wave (moving ∿)
 bar      = "─╌"        # two characters: filled and empty part of the progress and volume bars
 volume   = "bar"       # bar | leds (VU meter: green, accent, red)

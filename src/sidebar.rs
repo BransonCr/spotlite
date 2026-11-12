@@ -34,9 +34,10 @@ pub const MIN_SCREEN: u16 = 90;
 pub enum SideFx {
     #[default]
     Off,
-    /// Small drops of liquid over the panel, one per band of the visualizer, each swelling and
-    /// trembling with its band; each theme has its own.
-    Liquid,
+    /// Light that comes off the cover, in the cover's colours, and moves to the music; each
+    /// theme has its own form. (`liquid` is the name of the effect it took the place of.)
+    #[serde(alias = "liquid")]
+    Aura,
     /// The spectrum on its side: bars from the left edge.
     Spectrum,
 }
@@ -342,13 +343,11 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, shown: u16) {
             if view == SideView::Playing && reveal > 0.0 {
                 let frame = app.viz.frame();
                 match fx {
-                    SideFx::Liquid => {
-                        let kind = crate::theme::c().liquid;
-                        // Frozen when the theme turns motion off.
-                        if crate::theme::c().motion {
-                            app.liquid.update(&frame, content.width, content.height, kind);
-                        }
-                        crate::ui::draw_liquid(f.buffer_mut(), content, &app.liquid, kind, reveal);
+                    SideFx::Aura => {
+                        let kind = crate::theme::c().aura;
+                        let cover = app.side_cover;
+                        app.aura.update(&frame, crate::aura::Geo::new(content, cover), kind, theme::motion());
+                        crate::ui::draw_aura(f.buffer_mut(), content, cover, &app.aura, &frame, kind, reveal);
                     }
                     SideFx::Spectrum => {
                         app.side_peaks.update(&frame);
@@ -584,6 +583,9 @@ fn row(buf: &mut Buffer, r: Rect, glyph: Span<'static>, label: &str, right: &str
 
 fn render_playing(buf: &mut Buffer, area: Rect, app: &mut App, live: bool) {
     let t = theme::c();
+    if live {
+        app.side_cover = None;
+    }
     let Some((track, playing)) = app.playback.as_ref().and_then(|pb| pb.item.clone().map(|t| (t, pb.is_playing))) else {
         centered(
             buf,
@@ -639,6 +641,11 @@ fn render_playing(buf: &mut Buffer, area: Rect, app: &mut App, live: bool) {
         draw_cover(buf, app, track.images(), cover, live);
         if live {
             app.hits.np_album = cover;
+            // The aura (V) comes off the cover, in its colours.
+            app.side_cover = Some(cover);
+            let (fw, _) = app.images.font_size();
+            let url = pick_image(track.images(), u32::from(cover.width) * u32::from(fw));
+            app.aura.see_cover(url, &app.images);
         }
         y += rows + 1;
     }

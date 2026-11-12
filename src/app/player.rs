@@ -178,10 +178,10 @@ impl App {
         if !self.sidebar.shows_song() {
             self.show_side(SideView::Playing);
         }
-        let liquid = crate::theme::c().liquid.name();
+        let aura = crate::theme::c().aura;
         let items = vec![
             ("1", "Off".to_owned(), Action::SideFx(SideFx::Off)),
-            ("2", format!("Liquid · {liquid}, drops that move to each band"), Action::SideFx(SideFx::Liquid)),
+            ("2", format!("Aura · {}, {}", aura.name(), aura.about()), Action::SideFx(SideFx::Aura)),
             ("3", "Spectrum · bars on their side".to_owned(), Action::SideFx(SideFx::Spectrum)),
         ];
         let cursor = items.iter().position(|(_, _, a)| *a == Action::SideFx(self.side_fx)).unwrap_or(0);

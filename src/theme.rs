@@ -50,8 +50,8 @@ pub struct Theme {
     pub nerd: bool,
     pub select: Select,
     pub viz: Viz,
-    /// The liquid of the sidebar effect (V).
-    pub liquid: Liquid,
+    /// The aura of the sidebar effect (V).
+    pub aura: Aura,
     pub progress: Progress,
     pub volume: Volume,
     /// Dotted leaders from each song title to its time, like a printed track list.
@@ -117,38 +117,63 @@ pub enum Select {
     Arrow,
 }
 
-/// The liquid in the sidebar (V): each built-in theme has its own.
+/// The aura in the sidebar (V): light that comes off the cover of the song and moves to the
+/// music. Each built-in theme has its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Liquid {
-    /// Slow and thick, warm, with drips from the top.
-    Honey,
-    /// Pastel and lively, full of fizz.
-    Soda,
-    /// Blocky, with a glowing crust and rising blobs.
-    Lava,
-    /// Grey shades, with drops that fall in.
-    Ink,
-    /// Calm and cold, light stripes under the surface, ice on top.
-    Ice,
-    /// Braille dots, with slow sparkles.
-    Dew,
-    /// A dark body under a bright line, sparks off the splashes.
-    Neon,
+pub enum Aura {
+    /// Thin rings round the cover, like the grooves of a record; the music bends them.
+    Grooves,
+    /// Dust that drifts off the cover's edges and twinkles.
+    Stardust,
+    /// Square lights round the cover, a level meter in the cover's colours.
+    Pixels,
+    /// Curtains of light that hang down the panel and sway.
+    Aurora,
+    /// Soft ribbons that flow across the panel, behind the cover.
+    Ribbons,
+    /// Wires that run from the cover, with pulses of light on them.
+    Traces,
+    /// A print of dots round the cover, large where the music is loud.
+    Halftone,
 }
 
-impl Liquid {
-    pub const ALL: [(&'static str, Liquid); 7] = [
-        ("honey", Liquid::Honey),
-        ("soda", Liquid::Soda),
-        ("lava", Liquid::Lava),
-        ("ink", Liquid::Ink),
-        ("ice", Liquid::Ice),
-        ("dew", Liquid::Dew),
-        ("neon", Liquid::Neon),
+impl Aura {
+    pub const ALL: [(&'static str, Aura); 7] = [
+        ("grooves", Aura::Grooves),
+        ("stardust", Aura::Stardust),
+        ("pixels", Aura::Pixels),
+        ("aurora", Aura::Aurora),
+        ("ribbons", Aura::Ribbons),
+        ("traces", Aura::Traces),
+        ("halftone", Aura::Halftone),
+    ];
+
+    /// The values of `liquid`, the key before `aura`: each gives the aura that took its place.
+    const OLD: [(&'static str, Aura); 7] = [
+        ("honey", Aura::Grooves),
+        ("dew", Aura::Stardust),
+        ("lava", Aura::Pixels),
+        ("ice", Aura::Aurora),
+        ("soda", Aura::Ribbons),
+        ("neon", Aura::Traces),
+        ("ink", Aura::Halftone),
     ];
 
     pub fn name(self) -> &'static str {
-        Self::ALL.iter().find(|(_, l)| *l == self).map_or("honey", |(n, _)| n)
+        Self::ALL.iter().find(|(_, l)| *l == self).map_or("grooves", |(n, _)| n)
+    }
+
+    /// What it shows, for the effect menu.
+    pub fn about(self) -> &'static str {
+        match self {
+            Aura::Grooves => "rings round the cover",
+            Aura::Stardust => "dust off the cover",
+            Aura::Pixels => "lights round the cover",
+            Aura::Aurora => "curtains of light",
+            Aura::Ribbons => "ribbons behind the cover",
+            Aura::Traces => "wires from the cover",
+            Aura::Halftone => "a print of dots",
+        }
     }
 }
 
@@ -228,7 +253,7 @@ const AMBER: Theme = Theme {
     nerd: true,
     select: Select::Bar,
     viz: Viz::Wave,
-    liquid: Liquid::Honey,
+    aura: Aura::Grooves,
     progress: Progress::Line,
     volume: Volume::Bar,
     leaders: false,
@@ -321,7 +346,7 @@ pub fn all() -> Vec<(String, String)> {
 pub fn parse(text: &str) -> Result<Theme, String> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.message().trim().to_owned())?;
     let mut t = AMBER;
-    let mut liquid = None;
+    let mut aura = None;
     for (key, value) in &table {
         if let Some(b) = value.as_bool() {
             match key.as_str() {
@@ -389,8 +414,13 @@ pub fn parse(text: &str) -> Result<Theme, String> {
                 )?;
                 continue;
             }
+            "aura" => {
+                aura = Some(pick(key, s, &Aura::ALL)?);
+                continue;
+            }
+            // The key before `aura`: a theme file that has it still loads.
             "liquid" => {
-                liquid = Some(pick(key, s, &Liquid::ALL)?);
+                aura = aura.or(Some(pick(key, s, &Aura::OLD)?));
                 continue;
             }
             "viz" => {
@@ -454,13 +484,13 @@ pub fn parse(text: &str) -> Result<Theme, String> {
         };
         *slot = hex(s).ok_or_else(|| format!("{key}: “{s}” is not a \"#rrggbb\" colour"))?;
     }
-    // A theme without a liquid gets one that fits its visualizer.
-    t.liquid = liquid.unwrap_or(match t.viz {
-        Viz::Wave => Liquid::Honey,
-        Viz::Bars => Liquid::Lava,
-        Viz::Mirror => Liquid::Ice,
-        Viz::Dots => Liquid::Dew,
-        Viz::None => Liquid::Ink,
+    // A theme without an aura gets one that fits its visualizer.
+    t.aura = aura.unwrap_or(match t.viz {
+        Viz::Wave => Aura::Grooves,
+        Viz::Bars => Aura::Pixels,
+        Viz::Mirror => Aura::Aurora,
+        Viz::Dots => Aura::Stardust,
+        Viz::None => Aura::Halftone,
     });
     Ok(t)
 }
@@ -640,10 +670,12 @@ mod tests {
             })
             .collect();
         assert_eq!(looks.len(), BUILTIN.len(), "every theme has its own look, not only its own colours");
-        let liquids: std::collections::HashSet<&str> = BUILTIN.iter().map(|(_, text)| parse(text).unwrap().liquid.name()).collect();
-        assert_eq!(liquids.len(), BUILTIN.len(), "every theme has its own liquid");
-        assert_eq!(parse("viz = \"bars\"").unwrap().liquid, Liquid::Lava, "a liquid that fits the visualizer");
-        assert!(parse("liquid = \"oil\"").is_err());
+        let auras: std::collections::HashSet<&str> = BUILTIN.iter().map(|(_, text)| parse(text).unwrap().aura.name()).collect();
+        assert_eq!(auras.len(), BUILTIN.len(), "every theme has its own aura");
+        assert_eq!(parse("viz = \"bars\"").unwrap().aura, Aura::Pixels, "an aura that fits the visualizer");
+        assert!(parse("aura = \"oil\"").is_err());
+        assert_eq!(parse("liquid = \"neon\"").unwrap().aura, Aura::Traces, "a theme file from before the aura still loads");
+        assert_eq!(parse("aura = \"ribbons\"\nliquid = \"ink\"").unwrap().aura, Aura::Ribbons, "the new key wins");
         let t = parse("accent = \"#ff0000\"").unwrap();
         assert_eq!((t.accent, t.text), (Color::Rgb(255, 0, 0), AMBER.text));
         assert!(parse("accent = \"red\"").is_err());

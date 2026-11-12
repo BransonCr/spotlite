@@ -263,6 +263,30 @@ Cost while running (20 fps): about 0.5% CPU in spotlite and a few percent in the
 which redraws the changed cells. `SPOTLITE_VIZ=1` starts with it on;
 `SPOTLITE_VIZ_FPS` sets the frame rate (lower = cheaper).
 
+
+### Sidebar aura
+
+`V` picks an effect for the sidebar's Playing view: off, the aura, or the spectrum on its
+side. The aura is light that comes off the cover of the song. Its colours are the cover's
+(8 × 8 points of the picture, faded from one cover to the next), it starts at the cover's
+edges, and the music moves it: each band has a direction from the cover, and a bass beat
+sends a pulse out. Each theme has its own form, set with `aura` in the theme file:
+
+| `aura` | Theme | What it shows |
+| --- | --- | --- |
+| `grooves` | amber | thin rings like a record's grooves, bent by the spectrum |
+| `stardust` | rose-pine | dust that drifts off the cover, with stars that flash on treble |
+| `pixels` | gruvbox | square lights, a level meter that goes out from the cover |
+| `aurora` | nord | curtains of light; their hem is the spectrum |
+| `ribbons` | catppuccin | three ribbons for bass, middle and treble |
+| `traces` | tokyo-night | wires from the cover, with pulses of light on them |
+| `halftone` | mono | a print of dots, larger where the music is loud |
+
+It draws glyphs only, in empty cells and never between two words, so text stays readable
+and the terminal's background shows through. With `motion = false` it does not move in
+time; it follows only the levels of the music. `python3 tools/aura-preview.py` draws
+pictures of every form without a terminal (see the file's first lines).
+
 ### Cover art
 
 Playlists show their cover in each row, track lists show a small album thumbnail,

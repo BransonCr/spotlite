@@ -492,7 +492,7 @@ fn capital_v_picks_the_sidebar_effect_with_a_preview() {
     assert!(app.sidebar.open, "it opens the sidebar on the song");
     assert_eq!(app.menu.as_ref().unwrap().title, "Sidebar effect");
     app.on_key(KeyEvent::from(KeyCode::Down));
-    assert_eq!(app.side_fx, SideFx::Liquid, "moving previews");
+    assert_eq!(app.side_fx, SideFx::Aura, "moving previews");
     assert!(app.side_fx_shown().1 < 0.5, "it fills in");
     let _ = screen(&mut app, 120, 40);
     app.on_key(KeyEvent::from(KeyCode::Esc));
@@ -507,42 +507,184 @@ fn capital_v_picks_the_sidebar_effect_with_a_preview() {
     assert!(!app.viz_on, "the main visualizer is apart");
 }
 
-#[test]
-fn text_over_the_liquid_is_made_readable() {
-    let dark = Color::Rgb(0x30, 0x24, 0x10);
-    // Dim text on a dark liquid becomes light; text that reads well stays.
-    let fixed = readable(Color::Rgb(0x5f, 0x5e, 0x59), dark);
-    assert_ne!(fixed, Color::Rgb(0x5f, 0x5e, 0x59));
-    assert_eq!(readable(Color::Rgb(0xec, 0xeb, 0xe6), dark), Color::Rgb(0xec, 0xeb, 0xe6));
-    // On a light liquid, text goes dark.
-    let Color::Rgb(r, _, _) = readable(Color::Rgb(0xd0, 0xd0, 0xd0), Color::Rgb(0xe0, 0xc0, 0x80)) else { panic!() };
-    assert!(r < 0x80);
+/// A panel for the aura: 36 × 30 cells with a cover at its top, a line of text, and music.
+const AURA_AREA: Rect = Rect { x: 0, y: 0, width: 36, height: 30 };
+const AURA_COVER: Rect = Rect { x: 4, y: 0, width: 28, height: 14 };
+
+fn aura_music(i: usize) -> viz::Frame {
+    let mut f = viz::Frame::default();
+    for (b, l) in f.levels.iter_mut().enumerate() {
+        *l = 0.3 + 0.45 * (b as f32 * 0.4 + i as f32 * 0.21).sin().abs();
+    }
+    if i % 15 < 2 {
+        f.levels[..6].fill(0.95);
+    }
+    f
+}
+
+/// The aura after `secs` of `sound`, drawn over a cover (a picture) and a line of text.
+fn aura_drawn(kind: theme::Aura, colours: Option<[u8; 3]>, secs: f32, sound: impl Fn(usize) -> viz::Frame, reveal: f32) -> Buffer {
+    let geo = crate::aura::Geo::new(AURA_AREA, Some(AURA_COVER));
+    let mut aura = crate::aura::Aura::default();
+    if let Some(c) = colours {
+        aura.set_colours(&[c; crate::images::SWATCH * crate::images::SWATCH]);
+    }
+    let steps = (secs * 30.0) as usize;
+    for i in 0..steps {
+        aura.advance(&sound(i), geo, kind, 1.0 / 30.0);
+    }
+    let mut buf = Buffer::empty(AURA_AREA);
+    for y in AURA_COVER.top()..AURA_COVER.bottom() {
+        for x in AURA_COVER.left()..AURA_COVER.right() {
+            buf[(x, y)].skip = true;
+        }
+    }
+    buf.set_string(8, 16, "Teardrop by Massive", Style::new().fg(Color::Rgb(1, 2, 3)));
+    draw_aura(&mut buf, AURA_AREA, Some(AURA_COVER), &aura, &sound(steps), kind, reveal);
+    buf
+}
+
+/// The cells the aura drew, and the light in them (the sum of their colours).
+fn aura_light(buf: &Buffer) -> (usize, u32) {
+    let lit: Vec<u32> = buf
+        .content
+        .iter()
+        .filter(|c| !c.skip && c.symbol() != " " && c.fg != Color::Rgb(1, 2, 3))
+        .map(|c| if let Color::Rgb(r, g, b) = c.fg { r as u32 + g as u32 + b as u32 } else { 0 })
+        .collect();
+    (lit.len(), lit.iter().sum())
 }
 
 #[test]
-fn every_liquid_draws_its_drops_and_keeps_text_and_pictures() {
-    for (name, kind) in theme::Liquid::ALL {
-        let mut liquid = crate::liquid::Liquid::default();
-        // Loud, so the drops are big.
-        liquid.advance(&viz::Frame { levels: [0.9; viz::BANDS] }, 30, 20, kind, 0.5);
-        let area = Rect::new(0, 0, 30, 20);
-        let d = liquid.drops[20];
-        let (mx, my) = (d.x as u16, (d.y / 2.0) as u16);
-        let mut buf = Buffer::empty(area);
-        buf.set_string(mx, my, "S", Style::new());
-        let e = liquid.drops[26];
-        let (px, py) = (e.x as u16, (e.y / 2.0) as u16);
-        buf[(px, py)].skip = true;
-        draw_liquid(&mut buf, area, &liquid, kind, 1.0);
-        assert_eq!(buf[(mx, my)].symbol(), "S", "{name}: text is kept");
-        assert_ne!(buf[(mx, my)].bg, Color::Reset, "{name}: and floats in the liquid");
-        assert_eq!(buf[(px, py)].symbol(), " ", "{name}: the picture is left alone");
-        let drawn = (0..20).filter(|&y| (0..30).any(|x| buf[(x, y)].symbol() != " ")).count();
-        assert!(drawn >= 12, "{name}: drops all over, top to bottom: {drawn} rows");
-        let mut empty = Buffer::empty(area);
-        draw_liquid(&mut empty, area, &liquid, kind, 0.0);
-        assert_eq!(empty, Buffer::empty(area), "{name}: gone, nothing");
+fn every_aura_draws_round_the_cover_and_keeps_text_and_pictures() {
+    for (name, kind) in theme::Aura::ALL {
+        let buf = aura_drawn(kind, Some([200, 60, 30]), 4.0, aura_music, 1.0);
+        let (cells, _) = aura_light(&buf);
+        assert!(cells >= 25, "{name}: it shows: {cells} cells");
+        for (i, ch) in "Teardrop by Massive".chars().enumerate() {
+            let cell = &buf[(8 + i as u16, 16)];
+            if ch != ' ' {
+                assert_eq!((cell.symbol(), cell.fg), (ch.to_string().as_str(), Color::Rgb(1, 2, 3)), "{name}: text is kept");
+            }
+        }
+        for y in AURA_COVER.top()..AURA_COVER.bottom() {
+            for x in AURA_COVER.left()..AURA_COVER.right() {
+                assert_eq!(buf[(x, y)].symbol(), " ", "{name}: the picture is left alone");
+            }
+        }
+        assert!(buf.content.iter().all(|c| c.bg == Color::Reset), "{name}: only glyphs, the background shows through");
+        // It stays behind the text: no cell is near full light.
+        let brightest = buf.content.iter().filter(|c| c.fg != Color::Rgb(1, 2, 3)).filter_map(|c| if let Color::Rgb(r, g, b) = c.fg { Some(r.max(g).max(b)) } else { None }).max();
+        assert!(brightest.is_some_and(|v| v > 40), "{name}: it can be seen: {brightest:?}");
+        let gone = aura_drawn(kind, Some([200, 60, 30]), 4.0, aura_music, 0.0);
+        assert_eq!(aura_light(&gone).0, 0, "{name}: gone, nothing");
+        // Without a cover (a short panel), and in a panel too small: no panic.
+        let mut small = Buffer::empty(Rect::new(0, 0, 12, 6));
+        let mut aura = crate::aura::Aura::default();
+        aura.advance(&aura_music(0), crate::aura::Geo::new(small.area, None), kind, 0.5);
+        aura.advance(&aura_music(1), crate::aura::Geo::new(small.area, None), kind, 0.5);
+        draw_aura(&mut small, Rect::new(0, 0, 12, 6), None, &aura, &aura_music(1), kind, 1.0);
+        draw_aura(&mut small, Rect::new(0, 0, 3, 1), None, &aura, &aura_music(1), kind, 1.0);
+        draw_aura(&mut small, Rect::new(4, 2, 40, 40), Some(Rect::new(30, 30, 9, 9)), &aura, &aura_music(1), kind, 0.5);
     }
+}
+
+#[test]
+fn every_aura_moves_to_the_music() {
+    for (name, kind) in theme::Aura::ALL {
+        let quiet = aura_light(&aura_drawn(kind, Some([200, 60, 30]), 4.0, |_| viz::Frame::default(), 1.0));
+        let loud = aura_light(&aura_drawn(kind, Some([200, 60, 30]), 4.0, aura_music, 1.0));
+        assert!(loud.1 > quiet.1 * 3 / 2, "{name}: more light with music: {quiet:?} then {loud:?}");
+        assert!(quiet.0 < AURA_AREA.area() as usize / 4, "{name}: calm in silence: {} cells", quiet.0);
+    }
+}
+
+#[test]
+fn the_aura_has_the_colours_of_the_cover() {
+    for (name, kind) in theme::Aura::ALL {
+        let sum = |buf: &Buffer| {
+            buf.content.iter().filter(|c| c.fg != Color::Rgb(1, 2, 3)).fold([0u32; 3], |mut s, c| {
+                if let Color::Rgb(r, g, b) = c.fg {
+                    s = [s[0] + r as u32, s[1] + g as u32, s[2] + b as u32];
+                }
+                s
+            })
+        };
+        let red = sum(&aura_drawn(kind, Some([220, 30, 30]), 3.0, aura_music, 1.0));
+        let blue = sum(&aura_drawn(kind, Some([30, 30, 220]), 3.0, aura_music, 1.0));
+        assert!(red[0] * blue[2] > red[2] * blue[0], "{name}: a red cover gives redder light than a blue one: {red:?} {blue:?}");
+        // No cover's colours known: the theme's own.
+        assert!(aura_light(&aura_drawn(kind, None, 3.0, aura_music, 1.0)).0 > 0, "{name}");
+    }
+}
+
+/// Writes pictures' data of the aura in the real sidebar, one file per theme, for
+/// `tools/aura-preview.py`: `SPOTLITE_PREVIEW=<dir> cargo test aura_preview -- --ignored`.
+#[test]
+#[ignore]
+fn aura_preview() {
+    use crate::sidebar::SideFx;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    let Some(dir) = std::env::var_os("SPOTLITE_PREVIEW").map(std::path::PathBuf::from) else { return };
+    // A cover: a warm sky over a cold sea.
+    let mut swatch = [[0u8; 3]; crate::images::SWATCH * crate::images::SWATCH];
+    for (i, px) in swatch.iter_mut().enumerate() {
+        let (u, v) = ((i % 8) as f32 / 7.0, (i / 8) as f32 / 7.0);
+        let sky = [250.0 - 60.0 * u, 120.0 + 90.0 * u * (1.0 - v), 60.0 + 120.0 * v];
+        let sea = [20.0 + 40.0 * u, 110.0 + 80.0 * (1.0 - u), 190.0 - 40.0 * v];
+        *px = std::array::from_fn(|c| if v < 0.55 { sky[c] } else { sea[c] } as u8);
+    }
+    for (name, _) in theme::BUILTIN {
+        theme::apply(name).unwrap();
+        let (mut app, _rx) = test_app();
+        app.typing = false;
+        app.on_msg(playing(&track("Teardrop", "Massive Attack", "Mezzanine")));
+        app.on_key(KeyEvent::from(KeyCode::Char('<')));
+        for shot in ["quiet", "loud"] {
+            let mut terminal = Terminal::new(TestBackend::new(120, 44)).unwrap();
+            while app.sidebar.animating() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                terminal.draw(|f| draw(f, &mut app)).unwrap();
+            }
+            app.sidebar.step();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let mut buf = terminal.backend().buffer().clone();
+            let side = app.hits.side;
+            let content = match theme::c().frame {
+                theme::Frame::Full => Rect::new(side.x + 2, side.y + 4, side.width - 4, side.height - 5),
+                theme::Frame::Rule => Rect::new(side.x + 1, side.y + 3, side.width - 3, side.height - 3),
+                theme::Frame::None => Rect::new(side.x + 1, side.y + 3, side.width - 2, side.height - 3),
+            };
+            let cover = app.side_cover;
+            let geo = crate::aura::Geo::new(content, cover);
+            let kind = theme::c().aura;
+            app.aura.set_colours(&swatch);
+            let dt = if theme::motion() { 1.0 / 30.0 } else { 0.0 };
+            let sound = |i: usize| if shot == "loud" { aura_music(i) } else { viz::Frame { levels: [0.04; viz::BANDS] } };
+            for i in 0..150 {
+                app.aura.advance(&sound(i), geo, kind, dt);
+            }
+            assert_eq!(app.side_fx, SideFx::Off);
+            draw_aura(&mut buf, content, cover, &app.aura, &sound(150), kind, 1.0);
+            let mut out = format!("{} {} {} {} {}\n", side.width + 2, side.height, side.x, side.y, name);
+            if let Some(c) = cover {
+                out += &format!("cover {} {} {} {}\n", c.x, c.y, c.width, c.height);
+            }
+            out += &format!("bg {}\n", if let Color::Rgb(r, g, b) = theme::c().viz_low { format!("{r} {g} {b}") } else { "0 0 0".into() });
+            for y in side.top()..side.bottom() {
+                for x in side.left()..side.right() + 2 {
+                    let c = &buf[(x, y)];
+                    let col = |c: Color, d: &str| if let Color::Rgb(r, g, b) = c { format!("{r} {g} {b}") } else { d.to_owned() };
+                    if c.symbol() != " " || c.bg != Color::Reset {
+                        out += &format!("{x} {y} {} {} {}\n", col(c.fg, "200 200 200"), col(c.bg, "-1 -1 -1"), c.symbol());
+                    }
+                }
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{name}-{shot}.txt")), out).unwrap();
+        }
+    }
+    theme::apply(theme::DEFAULT).unwrap();
 }
 
 #[test]

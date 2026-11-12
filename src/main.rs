@@ -10,7 +10,7 @@ mod genres;
 mod images;
 mod input;
 mod keys;
-mod liquid;
+mod aura;
 mod log;
 mod pages;
 mod palette;

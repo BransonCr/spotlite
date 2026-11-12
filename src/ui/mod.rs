@@ -20,6 +20,7 @@ use ratatui::Frame;
 use ratatui_image::Image;
 use unicode_width::UnicodeWidthStr;
 
+mod aura;
 mod header;
 mod lists;
 mod pages;
@@ -35,6 +36,7 @@ use lists::*;
 use pages::*;
 pub use player::*;
 use popups::*;
+pub use aura::draw_aura;
 pub use effects::*;
 pub use widgets::*;
 

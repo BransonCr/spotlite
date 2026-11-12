@@ -187,7 +187,7 @@ impl App {
             self.set_side_fx(fx);
             self.info(match fx {
                 SideFx::Off => "Sidebar effect off".to_owned(),
-                SideFx::Liquid => format!("Sidebar effect: {}", crate::theme::c().liquid.name()),
+                SideFx::Aura => format!("Sidebar effect: aura ({})", crate::theme::c().aura.name()),
                 SideFx::Spectrum => "Sidebar effect: spectrum".to_owned(),
             });
             return;

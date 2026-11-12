@@ -39,6 +39,18 @@ pub struct Frame {
     pub levels: [f32; BANDS],
 }
 
+impl Frame {
+    /// The level at `pos` (0 = lowest band, 1 = highest), with smooth blending between bands.
+    pub fn at(&self, pos: f32) -> f32 {
+        let pos = pos.clamp(0.0, 1.0) * (BANDS - 1) as f32;
+        let (i, t) = (pos.floor() as usize, pos.fract());
+        let j = (i + 1).min(BANDS - 1);
+        // Smoothstep between bands: rounded curves instead of straight steps.
+        let t = t * t * (3.0 - 2.0 * t);
+        self.levels[i] * (1.0 - t) + self.levels[j] * t
+    }
+}
+
 impl Default for Frame {
     fn default() -> Self {
         Frame { levels: [0.0; BANDS] }

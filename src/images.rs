@@ -27,12 +27,20 @@ const DISK_LIMIT: u64 = 64 << 20;
 /// A picture at one size in cells: the URL's hash, columns, rows.
 type Key = (u64, u16, u16);
 
+/// The colours of a cover: `SWATCH` × `SWATCH` points of it, row by row. The sidebar's aura
+/// takes its colours from them.
+pub const SWATCH: usize = 8;
+pub type Swatch = [[u8; 3]; SWATCH * SWATCH];
+
+/// A picture ready for the terminal, and its colours.
+type Loaded = (Protocol, Box<Swatch>);
+
 /// Download threads: covers of a fresh list come in parallel.
 const THREADS: usize = 3;
 
 enum Slot {
     Pending,
-    Ready(Protocol),
+    Ready(Protocol, Box<Swatch>),
     Failed,
 }
 
@@ -47,7 +55,7 @@ struct Queue {
 pub struct Images {
     picker: Option<Picker>,
     queue: Option<Arc<(Mutex<Queue>, Condvar)>>,
-    rx: Option<Receiver<(Key, Option<Protocol>)>>,
+    rx: Option<Receiver<(Key, Option<Loaded>)>>,
     /// Each picture, and the draw it was last used in (the least recent goes first).
     cache: HashMap<Key, (Slot, u64)>,
     /// The draw count: `poll` moves it on.
@@ -134,12 +142,21 @@ impl Images {
             Some((slot, used)) => {
                 *used = frame;
                 match slot {
-                    Slot::Ready(p) => Some(p),
+                    Slot::Ready(p, _) => Some(p),
                     _ => None,
                 }
             }
             None => None,
         }
+    }
+
+    /// The colours of a cover that is loaded (at any size), or None.
+    pub fn swatch(&self, url: &str) -> Option<Swatch> {
+        let h = hash(url);
+        self.cache.iter().find_map(|(key, (slot, _))| match slot {
+            Slot::Ready(_, s) if key.0 == h => Some(**s),
+            _ => None,
+        })
     }
 
     /// Takes finished pictures from the threads. Returns true if any arrived.
@@ -151,7 +168,7 @@ impl Images {
             any = true;
             // It may have been evicted while loading; then it is not wanted any more.
             if let Some((slot, _)) = self.cache.get_mut(&key) {
-                *slot = protocol.map_or(Slot::Failed, Slot::Ready);
+                *slot = protocol.map_or(Slot::Failed, |(p, s)| Slot::Ready(p, s));
             }
         }
         any
@@ -241,12 +258,16 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Decodes a JPEG/PNG and encodes it to fill `cols` x `rows` cells.
-pub fn encode(picker: &Picker, bytes: &[u8], cols: u16, rows: u16) -> Option<Protocol> {
+/// Decodes a JPEG/PNG and encodes it to fill `cols` x `rows` cells. Also gives its colours.
+pub fn encode(picker: &Picker, bytes: &[u8], cols: u16, rows: u16) -> Option<Loaded> {
     let img = image::load_from_memory(bytes).ok()?;
-    picker
-        .new_protocol(img, Rect::new(0, 0, cols, rows), Resize::Scale(Some(FilterType::Triangle)))
-        .ok()
+    let small = img.thumbnail_exact(SWATCH as u32, SWATCH as u32).to_rgb8();
+    let mut swatch = Box::new([[0u8; 3]; SWATCH * SWATCH]);
+    for (slot, px) in swatch.iter_mut().zip(small.pixels()) {
+        *slot = px.0;
+    }
+    let protocol = picker.new_protocol(img, Rect::new(0, 0, cols, rows), Resize::Scale(Some(FilterType::Triangle))).ok()?;
+    Some((protocol, swatch))
 }
 
 #[cfg(test)]
@@ -260,8 +281,10 @@ mod tests {
         let img = RgbImage::from_fn(64, 64, |x, _| Rgb([x as u8 * 4, 100, 50]));
         let mut png = Vec::new();
         img.write_to(&mut Cursor::new(&mut png), ImageFormat::Png).unwrap();
-        let protocol = encode(&Picker::halfblocks(), &png, 4, 2).expect("encodes");
+        let (protocol, swatch) = encode(&Picker::halfblocks(), &png, 4, 2).expect("encodes");
         assert!(matches!(protocol, Protocol::Halfblocks(_)));
+        assert!(swatch[0][0] < swatch[SWATCH - 1][0], "the colours go left to right: {swatch:?}");
+        assert_eq!(swatch[0][1], 100);
         assert!(encode(&Picker::halfblocks(), b"not an image", 4, 2).is_none());
     }
 

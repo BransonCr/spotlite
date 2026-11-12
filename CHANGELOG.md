@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Looks
+- The sidebar effect Liquid (`V`) is gone. In its place: Aura, light that comes off the cover
+  of the playing song, in the cover's colours, and moves to the music. Each theme has its own
+  form: grooves (amber), stardust (rose-pine), pixels (gruvbox), aurora (nord), ribbons
+  (catppuccin), traces (tokyo-night), halftone (mono). The colours fade from one cover to the
+  next. The aura draws glyphs only, never over text or between words.
+- Theme key `aura` takes the place of `liquid`. A theme file with `liquid` still loads.
+
 ## 0.2.0
 
 ### Find and act faster

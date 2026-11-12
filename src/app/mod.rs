@@ -373,7 +373,9 @@ pub struct App {
     pub side_fx_at: Option<Instant>,
     side_fx_out: SideFx,
     side_fx_before: Option<SideFx>,
-    pub liquid: crate::liquid::Liquid,
+    pub aura: crate::aura::Aura,
+    /// Where the sidebar drew the cover of the playing song, if it did (the aura comes off it).
+    pub side_cover: Option<ratatui::layout::Rect>,
     /// When the main visualizer (v) was last turned on or off, for its sweep.
     pub viz_at: Option<Instant>,
     pub side_peaks: crate::viz::Peaks,
@@ -539,7 +541,8 @@ impl App {
             side_fx_at: None,
             side_fx_out: SideFx::Off,
             side_fx_before: None,
-            liquid: Default::default(),
+            aura: Default::default(),
+            side_cover: None,
             viz_at: None,
             side_peaks: Default::default(),
             images,
