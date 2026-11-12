@@ -13,6 +13,7 @@ mod input;
 mod keys;
 mod aura;
 mod log;
+mod login;
 mod pages;
 mod palette;
 mod card;
@@ -45,7 +46,7 @@ spotlite - lightweight Spotify client (plays through spotifyd)
 
 usage:
   spotlite            open the terminal UI
-  spotlite auth       log in to Spotify (once)
+  spotlite auth       log in to Spotify in the browser (spotlite asks by itself when it must)
   spotlite devices    list Spotify Connect devices
   spotlite folders    show your playlist folders
   spotlite radio URI  list the radio for a song or artist (spotify:track:... or spotify:artist:...)
@@ -74,8 +75,6 @@ fn main() -> Result<()> {
         }
         Some("auth") => {
             auth::login(&Config::load()?)?;
-            // Another account may have logged in: ask Spotify who it is again.
-            let _ = std::fs::remove_file(config::user_path());
             println!("Logged in. Token saved to {}", config::token_path().display());
             Ok(())
         }
@@ -239,14 +238,34 @@ fn theme_cmd(args: Vec<String>) -> Result<()> {
 fn run_tui() -> Result<()> {
     let cfg = Config::load()?;
     let cfg_keys = cfg.keys.clone();
-    let api = Spotify::new(cfg)?;
+    let login_reason = auth::needs_login(&cfg);
     start_spotifyd();
+    let mut terminal = ratatui::init();
+    // No saved login, or Spotify ended it: the login screen, before anything else.
+    if let Some(reason) = login_reason {
+        if let Some(name) = theme::env_override().or(state::load().theme) {
+            let _ = theme::apply(&name);
+        }
+        match login::screen(&mut terminal, &cfg, &reason) {
+            Ok(true) => {}
+            other => {
+                ratatui::restore();
+                return other.map(|_| ());
+            }
+        }
+    }
+    let api = match Spotify::new(cfg) {
+        Ok(api) => api,
+        Err(e) => {
+            ratatui::restore();
+            return Err(e);
+        }
+    };
     let can_like = api.has_scope("user-library-modify");
     let can_edit = api.has_scope("playlist-modify-private");
     let can_taste = api.has_scope("user-top-read") && api.has_scope("user-read-recently-played");
     let device_name = api.config().device_name.clone();
     let (tx, msg_tx, rx) = worker::spawn(api);
-    let mut terminal = ratatui::init();
     // ratatui's panic hook restores the screen; also give the mouse back to the terminal.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

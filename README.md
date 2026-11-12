@@ -44,14 +44,19 @@ A small Spotify client for the terminal. It replaces the official Electron app
    If spotifyd was already running, restart it after you log in:
    `systemctl --user restart spotifyd`.
 
-4. Install spotlite, log in, and check that the `spotlite` device is listed:
+4. Install spotlite and start it:
 
    ```sh
    cargo install --locked --path .
-   spotlite auth
-   spotlite devices
    spotlite
    ```
+
+   The first time, spotlite shows a login screen. Press `Enter` to log in with
+   Spotify in the browser; spotlite starts when the browser comes back. The login
+   is saved in `~/.cache/spotlite/token.json` and refreshed by itself, so the login
+   screen comes back only if Spotify ends the login (for example, if you remove
+   the app's access in your Spotify account). `spotlite auth` still does the same
+   login from a shell, and `spotlite devices` lists the Spotify Connect devices.
 
 ## Keys
 
