@@ -51,7 +51,7 @@ impl Images {
             .name("spotlite-img".into())
             .spawn(move || {
                 if let Some(dir) = &dir {
-                    prune(dir, DISK_LIMIT);
+                    crate::store::prune_dir(dir, DISK_LIMIT);
                 }
                 let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build();
                 for key in key_rx {
@@ -167,28 +167,6 @@ fn load(dir: Option<&Path>, url: &str, fetch: impl FnOnce(&str) -> Option<Vec<u8
     Some(bytes)
 }
 
-/// Removes the oldest saved covers until the folder holds at most `limit` bytes.
-fn prune(dir: &Path, limit: u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let meta = e.metadata().ok()?;
-            meta.is_file().then(|| (meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len(), e.path()))
-        })
-        .collect();
-    let mut total: u64 = files.iter().map(|f| f.1).sum();
-    files.sort_by_key(|f| f.0);
-    for (_, len, path) in files {
-        if total <= limit {
-            break;
-        }
-        if std::fs::remove_file(&path).is_ok() {
-            total -= len;
-        }
-    }
-}
-
 fn fetch(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
     let resp = agent.get(url).call().ok()?;
     let mut bytes = Vec::new();
@@ -252,7 +230,7 @@ mod tests {
             let f = std::fs::File::options().write(true).open(&path).unwrap();
             f.set_modified(now - Duration::from_secs(100 - i as u64 * 10)).unwrap();
         }
-        prune(&dir, 20);
+        crate::store::prune_dir(&dir, 20);
         let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         left.sort();
         assert_eq!(left, ["mid", "new"]);

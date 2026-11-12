@@ -1,6 +1,6 @@
 //! Spotify's client protocol (librespot), for what the Web API does not offer: playlist
 //! folders and song radio. It logs in with spotifyd's saved librespot login (read only), so
-//! there is no second login. Each use is short: connect, ask, disconnect.
+//! there is no second login. Uses close together share one connection (see `with`).
 
 #[cfg(feature = "client")]
 pub use imp::*;
@@ -9,6 +9,8 @@ pub use imp::*;
 mod imp {
     use anyhow::Result;
     use librespot_core::{Session, SessionConfig};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
     use tokio::runtime::Runtime;
 
     /// spotifyd's saved librespot login (written by `spotifyd authenticate`).
@@ -21,8 +23,8 @@ mod imp {
     }
 
     /// A connected session and the single-threaded runtime it runs on. Blocks while it
-    /// connects; call it from a background thread.
-    pub fn connect() -> Result<(Runtime, Session)> {
+    /// connects.
+    fn connect() -> Result<(Runtime, Session)> {
         let credentials = spotifyd_credentials()
             .ok_or_else(|| anyhow::anyhow!("no spotifyd login found; run `spotifyd authenticate`"))?;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -33,12 +35,39 @@ mod imp {
         Ok((rt, session))
     }
 
+    /// The last session, kept for a short time: a radio, its discover rounds, a playlist and a
+    /// shuffle often come close together, and each connect takes 1 to 2 s. Nothing drives an
+    /// idle session, so an older one is not trusted.
+    static KEPT: Mutex<Option<(Runtime, Session, Instant)>> = Mutex::new(None);
+    const KEEP: Duration = Duration::from_secs(45);
+
+    /// Runs `f` with a connected session: the kept one if it is recent, else a new one. If the
+    /// kept one fails, `f` runs once more with a new session. Blocks; call it from a
+    /// background thread. One use at a time (others wait).
+    pub fn with<T>(f: impl Fn(&Runtime, &Session) -> Result<T>) -> Result<T> {
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((rt, session, at)) = kept.take() {
+            if at.elapsed() < KEEP && !session.is_invalid() {
+                if let Ok(v) = f(&rt, &session) {
+                    *kept = Some((rt, session, Instant::now()));
+                    return Ok(v);
+                }
+            }
+            session.shutdown();
+        }
+        let (rt, session) = connect()?;
+        let result = f(&rt, &session);
+        match result {
+            Ok(_) => *kept = Some((rt, session, Instant::now())),
+            Err(_) => session.shutdown(),
+        }
+        result
+    }
+
     /// The account's user id, from the client protocol login. The Web API's /me can be refused
     /// for hours; this asks nothing of it.
     pub fn username() -> Option<String> {
-        let (_rt, session) = connect().ok()?;
-        let name = session.username();
-        session.shutdown();
+        let name = with(|_, session| Ok(session.username())).ok()?;
         (!name.is_empty()).then_some(name)
     }
 }

@@ -9,6 +9,7 @@ mod genre;
 mod genres;
 mod images;
 mod liquid;
+mod log;
 mod pages;
 mod palette;
 mod card;

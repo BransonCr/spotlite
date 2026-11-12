@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::collections::{HashMap, VecDeque};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// A list the UI shows, used to route pages back to the right place.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +73,8 @@ pub enum Cmd {
     Unsample { restore: Option<Restore> },
     /// 50 random songs of a genre.
     Randomize(String),
+    /// Reload: the saved copy with this name (see `kept`) is not used until a new one is saved.
+    Refresh(String),
     RemoveFromPlaylist { playlist_id: String, playlist: String, uri: String, what: String },
 }
 
@@ -107,14 +109,17 @@ pub enum Msg {
     Removed { playlist_id: String, uri: String },
     /// A track was added to a playlist.
     Added { playlist_id: String },
-    UpNext(Option<Track>),
+    /// The songs that play next, in order (up to 20).
+    UpNext(Vec<Track>),
+    /// Every Liked Song, newest first (from the saved copy, brought up to date).
+    Liked(Vec<Track>),
     /// A true shuffle started: these songs play for `context`.
     Shuffled { context: String, uris: Vec<String> },
     Random { genre: String, result: Result<Vec<Track>, String> },
     /// A sample plays (or could not start).
     Sampling { genre: String, result: Result<Track, String> },
-    /// A playlist was created: the Playlists tab loads again.
-    Created,
+    /// A playlist was created.
+    Created(Box<Playlist>),
     /// Sent after every command.
     Done(Kind),
 }
@@ -144,8 +149,16 @@ pub fn spawn(api: Spotify) -> (Sender<Cmd>, Sender<Msg>, Receiver<Msg>) {
         found_searches: SearchCache::default(),
         me_tried: None,
         samples: Vec::new(),
-        picked: HashMap::new(),
+        picked: crate::store::read("picked.json").unwrap_or_default(),
+        snapshots: HashMap::new(),
+        stale: HashMap::new(),
+        partial: HashMap::new(),
+        memo: crate::genre::Memo { depths: crate::store::read("depths.json").unwrap_or_default(), ..Default::default() },
     };
+    // The saved copies stay small: the oldest go first.
+    crate::store::prune("lists", 24 << 20);
+    crate::store::prune("albums", 16 << 20);
+    crate::store::prune("artists", 8 << 20);
     thread::Builder::new()
         .name("spotlite-api".into())
         .spawn(move || worker.run(cmd_rx))
@@ -165,11 +178,71 @@ struct Worker {
     me_tried: Option<Instant>,
     /// Genres sampled lately, and their songs, most popular first (Tab again is instant).
     samples: Vec<(String, Vec<Track>)>,
-    /// Prepicked sample songs found so far, by their search (samples.rs).
+    /// Prepicked sample songs found so far, by their search (samples.rs); kept on disk.
     picked: HashMap<String, Track>,
+    /// The newest snapshot id seen for each playlist (by id).
+    snapshots: HashMap<String, Option<String>>,
+    /// Saved copies asked to load again (R, or after a change), and when: a copy saved before
+    /// that time is not used.
+    stale: HashMap<String, SystemTime>,
+    /// Lists that load page by page, until they are whole and can be saved: the entries read
+    /// so far (null ones included) and the songs.
+    partial: HashMap<String, (usize, Vec<Track>)>,
+    /// What earlier randomize rolls found.
+    memo: crate::genre::Memo,
 }
 
-/// First pages of recent searches. Search as you type asks again for a text you had a moment
+/// Names of the copies kept on disk (`store`), so a second look at a list costs no request.
+pub mod kept {
+    /// The pages of the playlists list ("lists/playlists-0.json", ...).
+    pub const PLAYLISTS: &str = "lists/playlists";
+
+    pub fn playlist(id: &str) -> String {
+        format!("lists/pl-{id}.json")
+    }
+
+    pub fn album(id: &str) -> String {
+        format!("albums/{id}.json")
+    }
+
+    pub fn album_songs(id: &str) -> String {
+        format!("albums/{id}-songs.json")
+    }
+
+    pub fn artist(id: &str) -> String {
+        format!("artists/{id}.json")
+    }
+}
+
+/// A playlist's songs as saved, with the snapshot they belong to.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeptList {
+    snapshot: Option<String>,
+    tracks: Vec<Track>,
+}
+
+/// How long a copy without a snapshot to compare (a playlist, the playlists list) is used.
+const LIST_AGE: Duration = Duration::from_secs(600);
+/// How long an artist page is used.
+const ARTIST_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// The part of a whole list from `offset` on, as the last page of it.
+fn rest_page(tracks: Vec<Track>, offset: usize) -> Page<Track> {
+    let total = tracks.len();
+    let items: Vec<Track> = tracks.into_iter().skip(offset).collect();
+    Page { raw: items.len(), items, total }
+}
+
+/// True when a saved playlist is the one Spotify has now: the same snapshot if both are
+/// known, else young enough.
+fn playlist_current(kept: Option<&str>, known: Option<&str>, age: Duration) -> bool {
+    match (kept, known) {
+        (Some(a), Some(b)) => a == b,
+        _ => age <= LIST_AGE,
+    }
+}
+
+/// Pages of recent searches. Search as you type asks again for a text you had a moment
 /// ago (Backspace); this answers it without a request.
 struct SearchCache<T> {
     pages: VecDeque<(String, Instant, Page<T>)>,
@@ -182,21 +255,18 @@ impl<T> Default for SearchCache<T> {
 }
 
 impl<T: Clone> SearchCache<T> {
-    const KEEP: usize = 16;
+    const KEEP: usize = 32;
     const MAX_AGE: Duration = Duration::from_secs(120);
 
-    /// The first page for `key`, from the cache if it is recent, else from `fetch`. Later pages
-    /// always come from `fetch`.
+    /// The page of `key` at `offset`, from the cache if it is recent, else from `fetch`.
     fn get(&mut self, key: &str, offset: usize, fetch: impl FnOnce() -> Result<Page<T>>) -> Result<Page<T>> {
-        if offset > 0 {
-            return fetch();
-        }
+        let key = format!("{key}\n{offset}");
         self.pages.retain(|(_, at, _)| at.elapsed() < Self::MAX_AGE);
-        if let Some((_, _, page)) = self.pages.iter().find(|(k, _, _)| k == key) {
+        if let Some((_, _, page)) = self.pages.iter().find(|(k, _, _)| *k == key) {
             return Ok(page.clone());
         }
         let page = fetch()?;
-        self.pages.push_back((key.to_owned(), Instant::now(), page.clone()));
+        self.pages.push_back((key, Instant::now(), page.clone()));
         if self.pages.len() > Self::KEEP {
             self.pages.pop_front();
         }
@@ -387,7 +457,8 @@ impl Worker {
                 for chunk in uris.chunks(100) {
                     self.api.add_to_playlist(&pl.id, chunk)?;
                 }
-                self.send(Msg::Created);
+                self.stale.insert(kept::PLAYLISTS.to_owned(), SystemTime::now());
+                self.send(Msg::Created(Box::new(pl)));
                 self.send(Msg::Info(format!("Saved {} songs to the new playlist “{name}”", uris.len())));
                 Ok(())
             }
@@ -409,10 +480,18 @@ impl Worker {
                 Ok(())
             }
             Cmd::Artist(id) => {
+                let name = kept::artist(&id);
+                if self.current(&name, &name, Some(ARTIST_AGE)) {
+                    if let Some((artist, top, albums)) = crate::store::read(&name) {
+                        self.send(Msg::Artist { artist, top, albums });
+                        return Ok(());
+                    }
+                }
                 let result = (|| -> Result<()> {
                     let artist = self.api.artist(&id)?;
                     let top = self.api.artist_top_tracks(&artist)?;
                     let albums = self.api.artist_albums(&id)?;
+                    crate::store::write(&name, &(&artist, &top, &albums));
                     self.send(Msg::Artist { artist, top, albums });
                     Ok(())
                 })();
@@ -422,8 +501,21 @@ impl Worker {
                 result
             }
             Cmd::Album(id) => {
-                let album = self.api.album(&id)?;
+                // An album does not change: its copy is used until a reload.
+                let name = kept::album(&id);
+                let album = match self.current(&name, &name, None).then(|| crate::store::read(&name)).flatten() {
+                    Some(album) => album,
+                    None => {
+                        let album = self.api.album(&id)?;
+                        crate::store::write(&name, &album);
+                        album
+                    }
+                };
                 self.send(Msg::Album(album));
+                Ok(())
+            }
+            Cmd::Refresh(name) => {
+                self.stale.insert(name, SystemTime::now());
                 Ok(())
             }
             Cmd::Radio(seed) => {
@@ -443,13 +535,18 @@ impl Worker {
                 Ok(())
             }
             Cmd::Library => {
-                let library = match sync_library(&mut self.api, crate::store::read("library.json")) {
-                    Ok(library) => library,
+                let songs: Vec<Track> = crate::store::read("liked.json").unwrap_or_default();
+                let (library, songs) = match sync_library(&mut self.api, crate::store::read("library.json"), songs) {
+                    Ok(synced) => synced,
                     // The Liked Songs tab says so already; the ♥ marks wait for the next start.
                     Err(e) if matches!(e.downcast_ref::<ApiError>(), Some(ApiError::RateLimited(_))) => return Ok(()),
                     Err(e) => return Err(e),
                 };
                 crate::store::write("library.json", &library);
+                if songs.len() == library.liked_order.len() {
+                    crate::store::write("liked.json", &songs);
+                    self.send(Msg::Liked(songs));
+                }
                 self.send(Msg::Library(library));
                 Ok(())
             }
@@ -480,18 +577,24 @@ impl Worker {
             },
             Cmd::Randomize(genre) => {
                 let term = crate::genres::term(&genre);
-                let result = crate::genre::random(&mut self.api, &term).map_err(|e| format!("{e:#}"));
+                let depths = self.memo.depths.len();
+                let result = crate::genre::random(&mut self.api, &term, &mut self.memo).map_err(|e| format!("{e:#}"));
+                if self.memo.depths.len() != depths {
+                    crate::store::write("depths.json", &self.memo.depths);
+                }
                 self.send(Msg::Random { genre, result });
                 Ok(())
             }
             Cmd::AddToPlaylist { playlist_id, playlist, uris, what } => {
                 self.api.add_to_playlist(&playlist_id, &uris)?;
+                self.changed(&playlist_id);
                 self.send(Msg::Added { playlist_id });
                 self.send(Msg::Info(format!("Added {what} to {playlist}")));
                 Ok(())
             }
             Cmd::RemoveFromPlaylist { playlist_id, playlist, uri, what } => {
                 self.api.remove_from_playlist(&playlist_id, std::slice::from_ref(&uri))?;
+                self.changed(&playlist_id);
                 self.send(Msg::Removed { playlist_id, uri });
                 self.send(Msg::Info(format!("Removed {what} from {playlist}")));
                 Ok(())
@@ -538,6 +641,8 @@ impl Worker {
         let by = |t: &&Track| t.artists.iter().any(|a| a.name.to_lowercase() == artist);
         let track = items.iter().find(by).or(items.first())?.clone();
         self.picked.insert(query, track.clone());
+        // These songs are fixed: the next start finds them with no search.
+        crate::store::write("picked.json", &self.picked);
         Some(track)
     }
 
@@ -689,6 +794,95 @@ impl Worker {
         Ok(())
     }
 
+    /// True when the copy saved as `name` can be used: it is there, it was saved after the
+    /// last reload of `key`, and it is at most `max_age` old (None: any age).
+    fn current(&self, name: &str, key: &str, max_age: Option<Duration>) -> bool {
+        let Some(at) = crate::store::saved_at(name) else { return false };
+        if self.stale.get(key).is_some_and(|since| at <= *since) {
+            return false;
+        }
+        max_age.is_none_or(|max| at.elapsed().is_ok_and(|age| age <= max))
+    }
+
+    /// A playlist changed here: its copy and the playlists list load again when asked.
+    fn changed(&mut self, playlist_id: &str) {
+        let now = SystemTime::now();
+        self.stale.insert(kept::playlist(playlist_id), now);
+        self.stale.insert(kept::PLAYLISTS.to_owned(), now);
+        self.snapshots.remove(playlist_id);
+    }
+
+    /// The saved songs of a playlist, if they are what Spotify has now.
+    fn kept_playlist(&self, id: &str) -> Option<Vec<Track>> {
+        let name = kept::playlist(id);
+        if !self.current(&name, &name, None) {
+            return None;
+        }
+        let age = crate::store::saved_at(&name)?.elapsed().unwrap_or_default();
+        let kept: KeptList = crate::store::read(&name)?;
+        let known = self.snapshots.get(id).and_then(|s| s.as_deref());
+        playlist_current(kept.snapshot.as_deref(), known, age).then_some(kept.tracks)
+    }
+
+    /// Notes a page of a list that loads page by page. Returns every song once the list is
+    /// whole (to save it); a page out of order drops what was noted.
+    fn gather(&mut self, name: &str, offset: usize, page: &Page<Track>) -> Option<Vec<Track>> {
+        if offset == 0 {
+            self.partial.insert(name.to_owned(), (0, Vec::new()));
+        }
+        let (raw, songs) = self.partial.get_mut(name)?;
+        if *raw != offset {
+            self.partial.remove(name);
+            return None;
+        }
+        songs.extend(page.items.iter().cloned());
+        *raw += page.raw;
+        if page.raw == 0 || *raw >= page.total {
+            return self.partial.remove(name).map(|p| p.1);
+        }
+        None
+    }
+
+    /// A playlist's songs: the saved copy if it is current; else over the client protocol (no
+    /// Web API request, and any playlist, not only your own), 100 songs at a time; else the
+    /// Web API, page by page.
+    fn load_playlist(&mut self, list: List, id: &str, offset: usize) -> Result<()> {
+        if let Some(tracks) = self.kept_playlist(id) {
+            self.send(Msg::Tracks { list, offset, page: rest_page(tracks, offset) });
+            return Ok(());
+        }
+        let name = kept::playlist(id);
+        let snapshot = self.snapshots.get(id).cloned().flatten();
+        if offset == 0 && crate::client::AVAILABLE {
+            let mut all: Vec<Track> = Vec::new();
+            let mut sent = 0;
+            let tx = self.tx.clone();
+            let result = crate::radio::playlist_tracks(&format!("spotify:playlist:{id}"), |tracks, total| {
+                let raw = total.saturating_sub(sent).min(crate::radio::CHUNK);
+                all.extend(tracks.iter().cloned());
+                let page = Page { items: tracks, raw, total };
+                let alive = tx.send(Msg::Tracks { list: list.clone(), offset: sent, page }).is_ok();
+                sent += raw;
+                alive
+            });
+            match result {
+                Ok(()) => {
+                    crate::store::write(&name, &KeptList { snapshot, tracks: all });
+                    return Ok(());
+                }
+                // Part of it shows: the rest loads from the Web API as the list is scrolled.
+                Err(_) if sent > 0 => return Ok(()),
+                Err(_) => {}
+            }
+        }
+        let page = self.api.playlist_tracks(id, offset)?;
+        if let Some(tracks) = self.gather(&name, offset, &page) {
+            crate::store::write(&name, &KeptList { snapshot, tracks });
+        }
+        self.send(Msg::Tracks { list, offset, page });
+        Ok(())
+    }
+
     fn load(&mut self, list: List, offset: usize) -> Result<()> {
         match &list {
             List::Search(q) => {
@@ -711,15 +905,34 @@ impl Worker {
                 self.send(Msg::Tracks { list, offset, page });
             }
             List::Playlist(id) => {
-                let page = self.api.playlist_tracks(id, offset)?;
-                self.send(Msg::Tracks { list, offset, page });
+                let id = id.clone();
+                return self.load_playlist(list, &id, offset);
             }
             List::Album(id) => {
+                let name = kept::album_songs(id);
+                if self.current(&name, &kept::album(id), None) {
+                    if let Some(tracks) = crate::store::read::<Vec<Track>>(&name) {
+                        self.send(Msg::Tracks { list, offset, page: rest_page(tracks, offset) });
+                        return Ok(());
+                    }
+                }
                 let page = self.api.album_tracks(id, offset)?;
+                if let Some(tracks) = self.gather(&name, offset, &page) {
+                    crate::store::write(&name, &tracks);
+                }
                 self.send(Msg::Tracks { list, offset, page });
             }
             List::Playlists => {
-                let page = saved_copy(&list, offset, self.api.playlists(offset), &self.tx)?;
+                // The list from the last 10 minutes is used as it is; R asks Spotify.
+                let name = format!("{}-{offset}.json", kept::PLAYLISTS);
+                let recent = self.current(&name, kept::PLAYLISTS, Some(LIST_AGE)).then(|| crate::store::read(&name)).flatten();
+                let page: Page<Playlist> = match recent {
+                    Some(page) => page,
+                    None => saved_copy(&list, offset, self.api.playlists(offset), &self.tx)?,
+                };
+                for p in &page.items {
+                    self.snapshots.insert(p.id.clone(), p.snapshot_id.clone());
+                }
                 self.send(Msg::Playlists { offset, page });
             }
         }
@@ -775,11 +988,13 @@ fn add_liked(library: &mut Library, t: &Track) {
     library.artists.extend(t.artists.iter().filter_map(|a| a.uri.clone()));
 }
 
-/// Brings the Liked Songs index up to date with as few requests as it can. Liked Songs come
-/// newest first, so: read pages until a song the copy knows; if the count then matches, the
-/// copy plus the new songs is the list (often 1 request). Else (songs were removed) read it all.
-/// With no copy, or when Spotify refuses midway and there is a copy, the copy stands.
-fn sync_liked(api: &mut impl LikedPages, copy: Option<Library>) -> Result<Library> {
+/// Brings the Liked Songs index and the songs themselves up to date with as few requests as it
+/// can. Liked Songs come newest first, so: read pages until a song the copy knows; if the count
+/// then matches, the copy plus the new songs is the list (often 1 request). Else (songs were
+/// removed) read it all. When Spotify refuses midway and there is a copy, the copy stands.
+/// `songs` is the saved list; it counts only when it matches the saved index.
+fn sync_liked(api: &mut impl LikedPages, copy: Option<Library>, songs: Vec<Track>) -> Result<(Library, Vec<Track>)> {
+    let known = copy.as_ref().is_some_and(|c| c.liked_order.len() == songs.len());
     let mut fresh: Vec<Track> = Vec::new();
     let mut offset = 0;
     let mut total;
@@ -787,12 +1002,12 @@ fn sync_liked(api: &mut impl LikedPages, copy: Option<Library>) -> Result<Librar
     loop {
         let page = match api.liked_page(offset) {
             Ok(page) => page,
-            Err(e) => return copy.ok_or(e),
+            Err(e) => return copy.map(|c| (c, songs)).ok_or(e),
         };
         total = page.total;
         offset += page.raw;
         for t in page.items {
-            if copy.as_ref().is_some_and(|c| c.tracks.contains(&t.uri)) {
+            if known && copy.as_ref().is_some_and(|c| c.tracks.contains(&t.uri)) {
                 met = true;
                 break;
             }
@@ -802,58 +1017,55 @@ fn sync_liked(api: &mut impl LikedPages, copy: Option<Library>) -> Result<Librar
             break;
         }
     }
-    if let Some(mut lib) = copy.clone().filter(|_| met) {
-        let joined = fresh.len() + lib.liked_order.len();
-        if joined == total {
-            for t in &fresh {
-                add_liked(&mut lib, t);
-            }
-            let mut order: Vec<String> = fresh.iter().map(|t| t.uri.clone()).collect();
-            order.append(&mut lib.liked_order);
-            lib.liked_order = order;
-            return Ok(lib);
-        }
-    }
-    if !met {
-        // No song of the copy came up: `fresh` is the whole list.
+    if met && fresh.len() + songs.len() == total {
         let mut lib = copy.unwrap_or_default();
-        lib.tracks.clear();
-        lib.artists.clear();
         for t in &fresh {
             add_liked(&mut lib, t);
         }
-        lib.liked_order = fresh.into_iter().map(|t| t.uri).collect();
-        return Ok(lib);
+        fresh.extend(songs);
+        lib.liked_order = fresh.iter().map(|t| t.uri.clone()).collect();
+        return Ok((lib, fresh));
+    }
+    if !met {
+        // No song of the copy came up: `fresh` is the whole list.
+        return Ok(rebuilt(copy, fresh));
     }
     // Something changed that the newest pages do not show: read everything again.
-    let mut lib = copy.clone().unwrap_or_default();
-    lib.tracks.clear();
-    lib.artists.clear();
-    lib.liked_order.clear();
+    let mut all: Vec<Track> = Vec::new();
     let mut offset = 0;
     loop {
         let page = match api.liked_page(offset) {
             Ok(page) => page,
-            Err(e) => return copy.ok_or(e),
+            Err(e) => return copy.map(|c| (c, songs)).ok_or(e),
         };
         offset += page.raw;
-        for t in &page.items {
-            add_liked(&mut lib, t);
-            lib.liked_order.push(t.uri.clone());
-        }
-        if page.raw == 0 || offset >= page.total {
+        let done = page.raw == 0 || offset >= page.total;
+        all.extend(page.items);
+        if done {
             break;
         }
     }
-    Ok(lib)
+    Ok(rebuilt(copy, all))
+}
+
+/// The index made new from every Liked Song (what the copy knows of your taste is kept).
+fn rebuilt(copy: Option<Library>, songs: Vec<Track>) -> (Library, Vec<Track>) {
+    let mut lib = copy.unwrap_or_default();
+    lib.tracks.clear();
+    lib.artists.clear();
+    for t in &songs {
+        add_liked(&mut lib, t);
+    }
+    lib.liked_order = songs.iter().map(|t| t.uri.clone()).collect();
+    (lib, songs)
 }
 
 /// The Liked Songs index, plus top and recent songs and artists (for discover) once a day.
-fn sync_library(api: &mut Spotify, copy: Option<Library>) -> Result<Library> {
-    let mut library = sync_liked(api, copy)?;
+fn sync_library(api: &mut Spotify, copy: Option<Library>, songs: Vec<Track>) -> Result<(Library, Vec<Track>)> {
+    let (mut library, songs) = sync_liked(api, copy, songs)?;
     let now = crate::api::unix_now();
     if now.saturating_sub(library.taste_at) < 24 * 3600 {
-        return Ok(library);
+        return Ok((library, songs));
     }
     // A login from before these permissions gets an error here: discover then knows Liked
     // Songs only.
@@ -880,7 +1092,7 @@ fn sync_library(api: &mut Spotify, copy: Option<Library>) -> Result<Library> {
         library.heard = heard;
         library.taste_at = now;
     }
-    Ok(library)
+    Ok((library, songs))
 }
 
 /// Pages of Liked Songs and Playlists kept on disk: a good page is saved; when Spotify refuses
@@ -945,29 +1157,48 @@ mod tests {
     #[test]
     fn liked_sync_asks_little_when_little_changed() {
         let mut api = Fake { uris: liked(120), calls: 0, fail: false };
-        let lib = sync_liked(&mut api, None).unwrap();
-        assert_eq!((lib.liked_order.len(), api.calls), (120, 3), "no copy: every page");
+        let uris = |songs: &[Track]| songs.iter().map(|t| t.uri.clone()).collect::<Vec<_>>();
+        let (lib, songs) = sync_liked(&mut api, None, Vec::new()).unwrap();
+        assert_eq!((lib.liked_order.len(), songs.len(), api.calls), (120, 120, 3), "no copy: every page");
         // Nothing new: one request.
         api.calls = 0;
-        let lib = sync_liked(&mut api, Some(lib)).unwrap();
-        assert_eq!((lib.liked_order.len(), api.calls), (120, 1));
+        let (lib, songs) = sync_liked(&mut api, Some(lib), songs).unwrap();
+        assert_eq!((lib.liked_order.len(), songs.len(), api.calls), (120, 120, 1));
         // Two new songs on top: still one request, and they come first.
         api.uris.insert(0, "spotify:track:new1".into());
         api.uris.insert(0, "spotify:track:new2".into());
         api.calls = 0;
-        let lib = sync_liked(&mut api, Some(lib)).unwrap();
+        let (lib, songs) = sync_liked(&mut api, Some(lib), songs).unwrap();
         assert_eq!(api.calls, 1);
         assert_eq!(lib.liked_order, api.uris);
+        assert_eq!(uris(&songs), api.uris, "the songs themselves too");
         // A song removed: the count is off, so it reads everything again.
         api.uris.remove(60);
         api.calls = 0;
-        let lib = sync_liked(&mut api, Some(lib)).unwrap();
+        let (lib, songs) = sync_liked(&mut api, Some(lib), songs).unwrap();
         assert_eq!(lib.liked_order, api.uris);
+        assert_eq!(uris(&songs), api.uris);
         assert!(!lib.tracks.contains("spotify:track:58"));
+        // An index without its songs (saved by an older version): everything is read once.
+        api.calls = 0;
+        let (lib, songs) = sync_liked(&mut api, Some(lib), Vec::new()).unwrap();
+        assert_eq!((songs.len(), api.calls), (121, 3));
         // Refused: the copy stands; no copy: the error.
         api.fail = true;
-        assert_eq!(sync_liked(&mut api, Some(lib)).unwrap().liked_order.len(), 121);
-        assert!(sync_liked(&mut api, None).is_err());
+        assert_eq!(sync_liked(&mut api, Some(lib), songs).unwrap().1.len(), 121);
+        assert!(sync_liked(&mut api, None, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_saved_playlist_is_used_while_it_is_current() {
+        let (young, old) = (Duration::from_secs(60), Duration::from_secs(3600));
+        assert!(playlist_current(Some("a"), Some("a"), old), "the same snapshot: any age");
+        assert!(!playlist_current(Some("a"), Some("b"), young), "another snapshot: load again");
+        assert!(playlist_current(None, Some("b"), young) && playlist_current(Some("a"), None, young));
+        assert!(!playlist_current(Some("a"), None, old), "nothing to compare: 10 minutes");
+        let songs: Vec<Track> = (0..5).map(|i| track(&i.to_string())).collect();
+        let page = rest_page(songs, 3);
+        assert_eq!((page.items.len(), page.raw, page.total), (2, 2, 5));
     }
 
     #[test]
@@ -1004,13 +1235,14 @@ mod tests {
         };
         assert_eq!(get(&mut cache, "bowie", 0), 1);
         assert_eq!(get(&mut cache, "bowie", 0), 1, "from the cache");
-        assert_eq!(get(&mut cache, "bowie", 50), 2, "later pages always load");
+        assert_eq!(get(&mut cache, "bowie", 50), 2, "each page on its own");
+        assert_eq!(get(&mut cache, "bowie", 50), 2);
         assert_eq!(get(&mut cache, "bowi", 0), 3);
-        // Old entries go: only the last 16 texts stay.
-        for i in 0..16 {
+        // Old entries go: only the last 32 pages stay.
+        for i in 0..32 {
             get(&mut cache, &format!("q{i}"), 0);
         }
-        assert_eq!(get(&mut cache, "bowie", 0), 20);
+        assert_eq!(get(&mut cache, "bowie", 0), 36);
         // A failed request is not kept.
         assert!(cache.get("err", 0, || Err(anyhow!("down"))).is_err());
         assert!(cache.pages.iter().all(|(k, _, _)| k != "err"));

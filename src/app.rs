@@ -18,7 +18,14 @@ use std::time::{Duration, Instant};
 /// How often to ask Spotify for the player state. Progress is interpolated between polls.
 /// How long the like animation runs.
 pub const LIKE_BURST: Duration = Duration::from_millis(720);
-const POLL_EVERY: Duration = Duration::from_secs(5);
+/// How often to ask Spotify for the player state: often while music plays (a song can change
+/// from another device), less while it is paused, rarely with nothing loaded. The end of a
+/// song and spotlite's own commands ask at once anyway.
+const POLL_PLAYING: Duration = Duration::from_secs(8);
+const POLL_PAUSED: Duration = Duration::from_secs(20);
+const POLL_IDLE: Duration = Duration::from_secs(30);
+/// Recently played loads again on a visit when it is older than this (or the song changed).
+const RECENT_AGE: Duration = Duration::from_secs(60);
 /// Search as you type: the pause after the last key before the search starts.
 const SEARCH_DELAY: Duration = Duration::from_millis(300);
 const VOLUME_STEP: u8 = 5;
@@ -130,6 +137,17 @@ impl<T> Listing<T> {
 
     fn reset(&mut self) {
         *self = Listing::default();
+    }
+
+    /// The whole list at once (from a saved copy): nothing more to load.
+    fn fill(&mut self, items: Vec<T>) {
+        let sel = self.state.selected();
+        self.fetched = items.len();
+        self.total = Some(items.len());
+        self.items = items;
+        self.loading = false;
+        let len = self.items.len();
+        self.state.select((len > 0).then(|| sel.unwrap_or(0).min(len - 1)));
     }
 }
 
@@ -484,6 +502,11 @@ pub struct App {
     pub palette: Option<crate::palette::Palette>,
     /// The song after the playing one, when Spotify said.
     pub up_next: Option<Track>,
+    /// The songs after `up_next`, as Spotify listed them: a song change takes the next from
+    /// here instead of asking again.
+    queue: std::collections::VecDeque<Track>,
+    /// When Recently played last loaded, and the song playing then.
+    recent_at: Option<(Instant, Option<String>)>,
     /// What played last (kept when playback stops), saved for the next start.
     pub last_playback: Option<SavedPlayback>,
     /// What to start again if nothing plays at start, and when spotlite started.
@@ -549,7 +572,7 @@ impl App {
             tx,
             in_flight: 0,
             poll_pending: true,
-            next_poll: now + POLL_EVERY,
+            next_poll: now + POLL_PLAYING,
             vol_target: None,
             vol_in_flight: false,
             vol_set: None,
@@ -588,6 +611,8 @@ impl App {
             picker: None,
             palette: None,
             up_next: None,
+            queue: Default::default(),
+            recent_at: None,
             last_playback: None,
             resume: None,
             polled_once: false,
@@ -1074,7 +1099,7 @@ impl App {
         }
         if !self.poll_pending && (now >= self.next_poll || ended) {
             self.poll_pending = true;
-            self.next_poll = now + POLL_EVERY;
+            self.next_poll = now + self.poll_every();
             self.send(Cmd::Poll);
         }
         self.load_more();
@@ -1106,6 +1131,15 @@ impl App {
             Duration::from_millis(250)
         } else {
             Duration::from_secs(1)
+        }
+    }
+
+    /// The time between polls, from what the player does now.
+    fn poll_every(&self) -> Duration {
+        match &self.playback {
+            Some(pb) if pb.is_playing => POLL_PLAYING,
+            Some(pb) if pb.item.is_some() => POLL_PAUSED,
+            _ => POLL_IDLE,
         }
     }
 
@@ -1312,19 +1346,18 @@ impl App {
                 }
                 self.polled_at = Instant::now();
                 self.poll_pending = false;
-                self.next_poll = Instant::now() + if std::mem::take(&mut self.repoll) { CONFIRM_AFTER } else { POLL_EVERY };
+                self.next_poll = Instant::now() + if std::mem::take(&mut self.repoll) { CONFIRM_AFTER } else { self.poll_every() };
                 if let Some(d) = self.playback.as_ref().and_then(|p| p.device.as_ref()) {
                     self.device = Some(d.name.clone());
                 }
                 match new_uri {
                     Some(uri) if self.saved.as_ref().is_none_or(|(u, _)| *u != uri) => {
-                        self.saved = None;
-                        if uri.starts_with("spotify:track:") {
-                            self.send(Cmd::CheckSaved(uri));
+                        // The ♥: from the Liked index when it is there (no request).
+                        self.saved = self.library.as_ref().map(|l| (uri.clone(), l.tracks.contains(&uri)));
+                        if self.saved.is_none() && uri.starts_with("spotify:track:") {
+                            self.send(Cmd::CheckSaved(uri.clone()));
                         }
-                        // A new song: ask what comes after it.
-                        self.up_next = None;
-                        self.send(Cmd::UpNext);
+                        self.song_changed(&uri);
                     }
                     Some(_) => {}
                     None => self.saved = None,
@@ -1480,9 +1513,18 @@ impl App {
                     o.tracks.state.select((len > 0).then_some(sel));
                 }
             }
-            Msg::UpNext(next) => self.up_next = next,
-            Msg::Created => {
-                self.playlists.reset();
+            Msg::UpNext(next) => {
+                self.queue = next.into();
+                self.up_next = self.queue.pop_front();
+            }
+            Msg::Liked(songs) => {
+                // Shown at once, with the selection kept where it was.
+                self.liked.fill(songs);
+            }
+            Msg::Created(pl) => {
+                self.playlists.items.insert(0, *pl);
+                self.playlists.fetched += 1;
+                self.playlists.total = self.playlists.total.map(|t| t + 1);
                 self.rebuild_rows();
             }
             Msg::Added { playlist_id } => {
@@ -1542,9 +1584,19 @@ impl App {
                     }
                 }
                 if saved {
-                    // Liked Songs loads again, with the new song at the top.
-                    if self.view() != View::Liked {
-                        self.liked.reset();
+                    // The song goes to the top of Liked Songs (no new load).
+                    if let Some(t) = self.find_track(&uri).filter(|_| !self.liked.items.iter().any(|t| t.uri == uri)) {
+                        self.liked.items.insert(0, t);
+                        self.liked.fetched += 1;
+                        self.liked.total = self.liked.total.map(|n| n + 1);
+                        if let Some(sel) = self.liked.state.selected().filter(|_| self.view() == View::Liked) {
+                            self.liked.state.select(Some(sel + 1));
+                        }
+                    }
+                    if let Some(lib) = self.library.as_mut() {
+                        if !lib.liked_order.contains(&uri) {
+                            lib.liked_order.insert(0, uri.clone());
+                        }
                     }
                 } else {
                     let before = self.liked.items.len();
@@ -1609,9 +1661,15 @@ impl App {
                 }
             }
         }
-        // Recently played changes as you listen: load it again on each visit.
+        // Recently played changes as you listen: load it again on a visit, when the song
+        // changed since or a minute went by.
         if self.view() == View::Recent && !self.recent.loading {
-            self.recent.reset();
+            let song = self.playing_uri().map(str::to_owned);
+            let fresh = self.recent_at.as_ref().is_some_and(|(at, s)| at.elapsed() < RECENT_AGE && *s == song);
+            if !fresh {
+                self.recent.reset();
+                self.recent_at = Some((Instant::now(), song));
+            }
         }
     }
 
@@ -1681,6 +1739,10 @@ impl App {
             self.sidebar.view = sb.view;
         }
         self.pins = state.pins;
+        // Liked Songs from the saved copy: the tab shows at once, with no request.
+        if let Some(songs) = crate::store::read::<Vec<Track>>("liked.json").filter(|s| !s.is_empty()) {
+            self.liked.fill(songs);
+        }
         self.last_playback = state.playback.clone();
         self.true_shuffle = state.playback.as_ref().is_some_and(|p| p.shuffle);
         self.resume = state.playback.map(|p| (p, Instant::now()));
@@ -2631,12 +2693,47 @@ impl App {
                 self.like_burst = Some((Instant::now(), now));
                 self.send(Cmd::SetSaved { uri: track.uri, saved: now })
             }
-            // Spotify says which it is: the library index may be old.
+            // Known from the Liked index: one request, and the heart moves at once.
+            _ if self.library.is_some() => {
+                let now = !self.is_liked(&track.uri).unwrap_or(false);
+                if self.playing_uri() == Some(track.uri.as_str()) {
+                    self.saved = Some((track.uri.clone(), now));
+                    self.like_burst = Some((Instant::now(), now));
+                }
+                self.send(Cmd::SetSaved { uri: track.uri, saved: now })
+            }
+            // Spotify says which it is.
             _ => {
                 self.like_pending = Some(track.uri.clone());
                 self.send(Cmd::ToggleSaved(track.uri))
             }
         }
+    }
+
+    /// A new song plays: "up next" moves on through the list Spotify gave, and asks again only
+    /// when the list runs out or the song is not the one it said.
+    fn song_changed(&mut self, uri: &str) {
+        let was_next = self.up_next.as_ref().is_some_and(|t| t.uri == uri);
+        if was_next {
+            self.up_next = self.queue.pop_front();
+            if self.up_next.is_some() {
+                return;
+            }
+        }
+        self.queue.clear();
+        self.up_next = None;
+        self.send(Cmd::UpNext);
+    }
+
+    /// A song by its URI, from what is loaded (the player, the lists, the open pages).
+    fn find_track(&self, uri: &str) -> Option<Track> {
+        let playing = self.playback.as_ref().and_then(|p| p.item.as_ref());
+        let lists = [Some(&self.search), Some(&self.recent), self.open.as_ref().map(|o| &o.tracks)];
+        playing
+            .filter(|t| t.uri == uri)
+            .or_else(|| lists.into_iter().flatten().find_map(|l| l.items.iter().find(|t| t.uri == uri)))
+            .or_else(|| self.tracks().and_then(|l| l.items.iter().find(|t| t.uri == uri)))
+            .cloned()
     }
 
     /// The heart is animating (the loop wakes often meanwhile).
@@ -2825,8 +2922,9 @@ impl App {
         match item {
             Found::Artist(a) => self.open_artist(a.id, a.name),
             Found::Album(a) => self.open_album(a),
-            Found::Playlist(p) if self.owns(&p) => {
-                // Your own playlist opens in the Playlists tab, like there.
+            // Your own playlist opens in the Playlists tab, like there; so does any other when
+            // the client protocol can list its songs.
+            Found::Playlist(p) if self.owns(&p) || crate::client::AVAILABLE => {
                 self.open = Some(OpenPlaylist { playlist: p, tracks: Listing::default() });
                 self.switch_tab(Tab::Playlists);
             }
@@ -2866,21 +2964,52 @@ impl App {
     }
 
     fn reload(&mut self) {
+        use crate::worker::kept;
         match self.view() {
-            View::Artist | View::Album | View::Radio | View::Random => {}
+            View::Artist | View::Album | View::Radio | View::Random => {
+                // The page asks Spotify again (not its saved copy).
+                let Some(i) = self.active else { return };
+                match &mut self.pages[i] {
+                    Page::Artist(a) => {
+                        let id = a.id.clone();
+                        a.error = None;
+                        a.rows.loading = true;
+                        self.send(Cmd::Refresh(kept::artist(&id)));
+                    }
+                    Page::Album(a) => {
+                        let id = a.id.clone();
+                        a.tracks.reset();
+                        self.send(Cmd::Refresh(kept::album(&id)));
+                    }
+                    Page::Radio(r) => {
+                        r.error = None;
+                        r.tracks.loading = true;
+                    }
+                    Page::Random(_) => {}
+                }
+                if !matches!(self.pages[i], Page::Random(_)) {
+                    self.load_page(i);
+                }
+            }
             View::Search => {
                 self.search.reset();
                 self.found.reset();
             }
             View::Playlists => {
+                self.send(Cmd::Refresh(kept::PLAYLISTS.to_owned()));
                 self.playlists.reset();
                 self.rebuild_rows();
             }
             View::Liked => self.liked.reset(),
-            View::Recent => self.recent.reset(),
+            View::Recent => {
+                self.recent.reset();
+                self.recent_at = Some((Instant::now(), self.playing_uri().map(str::to_owned)));
+            }
             View::Playlist => {
                 if let Some(o) = self.open.as_mut() {
+                    let id = o.playlist.id.clone();
                     o.tracks.reset();
+                    self.send(Cmd::Refresh(kept::playlist(&id)));
                 }
             }
         }
@@ -4240,6 +4369,15 @@ mod tests {
         )))
     }
 
+    fn playing_song(uri: &str) -> Playback {
+        serde_json::from_value(serde_json::json!({
+            "device": {"id": "d", "name": "spotlite", "is_active": true, "volume_percent": 50},
+            "is_playing": true, "progress_ms": 0,
+            "item": {"uri": uri, "name": "X", "duration_ms": 200000}
+        }))
+        .unwrap()
+    }
+
     fn volumes(cmds: &[Cmd]) -> Vec<u8> {
         cmds.iter().filter_map(|c| if let Cmd::Volume(v) = c { Some(*v) } else { None }).collect()
     }
@@ -4718,7 +4856,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_tab_loads_each_visit() {
+    fn recent_tab_loads_again_when_the_song_changed() {
         let (mut app, rx) = test_app();
         app.on_key(KeyEvent::from(KeyCode::Char('4')));
         assert_eq!(app.view(), View::Recent);
@@ -4728,7 +4866,60 @@ mod tests {
         app.on_msg(Msg::Tracks { list: List::Recent, offset: 0, page: ApiPage { items: vec![t], raw: 1, total: 1 } });
         app.on_key(KeyEvent::from(KeyCode::Char('1')));
         app.on_key(KeyEvent::from(KeyCode::Char('4')));
-        assert!(app.recent.items.is_empty(), "loads again");
+        assert_eq!(app.recent.items.len(), 1, "a quick look back costs nothing");
+        app.on_msg(Msg::Playback(Some(Box::new(playing_song("spotify:track:new")))));
+        app.on_key(KeyEvent::from(KeyCode::Char('1')));
+        app.on_key(KeyEvent::from(KeyCode::Char('4')));
+        assert!(app.recent.items.is_empty(), "another song played: loads again");
+    }
+
+    #[test]
+    fn a_song_change_asks_little() {
+        let (mut app, rx) = test_app();
+        app.library = Some(Library { tracks: ["spotify:track:a".to_owned()].into(), ..Default::default() });
+        let queue: Vec<Track> = ["b", "c"].iter().map(|n| track_by(n, ("x", "X"), ("y", "Y"))).collect();
+        app.on_msg(Msg::Playback(Some(Box::new(playing_song("spotify:track:a")))));
+        let cmds = drain(&rx);
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::CheckSaved(_))), "the ♥ comes from the Liked index");
+        assert_eq!(app.saved, Some(("spotify:track:a".into(), true)));
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::UpNext)));
+        app.on_msg(Msg::UpNext(queue.clone()));
+        assert_eq!(app.up_next.as_ref().map(|t| t.uri.as_str()), Some(queue[0].uri.as_str()));
+        // The next song is the one Spotify said: the list moves on, nothing is asked.
+        app.on_msg(Msg::Playback(Some(Box::new(playing_song(&queue[0].uri)))));
+        assert!(drain(&rx).is_empty());
+        assert_eq!(app.up_next.as_ref().map(|t| t.uri.as_str()), Some(queue[1].uri.as_str()));
+        // Another song (a skip elsewhere): ask again.
+        app.on_msg(Msg::Playback(Some(Box::new(playing_song("spotify:track:zz")))));
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::UpNext)));
+    }
+
+    #[test]
+    fn liking_a_known_song_is_one_request_and_keeps_the_list() {
+        let (mut app, rx) = test_app();
+        app.library = Some(Library::default());
+        let t = track_by("s1", ("x", "X"), ("y", "Y"));
+        app.liked.fill(vec![track_by("old", ("x", "X"), ("y", "Y"))]);
+        app.search.fill(vec![t.clone()]);
+        drain(&rx);
+        app.toggle_like(Some(t.clone()));
+        let cmds = drain(&rx);
+        assert!(matches!(cmds.as_slice(), [Cmd::SetSaved { saved: true, .. }]), "{cmds:?}");
+        app.on_msg(Msg::Saved { uri: t.uri.clone(), saved: true });
+        assert_eq!(app.liked.items.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["Song s1", "Song old"], "on top, no reload");
+        assert_eq!(app.liked.total, Some(2));
+    }
+
+    #[test]
+    fn the_poll_slows_down_when_nothing_plays() {
+        let (mut app, _rx) = test_app();
+        assert_eq!(app.poll_every(), POLL_IDLE);
+        let mut pb = playing_song("spotify:track:a");
+        app.on_msg(Msg::Playback(Some(Box::new(pb.clone()))));
+        assert_eq!(app.poll_every(), POLL_PLAYING);
+        pb.is_playing = false;
+        app.on_msg(Msg::Playback(Some(Box::new(pb))));
+        assert_eq!(app.poll_every(), POLL_PAUSED);
     }
 
     #[test]

@@ -85,20 +85,20 @@ pub fn fetch() -> Result<Vec<Entry>> {
     use librespot_protocol::playlist4_external::SelectedListContent;
     use protobuf::Message;
 
-    let (rt, session) = crate::client::connect()?;
-    rt.block_on(async {
-        let mut uris = Vec::new();
-        loop {
-            let bytes = session.spclient().get_rootlist(uris.len(), Some(500)).await?;
-            let list = SelectedListContent::parse_from_bytes(&bytes)?;
-            let items = &list.contents.items;
-            uris.extend(items.iter().map(|i| i.uri().to_owned()));
-            if items.is_empty() || !list.contents.truncated() {
-                break;
+    crate::client::with(|rt, session| {
+        rt.block_on(async {
+            let mut uris = Vec::new();
+            loop {
+                let bytes = session.spclient().get_rootlist(uris.len(), Some(500)).await?;
+                let list = SelectedListContent::parse_from_bytes(&bytes)?;
+                let items = &list.contents.items;
+                uris.extend(items.iter().map(|i| i.uri().to_owned()));
+                if items.is_empty() || !list.contents.truncated() {
+                    break;
+                }
             }
-        }
-        session.shutdown();
-        Ok(parse_rootlist(uris.iter().map(String::as_str)))
+            Ok(parse_rootlist(uris.iter().map(String::as_str)))
+        })
     })
 }
 

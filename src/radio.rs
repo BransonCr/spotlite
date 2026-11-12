@@ -206,10 +206,9 @@ async fn radio_uris(sp: &librespot_core::spclient::SpClient, seed_uri: &str) -> 
         .collect())
 }
 
-/// Every song of a playlist, in order, over the client protocol: it works for any playlist
-/// (the Web API lists only your own) and uses none of the Web API's quota. Blocks.
+/// The track URIs of a playlist, in order.
 #[cfg(feature = "client")]
-pub fn playlist_uris(playlist_uri: &str) -> anyhow::Result<Vec<String>> {
+async fn playlist_items(sp: &librespot_core::spclient::SpClient, playlist_uri: &str) -> anyhow::Result<Vec<String>> {
     use anyhow::anyhow;
     use librespot_core::SpotifyId;
     use librespot_protocol::playlist4_external::SelectedListContent;
@@ -217,10 +216,7 @@ pub fn playlist_uris(playlist_uri: &str) -> anyhow::Result<Vec<String>> {
 
     let id = playlist_uri.strip_prefix("spotify:playlist:").ok_or_else(|| anyhow!("not a playlist: {playlist_uri}"))?;
     let id = SpotifyId::from_base62(id).map_err(|e| anyhow!("bad playlist id: {e}"))?;
-    let (rt, session) = crate::client::connect()?;
-    let bytes = rt.block_on(session.spclient().get_playlist(&id));
-    session.shutdown();
-    let list = SelectedListContent::parse_from_bytes(&bytes?)?;
+    let list = SelectedListContent::parse_from_bytes(&sp.get_playlist(&id).await?)?;
     Ok(list
         .contents
         .items
@@ -230,30 +226,68 @@ pub fn playlist_uris(playlist_uri: &str) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// Every song of a playlist, in order, over the client protocol: it works for any playlist
+/// (the Web API lists only your own) and uses none of the Web API's quota. Blocks.
+#[cfg(feature = "client")]
+pub fn playlist_uris(playlist_uri: &str) -> anyhow::Result<Vec<String>> {
+    crate::client::with(|rt, session| rt.block_on(playlist_items(session.spclient(), playlist_uri)))
+}
+
 #[cfg(not(feature = "client"))]
 pub fn playlist_uris(_playlist_uri: &str) -> anyhow::Result<Vec<String>> {
     anyhow::bail!("needs the `client` feature")
 }
 
+/// Songs asked for in one metadata request.
+pub const CHUNK: usize = 100;
+
+/// Every song of a playlist with its name, artists, album and cover, over the client protocol.
+/// `each` gets the songs in order, `CHUNK` at a time, with the size of the whole list (so a
+/// long playlist shows its start at once); it returns false to stop. Blocks.
+#[cfg(feature = "client")]
+pub fn playlist_tracks(playlist_uri: &str, mut each: impl FnMut(Vec<crate::api::Track>, usize) -> bool) -> anyhow::Result<()> {
+    let uris = playlist_uris(playlist_uri)?;
+    if uris.is_empty() {
+        each(Vec::new(), 0);
+        return Ok(());
+    }
+    for chunk in uris.chunks(CHUNK) {
+        let meta = crate::client::with(|rt, session| rt.block_on(metadata(session, chunk)))?;
+        if !each(meta.iter().map(RadioTrack::to_track).collect(), uris.len()) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "client"))]
+pub fn playlist_tracks(_playlist_uri: &str, _each: impl FnMut(Vec<crate::api::Track>, usize) -> bool) -> anyhow::Result<()> {
+    anyhow::bail!("needs the `client` feature")
+}
+
 /// Radio tracks of several seeds together (for discover mode); seeds with no radio are skipped.
-/// Blocks; run it on its own thread.
+/// The seeds are asked at the same time. Blocks; run it on its own thread.
 #[cfg(feature = "client")]
 pub fn fetch_more(seeds: &[String]) -> anyhow::Result<Vec<RadioTrack>> {
-    let (rt, session) = crate::client::connect()?;
-    let result = rt.block_on(async {
-        let sp = session.spclient();
-        let mut all: Vec<String> = Vec::new();
-        for seed in seeds {
-            if let Ok(uris) = radio_uris(sp, seed).await {
-                all.extend(uris.into_iter().filter(|u| !all.contains(u)).collect::<Vec<_>>());
+    crate::client::with(|rt, session| {
+        rt.block_on(async {
+            let asked: Vec<_> = seeds
+                .iter()
+                .map(|seed| {
+                    let (session, seed) = (session.clone(), seed.clone());
+                    tokio::spawn(async move { radio_uris(session.spclient(), &seed).await })
+                })
+                .collect();
+            let mut all: Vec<String> = Vec::new();
+            for task in asked {
+                if let Ok(Ok(uris)) = task.await {
+                    all.extend(uris.into_iter().filter(|u| !all.contains(u)).collect::<Vec<_>>());
+                }
             }
-        }
-        anyhow::ensure!(!all.is_empty(), "Spotify returned no radio for these songs");
-        let meta = metadata(&session, &all).await?;
-        session.shutdown();
-        anyhow::Ok(meta)
-    })?;
-    Ok(result)
+            anyhow::ensure!(!all.is_empty(), "Spotify returned no radio for these songs");
+            metadata(session, &all).await
+        })
+    })
 }
 
 #[cfg(not(feature = "client"))]
@@ -268,15 +302,14 @@ pub fn fetch(seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
     use anyhow::anyhow;
 
     let is_track = seed_uri.starts_with("spotify:track:");
-    let (rt, session) = crate::client::connect()?;
-    let result = rt.block_on(async {
-        let uris = radio_uris(session.spclient(), seed_uri).await?;
-        // A track seed comes first, so one request also gives its metadata (for the filters).
-        let mut all = if is_track { vec![seed_uri.to_owned()] } else { Vec::new() };
-        all.extend(uris);
-        let meta = metadata(&session, &all).await?;
-        session.shutdown();
-        anyhow::Ok(meta)
+    let result = crate::client::with(|rt, session| {
+        rt.block_on(async {
+            let uris = radio_uris(session.spclient(), seed_uri).await?;
+            // A track seed comes first, so one request also gives its metadata (for the filters).
+            let mut all = if is_track { vec![seed_uri.to_owned()] } else { Vec::new() };
+            all.extend(uris);
+            metadata(session, &all).await
+        })
     })?;
     let mut tracks = result.into_iter();
     let seed = if is_track {
@@ -314,10 +347,8 @@ pub fn fetch(_seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
 /// API no longer gives it. Blocks.
 #[cfg(feature = "client")]
 pub fn popularity(uris: &[String]) -> anyhow::Result<std::collections::HashMap<String, u8>> {
-    let (rt, session) = crate::client::connect()?;
-    let meta = rt.block_on(metadata(&session, uris));
-    session.shutdown();
-    Ok(meta?.into_iter().map(|t| (t.uri, t.popularity)).collect())
+    let meta = crate::client::with(|rt, session| rt.block_on(metadata(session, uris)))?;
+    Ok(meta.into_iter().map(|t| (t.uri, t.popularity)).collect())
 }
 
 #[cfg(not(feature = "client"))]

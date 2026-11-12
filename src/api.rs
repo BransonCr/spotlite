@@ -27,6 +27,8 @@ pub enum ApiError {
     Forbidden,
     /// 404 "no active device".
     NoDevice,
+    /// The request did not reach Spotify (no network, a timeout).
+    Offline,
     Other(u16, String),
 }
 
@@ -39,7 +41,10 @@ impl fmt::Display for ApiError {
             ApiError::MissingScope => write!(f, "permission missing; run `spotlite auth` again"),
             ApiError::Forbidden => write!(f, "Spotify does not allow this"),
             ApiError::NoDevice => write!(f, "no active device; is spotifyd running?"),
-            ApiError::Other(code, msg) => write!(f, "Spotify API {code}: {msg}"),
+            ApiError::Offline => write!(f, "no connection to Spotify"),
+            ApiError::Other(code, _) if *code >= 500 => write!(f, "Spotify has a problem on its side ({code}); try again in a moment"),
+            ApiError::Other(code, msg) if msg.is_empty() => write!(f, "Spotify refused this ({code})"),
+            ApiError::Other(code, msg) => write!(f, "Spotify refused this ({code}: {msg})"),
         }
     }
 }
@@ -119,7 +124,7 @@ impl Album {
 }
 
 /// An artist's profile. The Feb 2026 API keeps only name and pictures here.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artist {
     pub id: String,
     pub name: String,
@@ -190,6 +195,9 @@ pub struct Playlist {
     pub items: Option<Total>,
     #[serde(default, deserialize_with = "null_as_empty")]
     pub images: Vec<ImageRef>,
+    /// Changes when the playlist's songs change: a saved copy with the same one is current.
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
 }
 
 impl Playlist {
@@ -399,37 +407,72 @@ impl Spotify {
             }
             self.limits.remove(&key);
         }
-        let auth = self.bearer()?;
-        let mut req = self
-            .agent
-            .request(method, &format!("{API}{path}"))
-            .set("Authorization", &auth);
+        // One more try when it can help and cannot do harm: a GET that Spotify's side failed
+        // (5xx) or that did not get through, and any request refused as "login expired"
+        // (the token can end before its time: a new one often works).
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let auth = self.bearer()?;
+            let result = self.request_once(&auth, method, path, query, body.clone());
+            let again = tries < 2
+                && match &result {
+                    Err(ureq::Error::Status(401, _)) => {
+                        self.token.expires_at = 0;
+                        true
+                    }
+                    Err(ureq::Error::Status(code, _)) => method == "GET" && *code >= 500,
+                    Err(ureq::Error::Transport(_)) => method == "GET",
+                    Ok(_) => false,
+                };
+            if crate::log::on() {
+                let status = match &result {
+                    Ok(resp) => resp.status().to_string(),
+                    Err(ureq::Error::Status(code, _)) => code.to_string(),
+                    Err(_) => "no answer".to_owned(),
+                };
+                crate::log::line(&format!("{method} {key} {status}"));
+            }
+            if again {
+                std::thread::sleep(Duration::from_millis(300));
+                continue;
+            }
+            return match result {
+                Ok(resp) if resp.status() == 204 => Ok(None),
+                Ok(resp) => Ok(Some(resp)),
+                Err(ureq::Error::Status(code, resp)) => {
+                    let retry_after = resp.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(5);
+                    let body: Value = resp.into_json().unwrap_or(Value::Null);
+                    let msg = body["error"]["message"].as_str().unwrap_or("").to_owned();
+                    if code == 429 {
+                        self.limits.insert(key, now + retry_after);
+                        crate::store::write("limits.json", &self.limits);
+                    }
+                    Err(classify(code, msg, retry_after).into())
+                }
+                Err(ureq::Error::Transport(_)) => Err(ApiError::Offline.into()),
+            };
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn request_once(
+        &self,
+        auth: &str,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> Result<ureq::Response, ureq::Error> {
+        let mut req = self.agent.request(method, &format!("{API}{path}")).set("Authorization", auth);
         for (k, v) in query {
             req = req.query(k, v);
         }
-        let result = match body {
+        match body {
             Some(body) => req.send_json(body),
             // Spotify wants Content-Length on body-less PUT/POST.
             None if method != "GET" => req.send_bytes(&[]),
             None => req.call(),
-        };
-        match result {
-            Ok(resp) if resp.status() == 204 => Ok(None),
-            Ok(resp) => Ok(Some(resp)),
-            Err(ureq::Error::Status(code, resp)) => {
-                let retry_after = resp
-                    .header("Retry-After")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(5);
-                let body: Value = resp.into_json().unwrap_or(Value::Null);
-                let msg = body["error"]["message"].as_str().unwrap_or("no details").to_owned();
-                if code == 429 {
-                    self.limits.insert(key, now + retry_after);
-                    crate::store::write("limits.json", &self.limits);
-                }
-                Err(classify(code, msg, retry_after).into())
-            }
-            Err(e) => Err(e.into()),
         }
     }
 
@@ -695,10 +738,10 @@ impl Spotify {
         self.send("PUT", "/me/player/repeat", &Self::with_device(device_id, vec![("state", state)]), None)
     }
 
-    /// The first song in the play queue (what plays next), if Spotify says.
-    pub fn up_next(&mut self) -> Result<Option<Track>> {
+    /// The songs that play next, in order (Spotify gives up to 20). Episodes are left out.
+    pub fn up_next(&mut self) -> Result<Vec<Track>> {
         let v: Option<Value> = self.get("/me/player/queue", &[])?;
-        Ok(v.and_then(first_queued))
+        Ok(v.map(queued).unwrap_or_default())
     }
 
     pub fn queue(&mut self, device_id: Option<&str>, uri: &str) -> Result<()> {
@@ -726,22 +769,9 @@ impl Spotify {
     }
 }
 
-trait PipeTrack {
-    fn pipe_track(self) -> Option<Track>;
-}
-
-impl PipeTrack for Value {
-    /// A queue entry as a track; an episode or null gives None.
-    fn pipe_track(self) -> Option<Track> {
-        if self.is_null() {
-            return None;
-        }
-        serde_json::from_value(self).ok()
-    }
-}
-
-/// The first song of a `/me/player/queue` answer. The queue can be empty: `v["queue"][0]` on a
-/// value we change panics there (and a panic aborts the app), so read it with `pointer_mut`.
+/// The songs of a `/me/player/queue` answer. The queue can be empty or missing, and an entry
+/// can be null or an episode: those are skipped (an index into a value we change would panic,
+/// and a panic aborts the app).
 fn read_user(path: &std::path::Path) -> Option<User> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
@@ -753,8 +783,9 @@ fn write_user(path: &std::path::Path, user: &User) {
     }
 }
 
-fn first_queued(mut v: Value) -> Option<Track> {
-    v.pointer_mut("/queue/0").map(Value::take).and_then(PipeTrack::pipe_track)
+fn queued(mut v: Value) -> Vec<Track> {
+    let Some(Value::Array(items)) = v.get_mut("queue").map(Value::take) else { return Vec::new() };
+    items.into_iter().filter(|i| !i.is_null()).filter_map(|i| serde_json::from_value(i).ok()).collect()
 }
 
 fn classify(code: u16, msg: String, retry_after: u64) -> ApiError {
@@ -780,11 +811,12 @@ mod tests {
     #[test]
     fn up_next_with_an_empty_or_odd_queue_does_not_panic() {
         use serde_json::json;
-        assert!(super::first_queued(json!({"currently_playing": null, "queue": []})).is_none());
-        assert!(super::first_queued(json!({})).is_none());
-        assert!(super::first_queued(json!(null)).is_none());
-        let t = super::first_queued(json!({"queue": [{"uri": "spotify:track:a", "name": "A", "duration_ms": 1, "artists": [], "album": {"name": "X"}}]}));
-        assert_eq!(t.map(|t| t.name), Some("A".into()));
+        assert!(super::queued(json!({"currently_playing": null, "queue": []})).is_empty());
+        assert!(super::queued(json!({})).is_empty());
+        assert!(super::queued(json!(null)).is_empty());
+        let song = |n: &str| json!({"uri": format!("spotify:track:{n}"), "name": n, "duration_ms": 1, "artists": [], "album": {"name": "X"}});
+        let t = super::queued(json!({"queue": [song("A"), null, {"odd": true}, song("B")]}));
+        assert_eq!(t.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["A", "B"], "in order, odd entries skipped");
     }
 
     use super::*;
