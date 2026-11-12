@@ -319,6 +319,14 @@ struct SavedTrack {
     track: Option<Track>,
 }
 
+/// Entry of /me/player/recently-played.
+#[derive(Deserialize)]
+struct PlayedEntry {
+    track: Option<Track>,
+    #[serde(default)]
+    played_at: String,
+}
+
 /// Entry of /playlists/{id}/items. The track was in `track` before the Feb 2026 rename.
 #[derive(Deserialize)]
 struct PlaylistEntry {
@@ -607,16 +615,16 @@ impl Spotify {
         self.page("/me/playlists", offset, Some)
     }
 
-    /// The last 50 songs played (newest first). The API pages by time, not offset, so only
-    /// the first page has songs.
-    pub fn recently_played(&mut self, offset: usize) -> Result<Page<Track>> {
-        if offset > 0 {
-            return Ok(Page { items: Vec::new(), raw: 0, total: offset });
-        }
-        let raw: Option<RawPage<SavedTrack>> = self.get("/me/player/recently-played", &[("limit", "50")])?;
-        let mut page = raw.map(|r| r.into_page(|s: SavedTrack| s.track)).unwrap_or_else(Page::empty);
-        page.total = page.raw;
-        Ok(page)
+    /// The last 50 songs played on Spotify, newest first, with when each played. Songs that
+    /// spotifyd played are not there (see `history`).
+    pub fn recently_played(&mut self) -> Result<Vec<crate::history::Played>> {
+        let raw: Option<RawPage<PlayedEntry>> = self.get("/me/player/recently-played", &[("limit", "50")])?;
+        let items = raw.map(|r| r.items).unwrap_or_default();
+        Ok(items
+            .into_iter()
+            .flatten()
+            .filter_map(|e| Some(crate::history::Played { at: crate::history::parse_time(&e.played_at)?, track: e.track? }))
+            .collect())
     }
 
     /// Your most played artists over a time range ("short_term", "medium_term", "long_term").

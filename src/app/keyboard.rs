@@ -211,7 +211,12 @@ impl App {
             Act::Visualizer => {
                 self.viz_on = !self.viz_on;
                 self.viz_at = Some(Instant::now());
-                self.info(if self.viz_on { "Visualizer on" } else { "Visualizer off" });
+                if self.viz_on && crate::theme::c().viz == crate::theme::Viz::None {
+                    // Without this the visualizer is on, but nothing shows.
+                    self.info(format!("The theme “{}” has no visualizer (viz = \"none\"): pick a style in its file", crate::theme::name()));
+                } else {
+                    self.info(if self.viz_on { "Visualizer on" } else { "Visualizer off" });
+                }
             }
             Act::SideEffect => self.open_side_fx(),
             Act::Help => {

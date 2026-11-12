@@ -1,4 +1,4 @@
-//! Randomize: the genre picker, its samples (Tab) and the volume fades around them.
+//! Randomize: the genre picker and its samples (Tab).
 
 use super::*;
 
@@ -82,23 +82,15 @@ impl App {
     }
 
     /// Tab in the genre picker: about 10 s of the genre's top song (Tab again: the next one).
-    /// What plays now fades out, the sample fades in; when it ends, the same back.
+    /// When it ends, what played before goes on.
     pub(super) fn start_sample(&mut self, genre: String) {
         let nth = match &self.sample {
             Some(s) if s.genre == genre => s.nth + 1,
             _ => 0,
         };
-        // A way back still waiting in a fade (Tab again while it went back): keep it.
-        let pending = self.fade.iter_mut().find_map(|step| match step {
-            FadeStep::Send(Cmd::Unsample { restore }) => Some(restore.take()),
-            _ => None,
-        });
-        if let Some(restore) = pending {
-            self.sample_restore = restore;
-        } else if self.sample.is_none() {
-            // What played before the first sample, and its volume.
+        if self.sample.is_none() {
+            // What played before the first sample.
             let pb = self.playback.as_ref();
-            self.sample_volume = pb.and_then(|p| p.device.as_ref()).and_then(|d| d.volume_percent);
             self.sample_restore = pb.and_then(|p| {
                 Some(crate::worker::Restore {
                     context: p.context.as_ref().map(|c| c.uri.clone()),
@@ -108,37 +100,17 @@ impl App {
                 })
             });
         }
-        let playing = self.playback.as_ref().is_some_and(|p| p.is_playing);
         self.sample = Some(Sample { genre: genre.clone(), nth, track: None, started: None });
-        self.fade.clear();
-        self.fade_at = None;
-        if let (Some(v), true) = (self.sample_volume, playing) {
-            self.fade.push_back(FadeStep::Ramp { to: v / 10, len: FADE_OUT });
-        } else if let Some(v) = self.sample_volume {
-            // Nothing is heard now: start quiet, then fade in.
-            self.set_volume(v / 10);
-        }
-        self.fade.push_back(FadeStep::Send(Cmd::Sample { genre, nth }));
+        self.send(Cmd::Sample { genre, nth });
     }
 
-    /// Ends the sample (time is up, Esc, or the picker closes): fades out, goes back to what
-    /// played, and fades it in.
+    /// Ends the sample (time is up, Esc, or the picker closes): goes back to what played.
     pub(super) fn stop_sample(&mut self) {
         if self.sample.take().is_none() {
             return;
         }
         let restore = self.sample_restore.take();
-        self.fade.clear();
-        self.fade_at = None;
-        match self.sample_volume {
-            Some(v) => {
-                self.fade.push_back(FadeStep::Ramp { to: v / 10, len: FADE_OUT });
-                self.fade.push_back(FadeStep::Send(Cmd::Unsample { restore }));
-                self.fade.push_back(FadeStep::Wait(SWITCH_WAIT));
-                self.fade.push_back(FadeStep::Ramp { to: v, len: FADE_IN });
-            }
-            None => self.fade.push_back(FadeStep::Send(Cmd::Unsample { restore })),
-        }
+        self.send(Cmd::Unsample { restore });
         self.poll_soon();
     }
 

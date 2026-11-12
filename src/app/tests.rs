@@ -225,40 +225,28 @@ fn tab_samples_a_genre_then_goes_back_to_the_song() {
     app.on_msg(playing_in("spotify:playlist:p1"));
     app.on_key(KeyEvent::from(KeyCode::Char('z')));
     drain(&rx);
-    // Tab on the first quick pick: pop, its top song, at the volume playing now.
-    // Runs the fade to its end (each step as if its time were up), with the commands it sends.
-    let fade = |app: &mut App| -> Vec<Cmd> {
-        let mut out = Vec::new();
-        for _ in 0..10 {
-            if let Some((_, v)) = app.fade_at {
-                app.fade_at = Some((Instant::now() - Duration::from_secs(60), v));
-            }
-            app.tick();
-            out.extend(drain(&rx).into_iter().filter(|c| !matches!(c, Cmd::Volume(_) | Cmd::Poll)));
-        }
-        out
-    };
+    // Tab on the first quick pick: pop, its top song, at once and at the same volume.
     app.on_key(KeyEvent::from(KeyCode::Tab));
-    assert!(drain(&rx).is_empty(), "the music fades out first");
-    let cmds = fade(&mut app);
+    let cmds = drain(&rx);
     assert!(matches!(cmds.as_slice(), [Cmd::Sample { genre, nth: 0 }] if genre == "pop"), "{cmds:?}");
-    assert_eq!(app.volume(), Some(5), "quiet for the switch");
+    assert_eq!(app.volume(), Some(50), "no fade");
     // Tab again: the next song of the genre.
     app.on_key(KeyEvent::from(KeyCode::Tab));
-    assert!(matches!(fade(&mut app).as_slice(), [Cmd::Sample { nth: 1, .. }]));
+    assert!(matches!(drain(&rx).as_slice(), [Cmd::Sample { nth: 1, .. }]));
     app.on_msg(Msg::Sampling { genre: "pop".into(), result: Ok(track(7)) });
     assert!(app.sample.as_ref().is_some_and(|s| s.started.is_some()));
-    fade(&mut app);
-    assert_eq!(app.volume(), Some(50), "faded in after the switch");
+    drain(&rx);
     // Ten seconds later it ends: back to the playlist, at the song and place it was.
     app.sample.as_mut().unwrap().started = Some(Instant::now() - SAMPLE_LEN);
-    let cmds = fade(&mut app);
+    app.tick();
+    let cmds = drain(&rx);
     assert!(
         cmds.iter().any(|c| matches!(c, Cmd::Unsample { restore: Some(r) }
             if r.context.as_deref() == Some("spotify:playlist:p1") && r.track == "spotify:track:x" && r.position_ms >= 30_000 && r.playing)),
         "{cmds:?}"
     );
-    assert_eq!(app.volume(), Some(50), "and back at its volume");
+    assert!(!cmds.iter().any(|c| matches!(c, Cmd::Volume(_))), "no fade: {cmds:?}");
+    assert_eq!(app.volume(), Some(50));
     assert!(app.sample.is_none() && app.genre_picker.is_some(), "the picker stays open");
     // Esc while a sample plays stops only the sample; Esc again closes the picker.
     app.on_key(KeyEvent::from(KeyCode::Tab));
@@ -1552,6 +1540,15 @@ fn the_song_of_the_last_run_shows_at_start_and_starts_again() {
     app.on_msg(poll(None));
     app.tick();
     assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::FindDevice)));
+    assert!(app.toast.as_ref().unwrap().text.starts_with("Starting where you left off"));
+    assert!(app.busy(), "the loop wakes often while it waits");
+    // Not again before the answer; soon after it.
+    app.tick();
+    assert!(!drain(&rx).iter().any(|c| matches!(c, Cmd::FindDevice)));
+    app.on_msg(Msg::Device(None));
+    app.find_device_at = Some(Instant::now() - FIND_EVERY);
+    app.tick();
+    assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::FindDevice)));
     assert_eq!(app.playing_uri(), Some("spotify:track:5"), "still shown");
     // spotifyd shows up: the song starts again, and polls come fast until it plays.
     app.on_msg(Msg::Device(Some("spotlite".into())));
@@ -1619,4 +1616,44 @@ fn buttons_light_up_under_the_pointer() {
     assert_eq!(app.hot_at(Position::new(22, 28)).map(|h| h.1), Some(Hot::Link));
     assert!(app.on_hover(Position::new(50, 10)));
     assert_eq!(app.hot_at(Position::new(50, 10)), None);
+}
+
+#[test]
+fn a_song_played_30_s_goes_to_the_top_of_recent() {
+    let (mut app, _rx) = test_app();
+    app.switch_tab(Tab::Recent);
+    app.recent.apply(0, page(0..3, 3));
+    app.recent.state.select(Some(1));
+    let mut pb = playing_song("spotify:track:9");
+    pb.progress_ms = Some(10_000);
+    app.on_msg(poll(Some(pb.clone())));
+    assert!(!app.note_listen(), "not 30 s yet");
+    pb.progress_ms = Some(31_000);
+    app.on_msg(poll(Some(pb.clone())));
+    assert!(app.note_listen(), "the list on screen changed");
+    let uris: Vec<&str> = app.recent.items.iter().map(|t| t.uri.as_str()).collect();
+    assert_eq!(uris, ["spotify:track:9", "spotify:track:0", "spotify:track:1", "spotify:track:2"]);
+    assert_eq!(app.recent.selected(), 2, "the selection stays on its song");
+    // Once per play; from the start again, it counts again.
+    pb.progress_ms = Some(60_000);
+    app.on_msg(poll(Some(pb.clone())));
+    assert!(!app.note_listen());
+    pb.progress_ms = Some(1_000);
+    app.on_msg(poll(Some(pb.clone())));
+    app.note_listen();
+    pb.progress_ms = Some(40_000);
+    app.on_msg(poll(Some(pb.clone())));
+    assert!(app.note_listen());
+    assert_eq!(app.recent.items.len(), 5);
+    // A song on another device (a phone) is in Spotify's own list.
+    let (mut app, _rx) = test_app();
+    let (tx, _crx) = std::sync::mpsc::channel();
+    app = app.with_control(tx, "spotlite".into());
+    app.recent.apply(0, page(0..1, 1));
+    let mut pb = playing_song("spotify:track:8");
+    pb.device.as_mut().unwrap().name = "Phone".into();
+    pb.progress_ms = Some(40_000);
+    app.on_msg(poll(Some(pb)));
+    app.note_listen();
+    assert_eq!(app.recent.items.len(), 1);
 }

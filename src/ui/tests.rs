@@ -846,3 +846,31 @@ fn the_row_stays_lit_over_its_close_button() {
     };
     assert_eq!(buf_bg, sel);
 }
+
+#[test]
+fn the_playlist_picker_shows_a_cover_and_count_per_playlist() {
+    let (mut app, _rx) = test_app();
+    app.on_msg(Msg::User(serde_json::from_value(serde_json::json!({"id": "me", "uri": "spotify:user:me"})).unwrap()));
+    let pls: Vec<Playlist> = serde_json::from_value(serde_json::json!([
+        {"id": "1", "uri": "spotify:playlist:1", "name": "Jammer", "owner": {"id": "me"}, "items": {"total": 174}},
+        {"id": "2", "uri": "spotify:playlist:2", "name": "Not Mine", "owner": {"id": "x"}, "items": {"total": 28}},
+        {"id": "3", "uri": "spotify:playlist:3", "name": "Chill", "owner": {"id": "me"}, "items": {"total": 9}}
+    ]))
+    .unwrap();
+    app.on_msg(Msg::Playlists { offset: 0, page: Page { items: pls, raw: 3, total: 3 } });
+    app.can_edit = true;
+    app.picker = Some(crate::app::Picker { track: track("Song", "A", "B"), query: Default::default(), cursor: 1 });
+    let out = screen(&mut app, 90, 30);
+    let rows: Vec<&str> = out.lines().collect();
+    let jammer = rows.iter().position(|r| r.contains("Jammer")).expect(&out);
+    assert!(rows[jammer + 1].contains("174 tracks"), "{out}");
+    assert!(rows[jammer + 2].contains("Chill") && rows[jammer + 3].contains("9 tracks"), "{out}");
+    assert!(!out.contains("Not Mine"), "{out}");
+    // The name starts after the marker and a cover as wide as the list's thumbnails.
+    let row = app.hits.popup_rows[0].0;
+    let name_x = (0..row.width).find(|&x| rows[jammer].chars().nth((row.x + x) as usize) == Some('J')).unwrap();
+    assert_eq!(name_x, 2 + app.images.square_cols(PLAYLIST_ROW) + 1, "{out}");
+    let hits: Vec<(u16, usize)> = app.hits.popup_rows.iter().map(|(r, i)| (r.height, *i)).collect();
+    assert_eq!(hits, vec![(PLAYLIST_ROW, 0), (PLAYLIST_ROW, 1)]);
+    assert_eq!(app.hits.popup_rows[0].0.y as usize, jammer);
+}

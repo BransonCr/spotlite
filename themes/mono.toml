@@ -18,8 +18,8 @@ red      = "#c86464"  # errors, remove, the top of the volume LEDs
 green    = "#a0a0a0"  # liked songs, the active device
 love     = "#ff4d6d"  # the like heart (vivid)
 viz_low  = "#101010"  # visualizer, bottom shade; dark text on accent
-viz_high = "#202020"  # visualizer, top shade
-viz_line = "#505050"  # visualizer line and dots
+viz_high = "#2e2e2e"  # visualizer, top shade
+viz_line = "#b0b0b0"  # visualizer line and dots
 
 # Look and feel
 layout   = "classic"   # classic (player at the bottom) | stage (big cover column on wide terminals) | top (player at the top)
@@ -31,8 +31,8 @@ header   = "brackets"  # plain | pills | brackets | powerline
 nerd     = true        # Nerd Font glyphs (powerline arrows, the like heart); false if your terminal lacks them
 select   = "block"     # bar (marker + soft background) | block (inverse) | underline | arrow (❯)
 marker   = "▌"         # one character before the selected row (select = bar or underline)
-viz      = "none"      # wave | bars | mirror | dots | none
-aura     = "halftone"  # sidebar effect (V): grooves | stardust | pixels | aurora | ribbons | traces | halftone
+viz      = "dots"      # wave | bars | mirror | dots | none
+aura     = "halftone"  # sidebar effect (V): grooves | stardust | pixels | aurora | ribbons | traces | halftone | phosphor
 progress = "line"      # line | knob (●) | blocks (stepped gradient) | wave (moving ∿)
 bar      = "■·"        # two characters: filled and empty part of the progress and volume bars
 volume   = "bar"       # bar | leds (VU meter: green, accent, red)

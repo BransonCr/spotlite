@@ -388,11 +388,12 @@ impl App {
     }
 
     /// Starts again what played at the last quit, if nothing plays now. It waits for the first
-    /// player state and for spotifyd to show up as a device (up to 20 s after start), and
-    /// looks for the device every 2 s meanwhile (spotifyd may have just started).
+    /// player state and for spotifyd to show up as a device (up to 45 s after start: a slow login takes 30 s). spotifyd
+    /// may have just started (it needs about 2 s to log in): the device is looked for again as
+    /// soon as each answer is in, at most every `FIND_EVERY`, so the song starts at once.
     pub(super) fn try_resume(&mut self) {
         let Some((_, since)) = &self.resume else { return };
-        if since.elapsed() > Duration::from_secs(20) {
+        if since.elapsed() > Duration::from_secs(45) {
             self.resume = None;
             return;
         }
@@ -405,8 +406,15 @@ impl App {
             return;
         }
         if self.device.is_none() {
-            if self.find_device_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
+            // An answer that never came (an error) does not stop the looking.
+            let every = if self.finding { Duration::from_secs(3) } else { FIND_EVERY };
+            if self.find_device_at.is_none_or(|at| at.elapsed() >= every) {
+                if self.find_device_at.is_none() {
+                    // Say why nothing plays yet (only when it has to wait).
+                    self.info(format!("Starting where you left off: {}…", self.resume.as_ref().map_or("", |(sp, _)| sp.name.as_str())));
+                }
                 self.find_device_at = Some(Instant::now());
+                self.finding = true;
                 self.send(Cmd::FindDevice);
             }
             return;
@@ -416,41 +424,52 @@ impl App {
         }
     }
 
+    /// Adds the song to the local history once it played 30 s (half of it, if it is shorter)
+    /// on spotlite's device: spotifyd does not tell Spotify, so Recently played would miss it.
+    /// A play of the same song from the start again counts again. True if the list on screen
+    /// changed.
+    pub(super) fn note_listen(&mut self) -> bool {
+        let Some(pb) = self.playback.as_ref().filter(|p| p.is_playing && !self.ghost) else { return false };
+        let Some(track) = pb.item.as_ref() else { return false };
+        // Songs on another device (a phone) are in Spotify's own list.
+        let own = match (&self.control, &pb.device) {
+            (Some((_, name)), Some(d)) => d.name == *name,
+            _ => true,
+        };
+        let ms = pb.progress_ms.unwrap_or(0) + self.polled_at.elapsed().as_millis() as u64;
+        let done = match &mut self.listen {
+            Some((uri, done)) if *uri == track.uri => {
+                if *done && ms < 5_000 {
+                    *done = false;
+                }
+                *done
+            }
+            _ => {
+                self.listen = Some((track.uri.clone(), false));
+                false
+            }
+        };
+        let need = crate::history::LISTEN_MS.min(track.duration_ms / 2).max(1_000);
+        if done || !own || ms < need {
+            return false;
+        }
+        if let Some(l) = self.listen.as_mut() {
+            l.1 = true;
+        }
+        let track = track.clone();
+        crate::history::add(&track, crate::history::now_ms());
+        // Recently played shows it at once; a later visit loads the merged list again.
+        self.recent_at = None;
+        if self.recent.total.is_some() && !self.recent.loading {
+            self.recent.push_front(track);
+            return self.view() == View::Recent;
+        }
+        false
+    }
+
     /// Music is playing and the theme moves: the loop wakes 4 times a second.
     pub fn moving(&self) -> bool {
         crate::theme::motion() && self.playback.as_ref().is_some_and(|pb| pb.is_playing && pb.item.is_some())
-    }
-
-    /// Runs the fade steps that are due. True if the volume changed.
-    pub(super) fn run_fade(&mut self) -> bool {
-        let mut changed = false;
-        while let Some(step) = self.fade.front() {
-            let volume = self.volume().unwrap_or(0);
-            let (start, from) = *self.fade_at.get_or_insert((Instant::now(), volume));
-            let done = match step {
-                FadeStep::Send(_) => true,
-                FadeStep::Wait(len) => start.elapsed() >= *len,
-                FadeStep::Ramp { to, len } => {
-                    let t = (start.elapsed().as_secs_f32() / len.as_secs_f32().max(0.001)).min(1.0);
-                    // Ease in and out: it starts and ends gently.
-                    let eased = t * t * (3.0 - 2.0 * t);
-                    let v = (from as f32 + (*to as f32 - from as f32) * eased).round() as u8;
-                    if Some(v) != self.volume() {
-                        self.set_volume(v);
-                        changed = true;
-                    }
-                    t >= 1.0
-                }
-            };
-            if !done {
-                break;
-            }
-            self.fade_at = None;
-            if let Some(FadeStep::Send(cmd)) = self.fade.pop_front() {
-                self.send(cmd);
-            }
-        }
-        changed
     }
 
     pub(super) fn play_selected(&mut self) {

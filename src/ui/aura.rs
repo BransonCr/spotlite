@@ -398,6 +398,94 @@ impl Pen<'_> {
     }
 }
 
+impl Pen<'_> {
+    /// Phosphor: an oscilloscope screen in amber phosphor over the whole panel. A graticule
+    /// (a grid of dotted lines, with ticks on the middle lines) is the screen; the beam draws
+    /// a figure of the music on it and leaves an afterglow that fades; the head of the trace
+    /// is white hot. A bass beat kicks the figure larger and sends a flash out over the grid,
+    /// and a slow bright band rolls down the screen, as on an old tube.
+    fn phosphor(&self, buf: &mut Buffer) {
+        use std::f32::consts::TAU;
+        let g = self.geo;
+        let a = self.aura;
+        let (cx, cy, ax, ay) = crate::aura::scope_frame(g);
+        let quiet = self.sound();
+        let (sw, sh) = (self.area.width as usize * 2, self.area.height as usize * 4);
+        // The phosphor's colour: the theme's accent, warmed a little by the cover.
+        let phos = |x: f32, y: f32| {
+            let (u, v) = g.uv(x, y);
+            mix(rgb(self.t.accent), self.tone(u, v), 0.3)
+        };
+        let hot = mix(rgb(self.t.accent), rgb(self.t.bright), 0.75);
+        // The roll bar: a band of light that goes down the screen every few seconds.
+        let roll = (a.time * 0.16).fract() * (g.h + 16.0) - 8.0;
+        let mut dots = Dots::new(self.area);
+        // The graticule: lines a division apart from the screen's middle, over the whole panel.
+        // In silence only the middle cross shows; with music, the whole grid.
+        // In dots: the middle, and a division (half the screen each way: the lines are the
+        // middle cross and a frame round the screen).
+        let (csx, csy) = ((cx * 2.0) as i32, (cy * 2.0) as i32);
+        let (dvx, dvy) = (((ax * 2.0) as i32).max(6), ((ay * 2.0) as i32).max(6));
+        let reach = g.far() * (0.25 + 0.75 * quiet);
+        for sy in 0..sh {
+            let y = (sy as f32 + 0.5) / 2.0;
+            let ry = sy as i32 - csy;
+            for sx in 0..sw {
+                let x = (sx as f32 + 0.5) / 2.0;
+                let rx = sx as i32 - csx;
+                let mid = (rx == 0 && sy % 2 == 0) || (ry == 0 && sx % 2 == 0);
+                // Ticks across the middle lines, five to a division.
+                let tick = (rx.abs() <= 1 && ry.rem_euclid((dvy / 5).max(2)) == 0) || (ry.abs() <= 1 && rx.rem_euclid((dvx / 5).max(2)) == 0);
+                // The frame, dotted, and on past the screen over the rest of the panel.
+                let dotted = (rx.rem_euclid(dvx) == 0 && sy % 2 == 0) || (ry.rem_euclid(dvy) == 0 && sx % 2 == 0);
+                if !(mid || dotted || (tick && quiet > 0.0)) {
+                    continue;
+                }
+                let r = (x - cx).hypot(y - cy);
+                let near = if mid { 1.0 } else { ((reach - r) / 4.0).clamp(0.0, 1.0) };
+                let flash = a.pulse_at(r);
+                let band = (1.0 - (y - roll).abs() / 6.0).max(0.0);
+                let base = if mid || tick { 0.38 } else { 0.28 };
+                let v = (base + 0.08 * quiet + 0.8 * flash + 0.25 * band * quiet) * near * self.gate(g.dist(x, y));
+                if v > 0.04 {
+                    dots.set(sx, sy, v, phos(x, y));
+                }
+            }
+        }
+        // With no motion there is no trace: the whole figure, still.
+        let still = a.glow.is_empty() || a.time == 0.0;
+        let faint = if still { 0.45 } else { 0.0 };
+        let n = if still { (TAU * 4.0 * 90.0) as usize } else { 0 };
+        for i in 0..n {
+            let (x, y) = a.beam_at(i as f32 / 90.0);
+            if x >= 0.0 && y >= 0.0 && x < g.w && y < g.h {
+                let v = faint * (0.4 + 0.6 * quiet) * self.gate(g.dist(x, y));
+                dots.set((x * 2.0) as usize, (y * 2.0) as usize, v, phos(x, y));
+            }
+        }
+        // The trace: the afterglow on the screen, white hot where it is new.
+        let cols = a.glow_cols;
+        if cols == sw {
+            for (i, &v) in a.glow.iter().enumerate() {
+                if v < 0.07 {
+                    continue;
+                }
+                let (sx, sy) = (i % cols, i / cols);
+                if sy >= sh {
+                    break;
+                }
+                let (x, y) = ((sx as f32 + 0.5) / 2.0, (sy as f32 + 0.5) / 2.0);
+                let heat = ((v - 0.75) / 0.25).clamp(0.0, 1.0) * (0.6 + 0.4 * a.scope.kick.max(0.5));
+                let colour = mix(phos(x, y), hot, heat);
+                // A beat flares the whole trace.
+                let lit = ((0.12 + 0.88 * v) * (1.0 + 0.4 * a.scope.kick)).min(1.0);
+                dots.set(sx, sy, lit * self.gate(g.dist(x, y)), colour);
+            }
+        }
+        dots.flush(buf, self.area, &self.clear, self.low);
+    }
+}
+
 /// The aura of the sidebar effect, in `area`, round `cover` (the cover's place, if it shows).
 /// `reveal` (0..1) grows it out of the cover, and takes it back in.
 pub fn draw_aura(buf: &mut Buffer, area: Rect, cover: Option<Rect>, aura: &Aura, frame: &viz::Frame, kind: Kind, reveal: f32) {
@@ -425,5 +513,6 @@ pub fn draw_aura(buf: &mut Buffer, area: Rect, cover: Option<Rect>, aura: &Aura,
         Kind::Ribbons => pen.ribbons(buf),
         Kind::Traces => pen.traces(buf),
         Kind::Halftone => pen.halftone(buf),
+        Kind::Phosphor => pen.phosphor(buf),
     }
 }

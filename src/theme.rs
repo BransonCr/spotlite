@@ -135,10 +135,13 @@ pub enum Aura {
     Traces,
     /// A print of dots round the cover, large where the music is loud.
     Halftone,
+    /// An oscilloscope in amber phosphor: a grid over the panel, and a beam that draws a
+    /// figure of the music and leaves a glow behind it.
+    Phosphor,
 }
 
 impl Aura {
-    pub const ALL: [(&'static str, Aura); 7] = [
+    pub const ALL: [(&'static str, Aura); 8] = [
         ("grooves", Aura::Grooves),
         ("stardust", Aura::Stardust),
         ("pixels", Aura::Pixels),
@@ -146,6 +149,7 @@ impl Aura {
         ("ribbons", Aura::Ribbons),
         ("traces", Aura::Traces),
         ("halftone", Aura::Halftone),
+        ("phosphor", Aura::Phosphor),
     ];
 
     /// The values of `liquid`, the key before `aura`: each gives the aura that took its place.
@@ -173,6 +177,7 @@ impl Aura {
             Aura::Ribbons => "ribbons behind the cover",
             Aura::Traces => "wires from the cover",
             Aura::Halftone => "a print of dots",
+            Aura::Phosphor => "an oscilloscope",
         }
     }
 }
@@ -253,7 +258,7 @@ const AMBER: Theme = Theme {
     nerd: true,
     select: Select::Bar,
     viz: Viz::Wave,
-    aura: Aura::Grooves,
+    aura: Aura::Phosphor,
     progress: Progress::Line,
     volume: Volume::Bar,
     leaders: false,

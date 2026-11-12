@@ -70,8 +70,7 @@ pub enum Cmd {
     Library,
     /// Adds songs to a playlist: at the end, or at `position` (undo puts a song back there).
     AddToPlaylist { playlist_id: String, playlist: String, uris: Vec<String>, what: String, position: Option<usize> },
-    /// Plays a genre's `nth` most popular song (0: the top one), from 20% in. The app fades
-    /// the volume around it.
+    /// Plays a genre's `nth` most popular song (0: the top one), from 20% in.
     Sample { genre: String, nth: usize },
     /// Ends a sample: plays what played before at its place (or pauses).
     Unsample { restore: Option<Restore> },
@@ -284,6 +283,10 @@ struct KeptList {
     tracks: Vec<Track>,
 }
 
+/// The Recent tab shows at most this many songs (Spotify's 50 and spotlite's own, merged).
+const RECENT_MAX: usize = 100;
+/// The longest spotifyd takes to log in and show up as a device after its start.
+const SPOTIFYD_LOGIN: Duration = Duration::from_secs(40);
 /// How long a copy without a snapshot to compare (a playlist, the playlists list) is used.
 const LIST_AGE: Duration = Duration::from_secs(600);
 /// How long an artist page is used.
@@ -932,12 +935,19 @@ impl Worker {
         if let Some(id) = self.find_device()? {
             return Ok(id);
         }
-        if !cfg!(test) && crate::start_spotifyd() {
-            self.send(Msg::Info("Starting spotifyd…".into()));
-            for _ in 0..6 {
-                thread::sleep(Duration::from_secs(1));
-                if let Some(id) = self.find_device()? {
-                    return Ok(id);
+        // spotifyd needs from a few seconds to about 30 s (a slow network) to log in and show
+        // up: wait while it is that young, and not when it ran for long and is lost.
+        if !cfg!(test) {
+            let started = crate::start_spotifyd();
+            let age = if started { Some(Duration::ZERO) } else { crate::spotifyd_age() };
+            if let Some(age) = age.filter(|a| *a < SPOTIFYD_LOGIN) {
+                self.send(Msg::Info(if started { "Starting spotifyd…" } else { "Waiting for spotifyd to log in…" }.into()));
+                let until = Instant::now() + (SPOTIFYD_LOGIN - age);
+                while Instant::now() < until {
+                    thread::sleep(Duration::from_secs(1));
+                    if let Some(id) = self.find_device()? {
+                        return Ok(id);
+                    }
                 }
             }
         }
@@ -1066,7 +1076,10 @@ impl Worker {
                 self.send(Msg::Found { list, offset, page });
             }
             List::Recent => {
-                let page = self.api.recently_played(offset)?;
+                // One page: Spotify's list pages by time, not offset. spotifyd's songs are
+                // not in it; spotlite's own list adds them.
+                let items = if offset > 0 { Vec::new() } else { crate::history::merge(self.api.recently_played()?, crate::history::load(), RECENT_MAX) };
+                let page = Page { raw: items.len(), total: offset + items.len(), items };
                 self.send(Msg::Tracks { list, offset, page });
             }
             List::Liked => {
@@ -1256,9 +1269,10 @@ fn sync_library(api: &mut Spotify, copy: Option<Library>, songs: Vec<Track>) -> 
         }
     }
     if api.has_scope("user-read-recently-played") {
-        if let Ok(page) = api.recently_played(0) {
-            heard.extend(page.items.into_iter().map(|t| t.uri));
+        if let Ok(played) = api.recently_played() {
+            heard.extend(played.into_iter().map(|p| p.track.uri));
         }
+        heard.extend(crate::history::load().into_iter().take(50).map(|p| p.track.uri));
     }
     // Keep the old lists when Spotify refused the new ones.
     if !top.is_empty() || !heard.is_empty() {

@@ -7,6 +7,7 @@ mod control;
 mod folders;
 mod genre;
 mod genres;
+mod history;
 mod images;
 mod input;
 mod keys;
@@ -491,6 +492,18 @@ pub fn start_spotifyd() -> bool {
             .status();
     }
     !running
+}
+
+/// How long spotifyd runs (None: it does not run).
+pub fn spotifyd_age() -> Option<std::time::Duration> {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "show", "spotifyd", "-p", "MainPID", "--value"])
+        .output()
+        .ok()?;
+    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().ok().filter(|p| *p > 0)?;
+    let out = std::process::Command::new("ps").args(["-o", "etimes=", "-p", &pid.to_string()]).output().ok()?;
+    let secs: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs))
 }
 
 /// `Q`: stop spotifyd too, so no part of spotlite keeps running or playing.

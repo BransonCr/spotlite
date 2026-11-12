@@ -66,6 +66,8 @@ const SWITCH_HOLD: Duration = Duration::from_secs(4);
 const SWITCH_POLL: Duration = Duration::from_millis(400);
 /// A resume can start spotifyd first: it is waited for longer.
 const RESUME_HOLD: Duration = Duration::from_secs(12);
+/// While a resume waits for spotifyd, the device is looked for this often.
+const FIND_EVERY: Duration = Duration::from_millis(300);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Rows one mouse-wheel step moves.
 const WHEEL_ROWS: isize = 3;
@@ -218,7 +220,6 @@ pub struct Sample {
 
 /// How long a genre sample plays.
 pub const SAMPLE_LEN: Duration = Duration::from_secs(10);
-/// The volume fades out this fast before a switch,
 /// A visualizer sweeps in and out over these many seconds.
 const VIZ_IN: f32 = 0.6;
 const VIZ_OUT: f32 = 0.4;
@@ -232,22 +233,9 @@ fn sweep(on: bool, at: Option<Instant>) -> f32 {
         (1.0 - since / VIZ_OUT).max(0.0)
     }
 }
-const FADE_OUT: Duration = Duration::from_millis(150);
-/// waits this long after the switch for the new song to start (spotifyd starts it a moment
-/// after Spotify answers; fading in sooner makes it cut in loud),
+/// How long after a sample's switch its song starts (spotifyd starts it a moment after
+/// Spotify answers): its 10 s count from then.
 const SWITCH_WAIT: Duration = Duration::from_millis(450);
-/// and fades back in this slowly.
-const FADE_IN: Duration = Duration::from_millis(350);
-
-/// One step of a fade.
-#[derive(Debug)]
-pub enum FadeStep {
-    /// Volume to `to`, smoothly, over the time.
-    Ramp { to: u8, len: Duration },
-    Wait(Duration),
-    /// A command to send now (the switch).
-    Send(Cmd),
-}
 
 /// Choose a playlist to add a track to; type to narrow the list.
 pub struct Picker {
@@ -470,11 +458,6 @@ pub struct App {
     /// A genre sample playing in the picker (Tab), and what played before it.
     pub sample: Option<Sample>,
     sample_restore: Option<crate::worker::Restore>,
-    sample_volume: Option<u8>,
-    /// Volume fades and the commands between them (a sample's switch), run by `tick`.
-    fade: std::collections::VecDeque<FadeStep>,
-    /// When the first step of `fade` began, and the volume then.
-    fade_at: Option<(Instant, u8)>,
     /// The list a true shuffle plays, and its songs: the player shows that list as the source.
     shuffled: Option<(String, std::collections::HashSet<String>)>,
     /// The theme in use when the picker opened (Esc goes back to it).
@@ -532,6 +515,10 @@ pub struct App {
     confirmed_uri: Option<String>,
     /// When the device was last looked for while a resume waits for it.
     find_device_at: Option<Instant>,
+    /// A look for the device is on its way.
+    finding: bool,
+    /// The song that plays now, and whether this play of it is in the local history yet.
+    listen: Option<(String, bool)>,
     /// spotifyd's player events (MPRIS), when playerctl is there.
     follow: Option<crate::control::Follow>,
     /// The heart's animation: when it started, and whether the song became liked.
@@ -626,9 +613,6 @@ impl App {
             genre_list: crate::genres::all(),
             sample: None,
             sample_restore: None,
-            sample_volume: None,
-            fade: Default::default(),
-            fade_at: None,
             shuffled: None,
             unloaded: Default::default(),
             theme_before: None,
@@ -660,6 +644,8 @@ impl App {
             switch: None,
             confirmed_uri: None,
             find_device_at: None,
+            finding: false,
+            listen: None,
             follow: None,
             like_burst: None,
             like_pending: None,
@@ -705,11 +691,11 @@ impl App {
     /// Answers from Spotify wake the loop themselves.
     pub fn busy(&self) -> bool {
         self.vol_target.is_some()
+            || (self.resume.is_some() && self.device.is_none())
             || self.images.busy()
             || self.like_animating()
             || self.search_due.is_some()
             || self.sample.is_some()
-            || !self.fade.is_empty()
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
@@ -828,7 +814,7 @@ impl App {
             self.viz.stop();
         }
         let now = Instant::now();
-        changed |= self.run_fade();
+        changed |= self.note_listen();
         if self.sample.as_ref().and_then(|s| s.started).is_some_and(|at| at.elapsed() >= SAMPLE_LEN) {
             self.stop_sample();
             changed = true;
@@ -884,9 +870,6 @@ impl App {
     pub fn frame_period(&self, viz_frame: Duration) -> Duration {
         if self.sidebar.animating() || self.viz_sweeping() {
             Duration::from_millis(16)
-        } else if !self.fade.is_empty() {
-            // A volume fade: small steps, so it sounds smooth.
-            Duration::from_millis(25)
         } else if self.animating() {
             viz_frame
         } else if self.in_flight > 0 || self.like_animating() {
@@ -1030,6 +1013,7 @@ impl App {
             }
             Msg::User(user) => self.user_id = Some(user.id),
             Msg::Device(name) => {
+                self.finding = false;
                 self.device_checked = true;
                 self.device = name;
             }
@@ -1195,10 +1179,6 @@ impl App {
                         s.track = Some(track);
                         // The 10 s count from when it can be heard.
                         s.started = Some(Instant::now() + SWITCH_WAIT);
-                        if let Some(v) = self.sample_volume {
-                            self.fade.push_back(FadeStep::Wait(SWITCH_WAIT));
-                            self.fade.push_back(FadeStep::Ramp { to: v, len: FADE_IN });
-                        }
                         let shown = s.track.clone();
                         self.expect_switch(shown, false);
                     }
@@ -1208,13 +1188,8 @@ impl App {
                     self.error(e);
                     if self.sample.as_ref().is_some_and(|s| s.genre == genre) {
                         self.sample = None;
-                        // Nothing changed: what played goes on, back at its volume.
+                        // Nothing changed: what played goes on.
                         self.sample_restore = None;
-                        self.fade.clear();
-                        self.fade_at = None;
-                        if let Some(v) = self.sample_volume {
-                            self.fade.push_back(FadeStep::Ramp { to: v, len: FADE_IN / 2 });
-                        }
                     }
                 }
             },

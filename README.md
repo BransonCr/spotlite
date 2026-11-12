@@ -274,7 +274,8 @@ sends a pulse out. Each theme has its own form, set with `aura` in the theme fil
 
 | `aura` | Theme | What it shows |
 | --- | --- | --- |
-| `grooves` | amber | thin rings like a record's grooves, bent by the spectrum |
+| `phosphor` | amber | an oscilloscope in amber phosphor: a grid over the pane and a beam that draws a figure of the music (each song its own), with a glow behind it; a bass beat kicks the figure and a flash runs over the grid |
+| `grooves` | | thin rings like a record's grooves, bent by the spectrum |
 | `stardust` | rose-pine | dust that drifts off the cover, with stars that flash on treble |
 | `pixels` | gruvbox | square lights, a level meter that goes out from the cover |
 | `aurora` | nord | curtains of light; their hem is the spectrum |

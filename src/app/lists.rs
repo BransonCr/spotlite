@@ -228,6 +228,16 @@ impl<T: Viewable> Listing<T> {
         self.sort = sort;
     }
 
+    /// Puts an item at the top. The selected row stays on the same item; a filter or a sort
+    /// is worked out again.
+    pub(super) fn push_front(&mut self, item: T) {
+        let keep = self.index(self.selected());
+        self.items.insert(0, item);
+        self.fetched += 1;
+        self.total = self.total.map(|t| t + 1);
+        self.reshape(keep.map(|i| i + 1));
+    }
+
     /// The whole list at once (from a saved copy): nothing more to load.
     pub(super) fn fill(&mut self, items: Vec<T>) {
         let keep = self.state.selected();

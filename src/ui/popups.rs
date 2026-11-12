@@ -176,7 +176,7 @@ pub(super) fn draw_sample(f: &mut Frame, app: &mut App, picker: Rect) {
         None => (
             vec![
                 Line::from(Span::styled(format!("{} Finding the top {} song…", SPINNER[anim(80) % SPINNER.len()], sample.genre), theme::muted())),
-                Line::from(Span::styled("What plays now fades out, and comes back after.", theme::faint())),
+                Line::from(Span::styled("What plays now comes back after.", theme::faint())),
             ],
             Vec::new(),
             None,
@@ -201,12 +201,14 @@ pub(super) fn draw_sample(f: &mut Frame, app: &mut App, picker: Rect) {
     }
 }
 
+/// The playlist picker (Add to playlist): a filter line, then your playlists, each with its cover.
 pub(super) fn draw_picker(f: &mut Frame, app: &mut App) {
-    let choices: Vec<String> = app.picker_choices().iter().map(|p| p.name.clone()).collect();
+    let choices: Vec<(String, Vec<ImageRef>, Option<usize>)> =
+        app.picker_choices().iter().map(|p| (p.name.clone(), p.images.clone(), p.track_count())).collect();
     let loading = app.playlists.loading;
     let Some(picker) = app.picker.as_ref() else { return };
-    let visible = 12usize;
-    let area = popup_area(f, 56, visible as u16 + 6);
+    let visible = 7u16;
+    let area = popup_area(f, 56, visible * PLAYLIST_ROW + 6);
     let block = popup_block(format!("Add “{}” to…", fit(&picker.track.name, 30)))
         .title_bottom(Line::from(Span::styled(" type to filter · ⏎ add · esc close ", theme::faint())).right_aligned());
     let inner = block.inner(area).inner(Margin::new(0, 1));
@@ -225,19 +227,31 @@ pub(super) fn draw_picker(f: &mut Frame, app: &mut App) {
         return;
     }
     let cursor = picker.cursor.min(choices.len() - 1);
-    let start = cursor.saturating_sub(list.height.saturating_sub(1) as usize);
-    for (n, (i, name)) in choices.iter().enumerate().skip(start).take(list.height as usize).enumerate() {
-        let row = Rect::new(list.x, list.y + n as u16, list.width, 1);
+    let rows = (list.height / PLAYLIST_ROW).max(1) as usize;
+    let start = cursor.saturating_sub(rows - 1);
+    // Marker, then the cover, then the name over the song count.
+    let thumb = app.images.square_cols(PLAYLIST_ROW);
+    let text_x = list.x + 2 + thumb + 1;
+    let text_w = list.right().saturating_sub(text_x) as usize;
+    for (n, (i, (name, images, count))) in choices.iter().enumerate().skip(start).take(rows).enumerate() {
+        let row = Rect::new(list.x, list.y + n as u16 * PLAYLIST_ROW, list.width, PLAYLIST_ROW);
+        if row.bottom() > list.bottom() {
+            break;
+        }
         let selected = i == cursor;
         let style = if selected { Style::new().bg(theme::c().selected).fg(theme::c().bright).add_modifier(Modifier::BOLD) } else { theme::text() };
+        let marker = Span::styled(if selected { theme::c().marker.to_string() } else { " ".into() }, theme::accent());
+        f.render_widget(Paragraph::new(vec![Line::from(marker.clone()), Line::from(marker)]).style(style), row);
+        let count = count.map(|n| format!("{n} tracks")).unwrap_or_default();
+        let text = Rect::new(text_x, row.y, text_w as u16, PLAYLIST_ROW);
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(if selected { theme::c().marker.to_string() } else { " ".into() }, theme::accent()),
-                Span::styled(format!(" {}", fit(name, list.width.saturating_sub(3) as usize)), style),
-            ]))
-            .style(style),
-            row,
+            Paragraph::new(vec![
+                Line::from(Span::styled(fit(name, text_w), style)),
+                Line::from(Span::styled(fit(&count, text_w), theme::faint())),
+            ]),
+            text,
         );
+        draw_cover(f, &mut app.images, images, Rect::new(list.x + 2, row.y, thumb, PLAYLIST_ROW));
         app.hits.popup_rows.push((row, i));
     }
 }

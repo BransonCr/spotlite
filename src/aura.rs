@@ -128,6 +128,34 @@ pub struct Wire {
     slow: f32,
 }
 
+/// The beam's figures (x and y frequency): a song picks one by its cover.
+const RATIOS: [(f32, f32); 6] = [(3.0, 2.0), (1.0, 2.0), (2.0, 3.0), (1.0, 3.0), (2.0, 1.0), (1.0, 1.0)];
+/// Phosphor: how long the afterglow lasts (seconds to fall to about a third).
+const AFTERGLOW: f32 = 0.7;
+
+/// Phosphor: the shape of the oscilloscope's figure, from the music. The parts of the sound
+/// are eased, so the figure changes smoothly.
+#[derive(Debug, Clone, Copy)]
+pub struct Scope {
+    pub bass: f32,
+    pub mid: f32,
+    pub treble: f32,
+    /// A bass beat kicks the beam brighter (and the figure a little larger); it falls back.
+    pub kick: f32,
+    /// How large the figure is (0..1): it follows the loudness slowly.
+    pub size: f32,
+    /// x and y frequency of the figure.
+    pub ratio: (f32, f32),
+    /// The phase between x and y: it turns the figure, like a shape that spins.
+    pub phase: f32,
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Scope { bass: 0.0, mid: 0.0, treble: 0.0, kick: 0.0, size: 0.0, ratio: RATIOS[0], phase: 0.0 }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Aura {
     /// Seconds of motion, and a clock that runs faster when the music is loud.
@@ -138,6 +166,15 @@ pub struct Aura {
     pub pulses: Vec<Pulse>,
     pub motes: Vec<Mote>,
     pub wires: Vec<Wire>,
+    /// Phosphor: the afterglow of the beam, one value (0..1) per braille dot of the panel,
+    /// row by row (`glow_cols` dots to a row).
+    pub glow: Vec<f32>,
+    pub glow_cols: usize,
+    /// Phosphor: where the beam is on its figure (radians), and the figure's shape.
+    pub beam: f32,
+    pub scope: Scope,
+    /// The figure's frequency ratio that the song asks for; `scope.ratio` goes to it slowly.
+    ratio_to: (f32, f32),
     /// The cover's colours now (0..1 each), where they go to, and how much of them shows
     /// (0 = none known: the theme's colours instead).
     colours: [[f32; 3]; SWATCH * SWATCH],
@@ -166,6 +203,11 @@ impl Default for Aura {
             pulses: Vec::new(),
             motes: Vec::new(),
             wires: Vec::new(),
+            glow: Vec::new(),
+            glow_cols: 0,
+            beam: 0.0,
+            scope: Scope::default(),
+            ratio_to: RATIOS[0],
             colours: [[0.0; 3]; SWATCH * SWATCH],
             target: [[0.0; 3]; SWATCH * SWATCH],
             tint: 0.0,
@@ -203,6 +245,9 @@ impl Aura {
         if self.cover.as_deref() != url {
             self.cover = url.map(str::to_owned);
             self.loaded = false;
+            // Each song has its own figure on the scope.
+            let h = url.unwrap_or("").bytes().fold(2_166_136_261u32, |h, b| (h ^ b as u32).wrapping_mul(16_777_619));
+            self.ratio_to = RATIOS[h as usize % RATIOS.len()];
         }
         if !self.loaded {
             if let Some(swatch) = url.and_then(|u| images.swatch(u)) {
@@ -248,6 +293,8 @@ impl Aura {
             self.kind = Some(kind);
             self.motes.clear();
             self.wires = if kind == Kind::Traces { wires(geo) } else { Vec::new() };
+            self.glow_cols = geo.w as usize * 2;
+            self.glow = if kind == Kind::Phosphor { vec![0.0; self.glow_cols * geo.h as usize * 2] } else { Vec::new() };
             if kind == Kind::Stardust {
                 // Dust all over the panel from the start: each piece is put where it would be
                 // some way into its life.
@@ -266,6 +313,10 @@ impl Aura {
         if dt <= 0.0 {
             // No motion: the levels and the colours as they are, nothing else.
             self.energy = mean;
+            if kind == Kind::Phosphor {
+                self.shape(frame, 0.0, 1.0);
+                self.scope.size = (0.45 + 0.55 * (mean / 0.5)).min(1.0);
+            }
             if self.loaded {
                 self.colours = self.target;
                 self.tint = 1.0;
@@ -304,8 +355,82 @@ impl Aura {
         match kind {
             Kind::Stardust => self.dust(beat, dt),
             Kind::Traces => self.signals(frame, beat, dt),
+            Kind::Phosphor => self.trace(frame, beat, dt),
             _ => {}
         }
+    }
+
+    /// Phosphor: the shape of the figure follows the parts of the sound (eased by `k`, 0..1).
+    fn shape(&mut self, frame: &Frame, beat: f32, k: f32) {
+        let part = |r: std::ops::Range<usize>| frame.levels[r.clone()].iter().sum::<f32>() / r.len() as f32;
+        let sc = &mut self.scope;
+        sc.bass += (part(0..8) - sc.bass) * k;
+        sc.mid += (part(8..26) - sc.mid) * k;
+        sc.treble += (part(26..BANDS) - sc.treble) * k;
+        sc.kick = sc.kick.max(beat);
+        let loud = (0.65 + 0.45 * (self.energy / 0.5)).min(1.0);
+        sc.size += (loud - sc.size) * k * 0.5;
+    }
+
+    /// Phosphor: the point of the figure at `theta`, in cell widths and half rows from the
+    /// panel's top left. The figure's middle is in the space under the cover; it is as wide as
+    /// the panel, and with loud music it reaches up past the cover's sides.
+    pub fn beam_at(&self, theta: f32) -> (f32, f32) {
+        self.beam_point(theta, 0.0)
+    }
+
+    /// A point of the figure with its x turned on by `turn` (the second beam: a quarter turn).
+    fn beam_point(&self, theta: f32, turn: f32) -> (f32, f32) {
+        let (g, sc) = (self.geo, &self.scope);
+        let (cx, cy, ax, ay) = scope_frame(g);
+        let size = (sc.size + 0.06 * sc.kick).min(1.05);
+        let (fx, fy) = sc.ratio;
+        // The bass makes the main figure; the middle adds loops; the treble a fine buzz.
+        let buzz = 0.06 * sc.treble * (theta * 37.0 + self.time * 11.0).sin();
+        let x = (fx * theta + sc.phase + turn).sin() + 0.24 * sc.mid * (3.0 * fx * theta - sc.phase).sin() + buzz;
+        let y = (fy * theta).sin() + 0.24 * sc.mid * (3.0 * fy * theta + sc.phase * 0.5).cos() - buzz;
+        let wide = 0.85 + 0.15 * sc.bass;
+        (cx + ax * size * wide * x / 1.2, cy + ay * size * y / 1.2)
+    }
+
+    /// Phosphor: the beam runs along its figure (faster when the music is loud) and leaves
+    /// light on the screen, which fades.
+    fn trace(&mut self, frame: &Frame, beat: f32, dt: f32) {
+        self.shape(frame, beat, (dt * 2.0).min(1.0));
+        let sc = &mut self.scope;
+        sc.kick *= (-dt * 3.5).exp();
+        sc.phase += dt * (0.25 + 0.9 * self.energy);
+        let k = (dt * 0.7).min(1.0);
+        sc.ratio.0 += (self.ratio_to.0 - sc.ratio.0) * k;
+        sc.ratio.1 += (self.ratio_to.1 - sc.ratio.1) * k;
+        let fade = (-dt / (AFTERGLOW * (0.8 + 0.6 * self.energy))).exp();
+        for v in &mut self.glow {
+            *v *= fade;
+        }
+        let from = self.beam;
+        self.beam += dt * std::f32::consts::TAU * (0.6 + 1.3 * self.energy);
+        let (cols, rows) = (self.glow_cols, self.glow.len() / self.glow_cols.max(1));
+        let steps = ((self.beam - from) * 420.0).ceil().clamp(1.0, 2000.0) as usize;
+        for i in 1..=steps {
+            let theta = from + (self.beam - from) * i as f32 / steps as f32;
+            // The newest light is the brightest: the head of the trace.
+            let at = 0.55 + 0.45 * i as f32 / steps as f32;
+            // Two beams: the figure, and the same figure a quarter turn on, dimmer.
+            for (turn, gain) in [(0.0, 1.0), (std::f32::consts::FRAC_PI_2, 0.62)] {
+                let (x, y) = self.beam_point(theta, turn);
+                let (sx, sy) = ((x * 2.0).floor() as i64, (y * 2.0).floor() as i64);
+                // A thick beam: the dot, and a softer dot beside it.
+                let side = if turn == 0.0 { 1 } else { 0 };
+                for (dx, dy, k) in [(0, 0, 1.0), (side, 0, 0.45)] {
+                    let (px, py) = (sx + dx, sy + dy);
+                    if px >= 0 && py >= 0 && (px as usize) < cols && (py as usize) < rows {
+                        let v = &mut self.glow[py as usize * cols + px as usize];
+                        *v = v.max(at * gain * k);
+                    }
+                }
+            }
+        }
+        self.beam = self.beam.rem_euclid(std::f32::consts::TAU * 4.0);
     }
 
     /// How much the pulses light a point `d` from the cover (0..1).
@@ -419,6 +544,14 @@ impl Aura {
             w.heads.retain(|h| *h < end);
         }
     }
+}
+
+/// Phosphor: the oscilloscope's screen: its middle (x, y) and its half width and half height,
+/// in cell widths and half rows. It sits in the space under the cover (the whole panel when
+/// there is too little space there).
+pub fn scope_frame(g: Geo) -> (f32, f32, f32, f32) {
+    let top = if g.has_cover() && g.h - g.y1 >= 8.0 { g.y1 } else { 0.0 };
+    ((g.w / 2.0), (top + g.h) / 2.0, (g.w / 2.0 - 1.0).max(1.0), ((g.h - top) / 2.0 - 1.0).max(1.0))
 }
 
 /// The wires of `traces`: from the cover's left and right edges out and down the panel's sides,
@@ -649,6 +782,43 @@ mod tests {
         assert!(a.wires.iter().all(|w| w.heads.len() <= MAX_HEADS));
         run(&mut a, Kind::Traces, 5.0, |_| Frame::default());
         assert!(a.wires.iter().all(|w| w.heads.is_empty()), "the light runs off the ends");
+    }
+
+    #[test]
+    fn the_beam_draws_a_figure_that_glows_and_fades() {
+        let mut a = Aura::default();
+        run(&mut a, Kind::Phosphor, 2.0, music);
+        let lit = a.glow.iter().filter(|&&v| v > 0.1).count();
+        assert!(lit > 60, "a trace on the screen: {lit} dots");
+        assert!(a.glow.iter().all(|&v| v <= 1.0));
+        // Its points stay on the screen under the cover.
+        let (cx, cy, ax, ay) = scope_frame(geo());
+        for i in 0..200 {
+            let (x, y) = a.beam_at(i as f32 * 0.1);
+            assert!((x - cx).abs() <= ax * 1.1 && (y - cy).abs() <= ay * 1.1, "{x},{y}");
+        }
+        let big = a.scope.size;
+        run(&mut a, Kind::Phosphor, 4.0, |_| Frame::default());
+        assert!(a.scope.size < big, "smaller in silence");
+        let left = a.glow.iter().filter(|&&v| v > 0.5).count();
+        let head = a.glow.iter().filter(|&&v| v > 0.03).count();
+        assert!(left < lit && head > 0, "the old light fades; the beam still runs: {left} {head}");
+    }
+
+    #[test]
+    fn each_song_has_its_own_figure() {
+        let images = Images::disabled();
+        let mut a = Aura::default();
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..20 {
+            a.see_cover(Some(&format!("https://i.scdn.co/image/{n}")), &images);
+            seen.insert((a.ratio_to.0 as u32, a.ratio_to.1 as u32));
+        }
+        assert!(seen.len() >= 4, "figures: {seen:?}");
+        a.see_cover(Some("https://i.scdn.co/image/7"), &images);
+        let to = a.ratio_to;
+        run(&mut a, Kind::Phosphor, 8.0, music);
+        assert!((a.scope.ratio.0 - to.0).abs() < 0.05 && (a.scope.ratio.1 - to.1).abs() < 0.05, "it turns into it slowly");
     }
 
     #[test]
