@@ -118,7 +118,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
     add("Reload the list", Act::Reload);
     add("Help: all keys", Act::Help);
     add("Quit (music keeps playing)", Act::Quit);
-    add("Quit and stop spotifyd", Act::QuitStop);
+    add("Quit and stop the player (spotifyd)", Act::QuitStop);
     add("Filter the list…", Act::Filter);
     add("Sort the list", Act::Sort);
     add("Mark all songs", Act::MarkAll);

@@ -607,7 +607,7 @@ impl App {
     /// The device menu: every Spotify Connect device; the one chosen plays from now on.
     pub(super) fn open_devices(&mut self, list: Vec<(String, String, bool)>) {
         if list.is_empty() {
-            self.info("Spotify sees no devices. Is spotifyd running?");
+            self.info(format!("Spotify sees no devices. Is {} running?", crate::engine::name()));
             return;
         }
         let cursor = list.iter().position(|d| d.2).unwrap_or(0);

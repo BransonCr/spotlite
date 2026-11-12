@@ -152,7 +152,7 @@ pub const ALL: &[Info] = &[
     i(Act::Reload, "reload", "Other", "load again from Spotify", &["R"]),
     i(Act::Help, "help", "Other", "these keys", &["?"]),
     i(Act::Quit, "quit", "Other", "quit (music keeps playing)", &["q"]),
-    i(Act::QuitStop, "quit_stop", "Other", "quit and stop spotifyd", &["Q"]),
+    i(Act::QuitStop, "quit_stop", "Other", "quit and stop the player (spotifyd)", &["Q"]),
 ];
 
 /// A key as the table knows it: Shift is part of the character ('G'), not a modifier.

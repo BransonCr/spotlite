@@ -1,12 +1,13 @@
-//! Sound visualizer: the spectrum of what spotifyd is playing.
+//! Sound visualizer: the spectrum of what the player engine (spotifyd, or the built-in
+//! player) is playing.
 //!
-//! `parec` records only spotifyd's own stream (its PulseAudio/PipeWire sink input), at
-//! 22 kHz mono, so other sounds on the machine do not show. A thread turns each 1024-sample
+//! The engine gives only its own sound, at 22 kHz mono (see `engine::pcm`), so other sounds
+//! on the machine do not show. A thread turns each 1024-sample
 //! window into BANDS log-spaced levels. Nothing runs while the visualizer is off, the music
 //! is paused, or the window does not have focus.
 
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use crate::engine::Closer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -109,7 +110,7 @@ impl Peaks {
 pub struct Visualizer {
     frame: Arc<Mutex<Frame>>,
     stop: Arc<AtomicBool>,
-    child: Option<Child>,
+    child: Option<Closer>,
     thread: Option<JoinHandle<()>>,
     last_start: Option<Instant>,
 }
@@ -136,7 +137,7 @@ impl Visualizer {
         self.frame.lock().map(|f| *f).unwrap_or_default()
     }
 
-    /// Starts capture if it is not running. spotifyd opens a new stream after a pause or a
+    /// Starts capture if it is not running. The engine opens a new stream after a pause or a
     /// device change, which ends the old capture; retries are spaced one second apart.
     pub fn ensure_running(&mut self) {
         if self.running() || self.last_start.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
@@ -144,16 +145,8 @@ impl Visualizer {
         }
         self.stop();
         self.last_start = Some(Instant::now());
-        let Some(stream) = spotifyd_stream() else { return };
-        let child = Command::new("parec")
-            .arg(format!("--monitor-stream={stream}"))
-            .args(["--raw", "--format=s16le", "--channels=1", "--latency-msec=20"])
-            .arg(format!("--rate={RATE}"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-        let Ok(mut child) = child else { return };
-        let Some(mut out) = child.stdout.take() else { return };
+        let Some(stream) = crate::engine::pcm() else { return };
+        let (mut out, child) = (stream.reader, stream.closer);
         self.child = Some(child);
         self.stop.store(false, Ordering::SeqCst);
         let (frame, stop) = (self.frame.clone(), self.stop.clone());
@@ -177,8 +170,7 @@ impl Visualizer {
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.close();
         }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -193,21 +185,6 @@ impl Drop for Visualizer {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// Index of spotifyd's sink input, from `pactl` (works with pipewire-pulse too).
-fn spotifyd_stream() -> Option<u32> {
-    let out = Command::new("pactl")
-        .args(["--format=json", "list", "sink-inputs"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let inputs: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    inputs.as_array()?.iter().find_map(|i| {
-        let props = &i["properties"];
-        let ours = props["application.process.binary"] == "spotifyd" || props["application.name"] == "spotifyd";
-        ours.then(|| i["index"].as_u64()).flatten().map(|n| n as u32)
-    })
 }
 
 /// In-place radix-2 FFT (n a power of two).

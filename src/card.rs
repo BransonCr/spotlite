@@ -1,6 +1,6 @@
 //! The share card (`C`, or "Share card" in the sidebar): a 1200x630 PNG of the playing song,
 //! with its cover, title, artist and album on a background in the cover's own colour. It is
-//! saved to ~/Pictures/spotlite and its path is copied (wl-copy), ready to paste.
+//! saved to the Pictures folder (spotlite) and its path is copied, ready to paste.
 
 use crate::api::{pick_image, Track};
 use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
@@ -21,8 +21,8 @@ pub fn make(track: &Track) -> Result<PathBuf> {
     let url = pick_image(track.images(), 600).ok_or_else(|| anyhow!("This song has no cover."))?;
     let bytes = crate::images::cover_bytes(url).ok_or_else(|| anyhow!("Could not download the cover."))?;
     let cover = image::load_from_memory(&bytes).context("reading the cover")?.to_rgba8();
-    let bold = font("Inter,Noto Sans,DejaVu Sans,sans-serif:bold")?;
-    let regular = font("Inter,Noto Sans,DejaVu Sans,sans-serif")?;
+    let bold = font(true)?;
+    let regular = font(false)?;
     let album = track.album.as_ref().map(|a| match a.year() {
         Some(y) => format!("{}  ·  {y}", a.name),
         None => a.name.clone(),
@@ -32,28 +32,16 @@ pub fn make(track: &Track) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
     let path = dir.join(format!("{}.png", file_name(&format!("{} - {}", track.artist_names(), track.name))));
     card.save(&path).with_context(|| format!("saving {}", path.display()))?;
-    // Copy the path, so it can be pasted into a chat at once. No wl-copy: no copy.
-    if let Ok(mut child) = std::process::Command::new("wl-copy")
-        .arg(path.as_os_str())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        std::thread::spawn(move || child.wait());
-    }
+    // Copy the path, so it can be pasted into a chat at once.
+    crate::platform::copy_text(&path.display().to_string());
     Ok(path)
 }
 
-/// A font file that fontconfig picks for `pattern`.
-fn font(pattern: &str) -> Result<FontVec> {
-    let out = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}", pattern])
-        .output()
-        .context("running fc-match (fontconfig)")?;
-    let file = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    let data = std::fs::read(&file).with_context(|| format!("reading the font {file}"))?;
-    FontVec::try_from_vec_and_index(data, 0).map_err(|_| anyhow!("cannot read the font {file}"))
+/// The share card's font: a sans-serif the system has (see `platform::font_file`).
+fn font(bold: bool) -> Result<FontVec> {
+    let file = crate::platform::font_file(bold)?;
+    let data = std::fs::read(&file).with_context(|| format!("reading the font {}", file.display()))?;
+    FontVec::try_from_vec_and_index(data, 0).map_err(|_| anyhow!("cannot read the font {}", file.display()))
 }
 
 /// Letters that are safe in a file name; others become spaces.
@@ -250,7 +238,7 @@ mod tests {
 
     #[test]
     fn composes_a_card_when_a_font_is_there() {
-        let (Ok(bold), Ok(regular)) = (font("sans-serif:bold"), font("sans-serif")) else { return };
+        let (Ok(bold), Ok(regular)) = (font(true), font(false)) else { return };
         let cover = RgbaImage::from_pixel(64, 64, Rgba([200, 40, 40, 255]));
         let card = compose(&cover, "A long song title that wraps", "Artist", Some("Album  ·  2020"), &bold, &regular);
         assert_eq!(card.dimensions(), (W, H));

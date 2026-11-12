@@ -53,17 +53,14 @@ impl Token {
     }
 
     pub fn save(&self) -> Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
         let path = token_path();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        crate::platform::private_file(&mut options);
+        let mut file = options.open(&path)?;
         file.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
         Ok(())
     }
