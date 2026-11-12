@@ -710,7 +710,9 @@ fn renders_empty_states_and_help() {
 
     app.on_msg(Msg::Device(None));
     let out = screen(&mut app, 90, 22);
-    assert!(out.contains("no device") && out.contains("systemctl --user start spotifyd"), "{out}");
+    // The hint names the backend's fix; a long log path can be cut at the edge.
+    let hint = crate::engine::hint_no_device();
+    assert!(out.contains("no device") && out.contains(&hint[..20]), "{out}");
 
     app.help = true;
     let out = screen(&mut app, 90, 32);
