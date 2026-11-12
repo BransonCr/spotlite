@@ -517,6 +517,46 @@ pub fn playing_mark(playing: bool, frame: usize) -> char {
 }
 
 /// The colour `f` (0 to 1) of the way from `a` to `b`.
+/// True when the terminal shows 24-bit colour (COLORTERM says so, or a terminal known to).
+/// `SPOTLITE_COLORS=256` or `=truecolor` decides instead.
+pub fn truecolor() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if cfg!(test) {
+            return true;
+        }
+        let var = |k: &str| std::env::var(k).unwrap_or_default().to_lowercase();
+        match var("SPOTLITE_COLORS").as_str() {
+            "256" => return false,
+            "truecolor" | "24bit" => return true,
+            _ => {}
+        }
+        let ct = var("COLORTERM");
+        let term = var("TERM") + &var("TERM_PROGRAM");
+        ct.contains("truecolor")
+            || ct.contains("24bit")
+            || ["kitty", "ghostty", "wezterm", "alacritty", "foot", "iterm", "vscode", "konsole"].iter().any(|t| term.contains(t))
+    })
+}
+
+/// The nearest colour of the 256-colour palette (its 6x6x6 cube or its grey ramp).
+pub fn to_256(c: Color) -> Color {
+    let Color::Rgb(r, g, b) = c else { return c };
+    const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let level = |v: u8| STEPS.iter().enumerate().min_by_key(|(_, s)| (**s as i32 - v as i32).abs()).map_or(0, |(i, _)| i);
+    let (ri, gi, bi) = (level(r), level(g), level(b));
+    let dist = |x: u8, y: u8, z: u8| (r as i32 - x as i32).pow(2) + (g as i32 - y as i32).pow(2) + (b as i32 - z as i32).pow(2);
+    let cube = dist(STEPS[ri], STEPS[gi], STEPS[bi]);
+    let avg = (r as u32 + g as u32 + b as u32) / 3;
+    let grey = (avg.saturating_sub(8) / 10).min(23) as u8;
+    let gv = 8 + grey * 10;
+    if dist(gv, gv, gv) < cube {
+        Color::Indexed(232 + grey)
+    } else {
+        Color::Indexed(16 + 36 * ri as u8 + 6 * gi as u8 + bi as u8)
+    }
+}
+
 pub fn blend(a: Color, b: Color, f: f32) -> Color {
     let (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) = (a, b) else { return a };
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f.clamp(0.0, 1.0)).round() as u8;
@@ -631,5 +671,13 @@ mod tests {
         assert_eq!(shades[2], Color::Rgb(20, 40, 60));
         assert_eq!(shades[4], Color::Rgb(40, 80, 120));
         set(DEFAULT, AMBER);
+    }
+
+    #[test]
+    fn colours_map_to_the_256_palette() {
+        assert_eq!(to_256(Color::Rgb(255, 0, 0)), Color::Indexed(196));
+        assert_eq!(to_256(Color::Rgb(0, 0, 0)), Color::Indexed(16));
+        assert_eq!(to_256(Color::Rgb(128, 128, 128)), Color::Indexed(244), "greys use the grey ramp");
+        assert_eq!(to_256(Color::Reset), Color::Reset);
     }
 }

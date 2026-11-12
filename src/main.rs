@@ -276,8 +276,10 @@ fn run_tui() -> Result<()> {
         app.set_folders(tree);
     }
     let saved = state::load();
-    // SPOTLITE_THEME tries a theme for this run only (it is not saved).
-    let wanted = theme::env_override().or(saved.theme.clone());
+    // SPOTLITE_THEME tries a theme for this run only (it is not saved). NO_COLOR asks for no
+    // colour: the mono theme.
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    let wanted = theme::env_override().or(no_color.then(|| "mono".to_owned())).or(saved.theme.clone());
     if let Some(name) = &wanted {
         if let Err(e) = theme::apply(name) {
             app.error(e);

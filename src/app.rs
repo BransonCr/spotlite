@@ -688,6 +688,8 @@ pub struct App {
     pub device: Option<String>,
     pub device_checked: bool,
     pub toast: Option<Toast>,
+    /// Messages that wait for an error to have been read.
+    toasts: std::collections::VecDeque<Toast>,
     pub help: bool,
     /// The filter typed in help, and how far help is scrolled.
     pub help_query: Input,
@@ -857,6 +859,7 @@ impl App {
             device: None,
             device_checked: false,
             toast: None,
+            toasts: Default::default(),
             help: false,
             help_query: Input::default(),
             help_scroll: 0,
@@ -1190,7 +1193,17 @@ impl App {
         let text = text.into();
         // Long messages stay longer: about 4 s, plus a second for each 20 characters.
         let secs = 4 + (text.chars().count() as u64 / 20).min(6);
-        self.toast = Some(Toast { text, error: false, until: Instant::now() + Duration::from_secs(secs) });
+        let toast = Toast { text, error: false, until: Instant::now() + Duration::from_secs(secs) };
+        // An error stays at least 3 s: a message after it waits its turn.
+        let fresh_error = self.toast.as_ref().is_some_and(|t| t.error && t.until > Instant::now() + Duration::from_secs(5));
+        if fresh_error {
+            self.toasts.push_back(toast);
+            while self.toasts.len() > 3 {
+                self.toasts.pop_front();
+            }
+        } else {
+            self.toast = Some(toast);
+        }
     }
 
     pub fn error(&mut self, text: impl Into<String>) {
@@ -1397,7 +1410,10 @@ impl App {
             changed = true;
         }
         if self.toast.as_ref().is_some_and(|t| now >= t.until) {
-            self.toast = None;
+            self.toast = self.toasts.pop_front().map(|mut t| {
+                t.until = now + Duration::from_secs(4);
+                t
+            });
             changed = true;
         }
         changed |= self.sidebar.step();
@@ -2059,7 +2075,9 @@ impl App {
             })
             .collect();
         // A theme tried with SPOTLITE_THEME is not saved.
-        let theme = if crate::theme::env_override().is_some() { crate::state::load().theme } else { Some(crate::theme::name()) };
+        // So is the mono theme that NO_COLOR asks for.
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+        let theme = if crate::theme::env_override().is_some() || no_color { crate::state::load().theme } else { Some(crate::theme::name()) };
         State {
             theme,
             tabs,
@@ -5831,6 +5849,19 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.view(), View::Playlist);
         assert_eq!(app.open.as_ref().map(|o| o.playlist.name.as_str()), Some("Gym"));
+    }
+
+    #[test]
+    fn a_message_waits_until_an_error_was_read() {
+        let (mut app, _rx) = test_app();
+        app.error("Spotify refused this");
+        app.info("Added to queue");
+        assert!(app.toast.as_ref().is_some_and(|t| t.error), "the error stays");
+        app.toast.as_mut().unwrap().until = Instant::now();
+        app.tick();
+        assert_eq!(app.toast.as_ref().map(|t| t.text.as_str()), Some("Added to queue"), "then the message shows");
+        app.info("Next");
+        assert_eq!(app.toast.as_ref().map(|t| t.text.as_str()), Some("Next"), "messages replace messages");
     }
 
     #[test]

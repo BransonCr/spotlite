@@ -229,6 +229,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let frame = app.viz.frame();
         draw_visualizer_fx(f.buffer_mut(), viz_area, &frame, reveal);
     }
+    let popup = app.menu.is_some()
+        || app.genre_picker.is_some()
+        || app.picker.is_some()
+        || app.confirm.is_some()
+        || app.palette.is_some()
+        || app.undo.is_some()
+        || app.help;
+    if popup {
+        // What is behind a pop-up steps back, so the pop-up stands out.
+        let area = f.area();
+        let buf = f.buffer_mut();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)].modifier.insert(Modifier::DIM);
+            }
+        }
+    }
     if app.menu.is_some() {
         draw_menu(f, app);
     } else if app.genre_picker.is_some() {
@@ -248,6 +265,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let playing = app.playback.as_ref().is_some_and(|pb| pb.is_playing);
     let area = f.area();
     frame_fx(f.buffer_mut(), area, playing);
+    if !theme::truecolor() {
+        let buf = f.buffer_mut();
+        for cell in buf.content.iter_mut() {
+            cell.fg = theme::to_256(cell.fg);
+            cell.bg = theme::to_256(cell.bg);
+        }
+    }
 }
 
 /// Cuts a styled line to `width` columns, ending with "…" when cut.
@@ -1511,6 +1535,19 @@ fn count_label<T: crate::app::Viewable>(l: &Listing<T>, filtering: bool) -> Stri
     out
 }
 
+/// The count of a song list with its length: " 45 songs · 2 h 51 min ".
+fn songs_label(l: &Listing<Track>, filtering: bool) -> String {
+    let base = count_label(l, filtering);
+    if l.loading || l.items.is_empty() || l.filter.is_some() {
+        return base;
+    }
+    let ms: u64 = l.items.iter().map(|t| t.duration_ms).sum();
+    let mins = ms / 60_000;
+    let time = if mins >= 60 { format!("{} h {} min", mins / 60, mins % 60) } else { format!("{mins} min") };
+    let more = if l.total.is_some_and(|t| l.items.len() < t) { "+" } else { "" };
+    format!("{} · {time}{more} ", base.trim_end())
+}
+
 /// A song or playlist name with the part the filter matched underlined.
 fn with_match(name: String, query: Option<&str>, style: Style) -> Vec<Span<'static>> {
     let word = query.and_then(|q| q.split_whitespace().next()).map(str::to_lowercase).filter(|w| !w.is_empty());
@@ -1986,7 +2023,7 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
     };
     let block = panel()
         .title(title)
-        .title(Line::from(Span::styled(count_label(listing, filtering), theme::faint())).right_aligned());
+        .title(Line::from(Span::styled(songs_label(listing, filtering), theme::faint())).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2330,11 +2367,43 @@ pub fn anim(period_ms: u128) -> usize {
     (START.get_or_init(std::time::Instant::now).elapsed().as_millis() / period_ms.max(1)) as usize
 }
 
+/// Placeholder rows while a list loads: a dim bar where each column's text will be, of a
+/// different length on each row. A soft light moves across them while the theme has motion.
+fn draw_skeleton(buf: &mut Buffer, area: Rect) {
+    let t = theme::c();
+    let base = theme::blend(t.selected, t.border, 0.25);
+    let light = theme::blend(t.selected, t.muted, 0.35);
+    let sweep = if theme::motion() { anim(30) as i32 } else { -1000 };
+    let width = area.width as i32;
+    for (n, y) in (area.top()..area.bottom()).enumerate().step_by(2) {
+        // Number, title, artist, album, time: lengths from the row number (no flicker).
+        let seed = (n as i32 * 7919) % 97;
+        let title = width * (22 + seed % 14) / 100;
+        let artist = width * (12 + (seed / 3) % 10) / 100;
+        let album = width * (10 + (seed / 7) % 12) / 100;
+        let bars = [(1, 2), (5, title), (5 + width * 42 / 100, artist), (5 + width * 66 / 100, album), (width - 6, 4)];
+        for (x0, len) in bars {
+            for x in x0..(x0 + len).min(width - 1) {
+                let d = (x + n as i32 * 2 - sweep % (width + 40) + 20).abs();
+                let c = if d < 10 { theme::blend(light, base, d as f32 / 10.0) } else { base };
+                let cell = &mut buf[(area.x + x as u16, y)];
+                cell.set_symbol(" ");
+                cell.set_bg(c);
+            }
+        }
+    }
+}
+
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// An empty or loading list: "Loading…" gets a spinner; any other message gets the theme's
 /// logo above it. A second line after "\n" is a hint (the key to press).
 fn draw_centered(f: &mut Frame, area: Rect, msg: &str) {
+    // A list that loads shows the shape of its rows, so the rows take their place without a jump.
+    if msg == "Loading…" && area.height >= 4 && area.width >= 30 {
+        draw_skeleton(f.buffer_mut(), area);
+        return;
+    }
     let mut lines = Vec::new();
     if msg == "Loading…" {
         lines.push(Line::from(vec![
@@ -3604,5 +3673,23 @@ mod tests {
         let out = screen(&mut app, 100, 30);
         assert_eq!(app.search.state.offset(), 0);
         assert!(out.contains("Song00000"), "{out}");
+    }
+
+    #[test]
+    fn a_loading_list_shows_skeleton_rows_and_popups_dim_the_rest() {
+        let (mut app, _rx) = test_app();
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Char('3')));
+        app.liked.loading = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let bars = buf.content.iter().filter(|c| c.bg == theme::blend(theme::c().selected, theme::c().border, 0.25)).count();
+        assert!(bars > 100, "skeleton bars: {bars}");
+        app.liked.loading = false;
+        app.help = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert!(buf[(1, 1)].modifier.contains(Modifier::DIM), "behind help is dim");
     }
 }
