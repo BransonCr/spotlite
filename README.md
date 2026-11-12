@@ -67,7 +67,7 @@ selected song, so you do not need to remember the keys below.
 | `x` | Close the artist, album or radio tab you are on |
 | `j` `k`, arrows, `g` `G`, `Ctrl+D` `Ctrl+U` | Move (more pages load as you scroll) |
 | `Esc`, `h` | Back: close a playlist or go up a folder, else go to the tab you were on before |
-| `c` | Jump to the playing song in the list |
+| `c` | Jump to the playing song (opens the list it plays from if it is not this one) |
 | `Enter` | Play the selected song, or open a playlist, album or folder |
 | `P` | Play the whole playlist or album |
 | `.` | Action menu for the selected song |
@@ -78,8 +78,13 @@ selected song, so you do not need to remember the keys below.
 | `F` | Radio filters (on a radio page) |
 | `d` | Discover: new songs outside your taste (on a radio page; again for a new round) |
 | `S` | Save the radio list on screen as a new playlist (asks first) |
-| `e` | Add the selected song to one of your playlists |
-| `D` | Remove the selected song from the open playlist (asks first) |
+| `e` / `E` | Add the selected song to one of your playlists / to the last one again |
+| `D` | Remove the selected song from the open playlist (`u` puts it back) |
+| `Ctrl+F` | Filter the list as you type (Esc clears it) |
+| `,` / `;` | Sort the list by title, artist, album, time / turn the sort round |
+| `w` / `W` | Mark the song / mark all: the next action is for every marked song |
+| `u` | Undo the last change: a remove, an add, a like, an unpin |
+| `y` | Play on another device (lists your Spotify Connect devices) |
 | `Space` | Play / pause (starts spotifyd if nothing is active) |
 | `n` / `p` | Next / previous |
 | `←` / `→` | Seek 10 seconds |
@@ -95,14 +100,46 @@ selected song, so you do not need to remember the keys below.
 | `q` | Quit (music keeps playing) |
 | `Q` | Quit and stop spotifyd: nothing keeps running (spotlite starts it again next time) |
 
+Every key can be changed in `config.toml`, and `spotlite keys` lists the actions with
+their names and keys:
+
+```toml
+[keys]
+next = "N"                  # one key
+like = ["f", "ctrl-l"]      # or several
+mute = ""                   # or none
+```
+
+A mistake (an unknown name, a key set twice) shows when spotlite starts. Help (`?`) shows
+the keys in use; type in it to filter, `↑` `↓` to scroll.
+
+### Lists: filter, sort, marks, undo
+
+- `Ctrl+F` filters the list shown as you type: songs by title, artist and album, playlists
+  by name and owner. The match is underlined. Enter keeps the filter and goes back to the
+  list; Esc clears it. A list that is not fully loaded loads the rest first, so nothing is
+  missed.
+- `,` sorts by title, then artist, album and time, then the list's own order; `;` turns it
+  round. Enter in a filtered or sorted list plays the songs in the order they show.
+- `w` marks a song (◆) and moves down; `W` marks all of them, or none. Queue, add to a
+  playlist, remove and like then act on every marked song. Esc clears the marks.
+- Remove does not ask first: `u` puts the songs back at their places. `u` also undoes an
+  add, a like or an unlike, and an unpin.
+- A playlist you open again comes back as you left it: the same place, filter and sort.
+- Text boxes (search, palette, pickers, filter) have a cursor: `←` `→`, Home/End, `Ctrl+A`
+  `Ctrl+E`, `Ctrl+←` `→` by word, `Ctrl+W`/`Ctrl+⌫` delete a word, `Ctrl+U` `Ctrl+K`, and
+  paste. In the search box, `↑` `↓` go through earlier searches.
+- The palette (`:`) also finds your playlists, earlier searches, themes and genres by name.
+
 ### Search and Recent
 
 `t` changes what the search lists: **Songs**, **Artists**, **Albums** or **Playlists** (or
 click one in the list title). Enter on an artist or album opens its page; on one of your
-playlists it opens the playlist; on someone else's playlist it plays it (the 2026 dev-mode
-API lists songs only of your own playlists).
+playlists it opens the playlist; someone else's playlist opens too: its songs come over
+Spotify's client protocol (the 2026 dev-mode Web API lists only your own).
 
-**Recent** (`4`) is the last 50 songs you played, loaded again each time you go to it.
+**Recent** (`4`) is the last 50 songs you played. It loads again when you come back to it
+after a new song or after a minute.
 
 ### Artists, albums, radio
 
@@ -148,7 +185,10 @@ quits or its window closes.
 - In the player, click the artist name to open the artist, or the cover to open the album.
 - Right-click a row for its action menu; it opens at the mouse.
 - Click the heart in the player to like or unlike the playing song.
-- Click a row to select it; double-click to play it or open the playlist.
+- Click a row to select it; double-click to play it or open the playlist. The row under the
+  pointer brightens.
+- Drag the scrollbar to move through a long list.
+- Click the song's length in the player to see the time left instead.
 - Wheel scrolls the list. Over the progress or volume bar, the wheel seeks or changes the volume.
 - Click or drag the progress bar to seek, and the volume slider to set the volume.
 
@@ -234,17 +274,40 @@ Set `SPOTLITE_NO_IMAGES=1` to turn pictures off.
 
 ## How it works
 
-- The UI thread only draws and reads keys. A second thread makes every Web API
-  call, so the UI never waits on the network.
+- The UI thread only draws and reads keys. Two more threads make the Web API calls: one
+  for player commands and polls, one for lists and pages, so play, pause and skip never
+  wait behind a long load.
+- spotlite asks Spotify as little as it can (Development Mode apps are rate limited hard):
+  - The player state is read every 8 s while music plays, 20 s while paused, 30 s with
+    nothing loaded, and at once after a command or at the end of a song. The progress bar
+    moves locally in between.
+  - A song change costs 0 or 1 requests: the ♥ comes from the Liked Songs index, and
+    "up next" walks the 20-song queue Spotify sent before.
+  - Saved copies in `~/.cache/spotlite`: Liked Songs (all of it, brought up to date with
+    usually 1 request), playlists (used while their snapshot is the same), albums, artist
+    pages (24 h), the playlists list (10 min), cover pictures, the prepicked genre samples
+    and how deep each genre's search goes. `R` asks Spotify again.
+  - Playlist songs, song radio, discover and the folder tree come over Spotify's client
+    protocol, which does not count against the Web API's limits. One connection serves
+    calls that come close together.
+  - Liking, adding and removing change the lists in place instead of loading them again.
+  - `SPOTLITE_LOG=/tmp/spotlite.log` writes one line per request (and slow frames), to see
+    what spotlite asks.
 - When spotifyd is the active device, play/pause, skip, seek and volume go to it over
   MPRIS (`playerctl`, about 8 ms) and the screen changes at once; a Web API read 0.5 s
   later confirms it. Other devices use the Web API (about 250 ms per call).
-- The player state is read every 5 seconds; the progress bar moves locally in
-  between. When idle, the UI wakes once a second.
+- Lists draw only the rows on screen, so a list of 10 000 songs draws as fast as one of
+  20. When nothing moves, the UI sleeps until the next thing is due.
+- No network: the header says offline and the poll waits longer each time; one message
+  says when it is back.
 - Liked Songs and your own playlists play as a context, so playback continues
   past the tracks that are loaded.
 - If spotifyd restarts, spotlite finds the device again and retries once.
-  On a rate limit (429), it waits for the time Spotify asks for.
+  On a rate limit (429), it waits for the time Spotify asks for. A play command with no
+  device starts spotifyd and waits for it.
+- Terminals without 24-bit colour get the nearest 256-colour palette colours
+  (`SPOTLITE_COLORS=256` or `truecolor` decides by hand); `NO_COLOR` uses the mono theme.
+- A crash leaves a note in `~/.local/state/spotlite/crash.log`.
 
 ## Commands
 
@@ -254,6 +317,8 @@ spotlite auth       log in (token in ~/.cache/spotlite/token.json, mode 600)
 spotlite devices    list Spotify Connect devices
 spotlite folders    print your playlist folders
 spotlite theme ...  list, set, copy, make and check themes (see Themes)
+spotlite keys       list every action, its name for [keys], and its keys
+spotlite --version  the version
 spotlite toggle     play/pause
 spotlite next       next track
 spotlite prev       previous track
@@ -285,6 +350,6 @@ bind = , XF86AudioPrev, exec, playerctl -p spotifyd previous
 - 5 users per app, owner must have Premium.
 - Search returns 10 results at most.
 - Playlist tracks are only readable for playlists you own or collaborate on.
-  Enter opens those; other playlists play as a whole.
+  spotlite reads the others over the client protocol instead.
 - Liking songs needs the `user-library-modify` permission. If you logged in
   with an older spotlite, run `spotlite auth` again.

@@ -55,7 +55,8 @@ usage:
   spotlite keys       list every action, its name for [keys] in config.toml, and its keys
   spotlite toggle     play/pause
   spotlite next       next track
-  spotlite prev       previous track";
+  spotlite prev       previous track
+  spotlite --version  print the version";
 
 fn main() -> Result<()> {
     let arg = std::env::args().nth(1);
@@ -151,6 +152,10 @@ fn main() -> Result<()> {
                     if t.explicit { " E" } else { "" }
                 );
             }
+            Ok(())
+        }
+        Some("-V" | "--version" | "version") => {
+            println!("spotlite {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("-h" | "--help" | "help") => {
