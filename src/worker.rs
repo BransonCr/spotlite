@@ -4,6 +4,7 @@ use crate::api::{Album, ApiError, Artist, Found, Page, Play, Playback, Playlist,
 use crate::radio::{Library, RadioTrack};
 use anyhow::{anyhow, Result};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, VecDeque};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -120,6 +121,10 @@ pub enum Msg {
     Sampling { genre: String, result: Result<Track, String> },
     /// A playlist was created.
     Created(Box<Playlist>),
+    /// The player state could not be read: no connection (the count of failures in a row).
+    Offline(u32),
+    /// The connection is back.
+    Online,
     /// Sent after every command.
     Done(Kind),
 }
@@ -134,44 +139,80 @@ pub enum Kind {
     Other,
 }
 
-/// Starts the API thread. Returns its command sender, a sender other threads can use to
+/// What the two API threads share: the device to play on and the user.
+#[derive(Default)]
+struct Shared {
+    device: Option<String>,
+    user: Option<User>,
+}
+
+/// The thread a command runs on. Player commands and polls have their own, so play, pause and
+/// skip never wait behind a long load (a randomize can take 40 requests).
+fn control_lane(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Init
+            | Cmd::Poll
+            | Cmd::Play(_)
+            | Cmd::PlayLiked { .. }
+            | Cmd::PlayAt(..)
+            | Cmd::Toggle
+            | Cmd::Next
+            | Cmd::Prev
+            | Cmd::Seek(_)
+            | Cmd::Volume(_)
+            | Cmd::Shuffle(_)
+            | Cmd::Repeat(_)
+            | Cmd::Queue { .. }
+            | Cmd::CheckSaved(_)
+            | Cmd::SetSaved { .. }
+            | Cmd::ToggleSaved(_)
+            | Cmd::UpNext
+            | Cmd::Resume(_)
+            | Cmd::Unsample { .. }
+    )
+}
+
+/// Starts the API threads. Returns their command sender, a sender other threads can use to
 /// post messages to the UI, and the UI's message receiver.
 pub fn spawn(api: Spotify) -> (Sender<Cmd>, Sender<Msg>, Receiver<Msg>) {
-    let (cmd_tx, cmd_rx) = channel();
+    let (cmd_tx, cmd_rx) = channel::<Cmd>();
     let (msg_tx, msg_rx) = channel();
-    let worker = Worker {
-        api,
-        tx: msg_tx.clone(),
-        device: None,
-        user: None,
-        last: None,
-        song_searches: SearchCache::default(),
-        found_searches: SearchCache::default(),
-        me_tried: None,
-        samples: Vec::new(),
-        picked: crate::store::read("picked.json").unwrap_or_default(),
-        snapshots: HashMap::new(),
-        stale: HashMap::new(),
-        partial: HashMap::new(),
-        memo: crate::genre::Memo { depths: crate::store::read("depths.json").unwrap_or_default(), ..Default::default() },
-    };
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let (control_tx, control_rx) = channel();
+    let (data_tx, data_rx) = channel();
+    for (name, rx) in [("spotlite-api", control_rx), ("spotlite-data", data_rx)] {
+        let worker = Worker::new(api.clone(), msg_tx.clone(), shared.clone());
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(move || worker.run(rx))
+            .expect("cannot start an API thread");
+    }
+    thread::Builder::new()
+        .name("spotlite-route".into())
+        .spawn(move || {
+            for cmd in cmd_rx {
+                let lane = if control_lane(&cmd) { &control_tx } else { &data_tx };
+                if lane.send(cmd).is_err() {
+                    return;
+                }
+            }
+        })
+        .expect("cannot start the API thread");
     // The saved copies stay small: the oldest go first.
     crate::store::prune("lists", 24 << 20);
     crate::store::prune("albums", 16 << 20);
     crate::store::prune("artists", 8 << 20);
-    thread::Builder::new()
-        .name("spotlite-api".into())
-        .spawn(move || worker.run(cmd_rx))
-        .expect("cannot start the API thread");
     (cmd_tx, msg_tx, msg_rx)
 }
 
 struct Worker {
     api: Spotify,
     tx: Sender<Msg>,
-    device: Option<String>,
-    user: Option<User>,
+    shared: Arc<Mutex<Shared>>,
     last: Option<Playback>,
+    /// Polls in a row that did not reach Spotify (the poll waits longer after each).
+    offline: u32,
     song_searches: SearchCache<Track>,
     found_searches: SearchCache<Found>,
     /// When /me was last asked without an answer (it is asked again at most every 10 min).
@@ -275,8 +316,63 @@ impl<T: Clone> SearchCache<T> {
 }
 
 impl Worker {
+    fn new(api: Spotify, tx: Sender<Msg>, shared: Arc<Mutex<Shared>>) -> Self {
+        Worker {
+            api,
+            tx,
+            shared,
+            last: None,
+            offline: 0,
+            song_searches: SearchCache::default(),
+            found_searches: SearchCache::default(),
+            me_tried: None,
+            samples: Vec::new(),
+            picked: crate::store::read("picked.json").unwrap_or_default(),
+            snapshots: HashMap::new(),
+            stale: HashMap::new(),
+            partial: HashMap::new(),
+            memo: crate::genre::Memo { depths: crate::store::read("depths.json").unwrap_or_default(), ..Default::default() },
+        }
+    }
+
+    fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn device(&self) -> Option<String> {
+        self.shared().device.clone()
+    }
+
+    fn user(&self) -> Option<User> {
+        self.shared().user.clone()
+    }
+
+    fn set_user(&self, user: User) {
+        self.shared().user = Some(user.clone());
+        self.send(Msg::User(user));
+    }
+
     fn run(mut self, rx: Receiver<Cmd>) {
-        for cmd in rx {
+        let mut waiting: VecDeque<Cmd> = VecDeque::new();
+        loop {
+            if waiting.is_empty() {
+                match rx.recv() {
+                    Ok(cmd) => waiting.push_back(cmd),
+                    Err(_) => return,
+                }
+            }
+            waiting.extend(rx.try_iter());
+            let Some(cmd) = waiting.pop_front() else { continue };
+            // A search typed further makes the load of the older text useless: skip it.
+            if is_search_start(&cmd) && waiting.iter().any(is_search_start) {
+                if let Cmd::Load { list, .. } = cmd {
+                    self.send(Msg::LoadFailed { list, forbidden: false });
+                }
+                if self.tx.send(Msg::Done(Kind::Other)).is_err() {
+                    return;
+                }
+                continue;
+            }
             let kind = match cmd {
                 // Init ends with the first player state, like a poll.
                 Cmd::Poll | Cmd::Init => Kind::Poll,
@@ -290,6 +386,10 @@ impl Worker {
             };
             let quiet = matches!(cmd, Cmd::CheckSaved(_) | Cmd::UpNext);
             if let Err(err) = self.handle(cmd) {
+                if kind == Kind::Poll && matches!(err.downcast_ref::<ApiError>(), Some(ApiError::Offline)) {
+                    self.offline += 1;
+                    self.send(Msg::Offline(self.offline));
+                }
                 self.report(err, list, kind, quiet);
             }
             if self.tx.send(Msg::Done(kind)).is_err() {
@@ -306,7 +406,11 @@ impl Worker {
         let api_err = err.downcast_ref::<ApiError>();
         // A check the user did not ask for (the ♥ of the playing song, what plays next) waits
         // for the limit to end without a message.
-        if quiet && matches!(api_err, Some(ApiError::RateLimited(_))) {
+        if quiet && matches!(api_err, Some(ApiError::RateLimited(_) | ApiError::Offline)) {
+            return;
+        }
+        // No network: the poll says so once and waits longer each time; no message each time.
+        if let (Some(ApiError::Offline), Kind::Poll) = (api_err, kind) {
             return;
         }
         // Spotify limits each kind of request on its own: only a limit on the player state
@@ -336,10 +440,7 @@ impl Worker {
                 // refused for hours. A profile error is reported after them.
                 let user = self.api.me_cached();
                 match &user {
-                    Ok(user) => {
-                        self.user = Some(user.clone());
-                        self.send(Msg::User(user.clone()));
-                    }
+                    Ok(user) => self.set_user(user.clone()),
                     Err(_) => self.me_tried = Some(Instant::now()),
                 }
                 self.find_device()?;
@@ -363,8 +464,8 @@ impl Worker {
             Cmd::Load { list, offset } => self.load(list, offset),
             Cmd::Play(play) => self.player(|api, dev| api.play(dev, Some(&play))),
             Cmd::PlayLiked { from } => {
-                let user = match &self.user {
-                    Some(u) => u.clone(),
+                let user = match self.user() {
+                    Some(u) => u,
                     None => self.api.me_cached()?,
                 };
                 let play = Play::Context {
@@ -744,16 +845,16 @@ impl Worker {
 
     fn poll(&mut self) -> Result<()> {
         // No user yet (/me was refused): ask again now and then, quietly.
-        if self.user.is_none() && self.me_tried.is_some_and(|at| at.elapsed() >= Duration::from_secs(600)) {
+        if self.user().is_none() && self.me_tried.is_some_and(|at| at.elapsed() >= Duration::from_secs(600)) {
             match self.api.me_cached() {
-                Ok(user) => {
-                    self.user = Some(user.clone());
-                    self.send(Msg::User(user));
-                }
+                Ok(user) => self.set_user(user),
                 Err(_) => self.me_tried = Some(Instant::now()),
             }
         }
         let pb = self.api.playback()?;
+        if std::mem::take(&mut self.offline) > 0 {
+            self.send(Msg::Online);
+        }
         self.last = pb.clone();
         self.send(Msg::Playback(pb.map(Box::new)));
         Ok(())
@@ -761,21 +862,34 @@ impl Worker {
 
     fn find_device(&mut self) -> Result<Option<String>> {
         let device = self.api.find_device()?;
-        self.device = device.as_ref().and_then(|d| d.id.clone());
+        let id = device.as_ref().and_then(|d| d.id.clone());
+        self.shared().device = id.clone();
         self.send(Msg::Device(device.map(|d| d.name)));
-        Ok(self.device.clone())
+        Ok(id)
     }
 
+    /// Our device. When Spotify does not see it, spotifyd is started (it may have been stopped
+    /// with Q, or not be running yet) and looked for again for a few seconds.
     fn require_device(&mut self) -> Result<String> {
-        if let Some(id) = &self.device {
-            return Ok(id.clone());
+        if let Some(id) = self.device() {
+            return Ok(id);
         }
-        self.find_device()?.ok_or_else(|| {
-            anyhow!(
-                "device '{}' not found; start it with `systemctl --user start spotifyd`",
-                self.api.config().device_name
-            )
-        })
+        if let Some(id) = self.find_device()? {
+            return Ok(id);
+        }
+        if !cfg!(test) && crate::start_spotifyd() {
+            self.send(Msg::Info("Starting spotifyd…".into()));
+            for _ in 0..6 {
+                thread::sleep(Duration::from_secs(1));
+                if let Some(id) = self.find_device()? {
+                    return Ok(id);
+                }
+            }
+        }
+        Err(anyhow!(
+            "Spotify does not see the device '{}'. Check spotifyd: `systemctl --user status spotifyd`",
+            self.api.config().device_name
+        ))
     }
 
     /// Runs a player command on our device. If Spotify says the device is gone
@@ -785,7 +899,7 @@ impl Worker {
         let dev = self.require_device()?;
         match f(&mut self.api, Some(&dev)) {
             Err(e) if matches!(e.downcast_ref::<ApiError>(), Some(ApiError::NoDevice)) => {
-                self.device = None;
+                self.shared().device = None;
                 let dev = self.require_device()?;
                 f(&mut self.api, Some(&dev))?;
             }
@@ -938,6 +1052,11 @@ impl Worker {
         }
         Ok(())
     }
+}
+
+/// The load of a search's first page.
+fn is_search_start(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::Load { list: List::Search(_) | List::Found { .. }, offset: 0 })
 }
 
 /// What played before a sample, to go back to.
@@ -1246,5 +1365,17 @@ mod tests {
         // A failed request is not kept.
         assert!(cache.get("err", 0, || Err(anyhow!("down"))).is_err());
         assert!(cache.pages.iter().all(|(k, _, _)| k != "err"));
+    }
+
+    #[test]
+    fn player_commands_never_wait_behind_loads() {
+        for cmd in [Cmd::Toggle, Cmd::Next, Cmd::Poll, Cmd::Volume(3), Cmd::Seek(1), Cmd::UpNext] {
+            assert!(control_lane(&cmd), "{cmd:?}");
+        }
+        for cmd in [Cmd::Load { list: List::Liked, offset: 0 }, Cmd::Randomize("x".into()), Cmd::Library, Cmd::Artist("a".into())] {
+            assert!(!control_lane(&cmd), "{cmd:?}");
+        }
+        assert!(is_search_start(&Cmd::Load { list: List::Search("a".into()), offset: 0 }));
+        assert!(!is_search_start(&Cmd::Load { list: List::Search("a".into()), offset: 10 }));
     }
 }

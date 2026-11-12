@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 const API: &str = "https://api.spotify.com/v1";
@@ -339,13 +340,16 @@ pub enum Play {
     Tracks { uris: Vec<String>, offset: usize },
 }
 
+/// A client. Clones share the connection pool, the login and the rate limits, so two threads
+/// can each have one.
+#[derive(Clone)]
 pub struct Spotify {
     agent: ureq::Agent,
     cfg: Config,
-    token: Token,
+    token: Arc<Mutex<Token>>,
     /// Requests Spotify refused with 429, by bucket, and the time (unix s) they open again.
     /// Until then spotlite does not ask: each refused request makes the wait longer.
-    limits: std::collections::HashMap<String, u64>,
+    limits: Arc<Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 /// The bucket of a request path: its ids become `*` ("/playlists/*/items").
@@ -368,8 +372,8 @@ impl Spotify {
         Ok(Spotify {
             agent,
             cfg,
-            token: Token::load()?,
-            limits: crate::store::read("limits.json").unwrap_or_default(),
+            token: Arc::new(Mutex::new(Token::load()?)),
+            limits: Arc::new(Mutex::new(crate::store::read("limits.json").unwrap_or_default())),
         })
     }
 
@@ -379,17 +383,28 @@ impl Spotify {
 
     /// False when the saved login predates a scope that spotlite now asks for.
     pub fn has_scope(&self, scope: &str) -> bool {
-        self.token
+        self.token()
             .scope
             .as_deref()
             .is_some_and(|s| s.split_whitespace().any(|x| x == scope))
     }
 
+    fn token(&self) -> MutexGuard<'_, Token> {
+        self.token.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn limits(&self) -> MutexGuard<'_, std::collections::HashMap<String, u64>> {
+        self.limits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The access token, refreshed first when it ran out (one thread refreshes; the other waits
+    /// for it).
     fn bearer(&mut self) -> Result<String> {
-        if self.token.expired() {
-            self.token = auth::refresh(&self.cfg, &self.token)?;
+        let mut token = self.token();
+        if token.expired() {
+            *token = auth::refresh(&self.cfg, &token)?;
         }
-        Ok(format!("Bearer {}", self.token.access_token))
+        Ok(format!("Bearer {}", token.access_token))
     }
 
     fn request(
@@ -401,11 +416,14 @@ impl Spotify {
     ) -> Result<Option<ureq::Response>> {
         let key = bucket(path);
         let now = unix_now();
-        if let Some(&until) = self.limits.get(&key) {
-            if until > now {
-                return Err(ApiError::RateLimited(until - now).into());
+        {
+            let mut limits = self.limits();
+            if let Some(&until) = limits.get(&key) {
+                if until > now {
+                    return Err(ApiError::RateLimited(until - now).into());
+                }
+                limits.remove(&key);
             }
-            self.limits.remove(&key);
         }
         // One more try when it can help and cannot do harm: a GET that Spotify's side failed
         // (5xx) or that did not get through, and any request refused as "login expired"
@@ -418,7 +436,7 @@ impl Spotify {
             let again = tries < 2
                 && match &result {
                     Err(ureq::Error::Status(401, _)) => {
-                        self.token.expires_at = 0;
+                        self.token().expires_at = 0;
                         true
                     }
                     Err(ureq::Error::Status(code, _)) => method == "GET" && *code >= 500,
@@ -445,8 +463,9 @@ impl Spotify {
                     let body: Value = resp.into_json().unwrap_or(Value::Null);
                     let msg = body["error"]["message"].as_str().unwrap_or("").to_owned();
                     if code == 429 {
-                        self.limits.insert(key, now + retry_after);
-                        crate::store::write("limits.json", &self.limits);
+                        let mut limits = self.limits();
+                        limits.insert(key, now + retry_after);
+                        crate::store::write("limits.json", &*limits);
                     }
                     Err(classify(code, msg, retry_after).into())
                 }

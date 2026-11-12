@@ -505,6 +505,8 @@ pub struct App {
     /// The songs after `up_next`, as Spotify listed them: a song change takes the next from
     /// here instead of asking again.
     queue: std::collections::VecDeque<Track>,
+    /// Spotify cannot be reached: the header says so, and the poll waits longer.
+    pub offline: bool,
     /// When Recently played last loaded, and the song playing then.
     recent_at: Option<(Instant, Option<String>)>,
     /// What played last (kept when playback stops), saved for the next start.
@@ -612,6 +614,7 @@ impl App {
             palette: None,
             up_next: None,
             queue: Default::default(),
+            offline: false,
             recent_at: None,
             last_playback: None,
             resume: None,
@@ -1611,6 +1614,18 @@ impl App {
             }
             Msg::Info(text) => self.info(text),
             Msg::Error(text) => self.error(text),
+            Msg::Offline(times) => {
+                if !self.offline {
+                    self.info("No connection to Spotify. spotlite keeps trying.");
+                }
+                self.offline = true;
+                let wait = [5, 10, 20, 60][(times as usize).saturating_sub(1).min(3)];
+                self.next_poll = Instant::now() + Duration::from_secs(wait);
+            }
+            Msg::Online => {
+                self.offline = false;
+                self.info("Connected to Spotify again.");
+            }
             Msg::Backoff(secs) => self.next_poll = Instant::now() + Duration::from_secs(secs.max(5)),
         }
     }

@@ -223,7 +223,17 @@ fn run_tui() -> Result<()> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        // A note for a bug report, beside the saved state (the release build stops at once).
+        let path = state::path().with_file_name("crash.log");
+        let note = format!(
+            "spotlite {} crashed at unix {}: {info}\n{}\n",
+            env!("CARGO_PKG_VERSION"),
+            api::unix_now(),
+            std::backtrace::Backtrace::force_capture()
+        );
+        let _ = std::fs::write(&path, note);
         hook(info);
+        eprintln!("A note about this crash is in {}", path.display());
     }));
     execute!(std::io::stdout(), EnableMouseCapture)?;
     // Ask the terminal which graphics protocol it speaks (kitty in ghostty); half blocks if none.
@@ -403,7 +413,8 @@ fn draw(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> Result<(
 }
 
 /// Starts the spotifyd user service if it is not running (after `Q` stopped it). Does not wait.
-fn start_spotifyd() {
+/// True when it was not running and was asked to start.
+pub fn start_spotifyd() -> bool {
     let running = std::process::Command::new("systemctl")
         .args(["--user", "--quiet", "is-active", "spotifyd"])
         .status()
@@ -413,6 +424,7 @@ fn start_spotifyd() {
             .args(["--user", "--no-block", "start", "spotifyd"])
             .status();
     }
+    !running
 }
 
 /// `Q`: stop spotifyd too, so no part of spotlite keeps running or playing.

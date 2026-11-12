@@ -1,4 +1,4 @@
-//! Cover pictures. A background thread downloads, decodes, scales and encodes each picture for
+//! Cover pictures. Background threads download, decode, scale and encode each picture for
 //! the terminal's graphics protocol (kitty in ghostty, else sixel/iTerm2, else half blocks),
 //! so the UI thread only places finished pictures.
 
@@ -7,11 +7,12 @@ use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::Resize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -23,8 +24,11 @@ const MAX_BYTES: u64 = 4 << 20;
 /// restart. Spotify cover URLs name their content, so a saved file never goes stale.
 const DISK_LIMIT: u64 = 64 << 20;
 
-/// A picture at one size in cells.
-type Key = (String, u16, u16);
+/// A picture at one size in cells: the URL's hash, columns, rows.
+type Key = (u64, u16, u16);
+
+/// Download threads: covers of a fresh list come in parallel.
+const THREADS: usize = 3;
 
 enum Slot {
     Pending,
@@ -32,57 +36,74 @@ enum Slot {
     Failed,
 }
 
+/// Pictures asked for and not started yet, newest last (the newest go first: they are the ones
+/// on screen now).
+#[derive(Default)]
+struct Queue {
+    jobs: Vec<(Key, String)>,
+    closed: bool,
+}
+
 pub struct Images {
     picker: Option<Picker>,
-    tx: Option<Sender<Key>>,
+    queue: Option<Arc<(Mutex<Queue>, Condvar)>>,
     rx: Option<Receiver<(Key, Option<Protocol>)>>,
-    cache: HashMap<Key, Slot>,
-    order: VecDeque<Key>,
+    /// Each picture, and the draw it was last used in (the least recent goes first).
+    cache: HashMap<Key, (Slot, u64)>,
+    /// The draw count: `poll` moves it on.
+    frame: u64,
     pending: usize,
+}
+
+fn hash(url: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut h);
+    h.finish()
 }
 
 impl Images {
     pub fn new(picker: Picker) -> Self {
-        let (key_tx, key_rx) = channel::<Key>();
+        let queue: Arc<(Mutex<Queue>, Condvar)> = Arc::default();
         let (img_tx, img_rx) = channel();
-        let worker_picker = picker.clone();
         let dir = dirs::cache_dir().map(|d| d.join("spotlite").join("covers"));
-        thread::Builder::new()
-            .name("spotlite-img".into())
-            .spawn(move || {
-                if let Some(dir) = &dir {
-                    crate::store::prune_dir(dir, DISK_LIMIT);
-                }
-                let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build();
-                for key in key_rx {
-                    let protocol = load(dir.as_deref(), &key.0, |url| fetch(&agent, url))
-                        .and_then(|bytes| encode(&worker_picker, &bytes, key.1, key.2));
-                    if img_tx.send((key, protocol)).is_err() {
+        if let Some(dir) = &dir {
+            let dir = dir.clone();
+            let _ = thread::Builder::new().name("spotlite-img-prune".into()).spawn(move || crate::store::prune_dir(&dir, DISK_LIMIT));
+        }
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build();
+        for n in 0..THREADS {
+            let (queue, img_tx, picker, dir, agent) = (queue.clone(), img_tx.clone(), picker.clone(), dir.clone(), agent.clone());
+            thread::Builder::new()
+                .name(format!("spotlite-img{n}"))
+                .spawn(move || loop {
+                    let job = {
+                        let (lock, wake) = &*queue;
+                        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if q.closed {
+                                return;
+                            }
+                            if let Some(job) = q.jobs.pop() {
+                                break job;
+                            }
+                            q = wake.wait(q).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let ((_, cols, rows), url) = (job.0, &job.1);
+                    let protocol = load(dir.as_deref(), url, |url| fetch(&agent, url)).and_then(|bytes| encode(&picker, &bytes, cols, rows));
+                    if img_tx.send((job.0, protocol)).is_err() {
                         return;
                     }
-                }
-            })
-            .expect("cannot start the image thread");
-        Images {
-            picker: Some(picker),
-            tx: Some(key_tx),
-            rx: Some(img_rx),
-            cache: HashMap::new(),
-            order: VecDeque::new(),
-            pending: 0,
+                })
+                .expect("cannot start an image thread");
         }
+        Images { picker: Some(picker), queue: Some(queue), rx: Some(img_rx), cache: HashMap::new(), frame: 0, pending: 0 }
     }
 
     /// No pictures at all (tests, or `SPOTLITE_NO_IMAGES=1`).
     pub fn disabled() -> Self {
-        Images {
-            picker: None,
-            tx: None,
-            rx: None,
-            cache: HashMap::new(),
-            order: VecDeque::new(),
-            pending: 0,
-        }
+        Images { picker: None, queue: None, rx: None, cache: HashMap::new(), frame: 0, pending: 0 }
     }
 
     /// Terminal cell size in pixels (width, height); used to keep covers square.
@@ -98,24 +119,30 @@ impl Images {
 
     /// The encoded picture, or None while it loads (the first call starts the load).
     pub fn get(&mut self, url: &str, cols: u16, rows: u16) -> Option<&Protocol> {
-        let tx = self.tx.as_ref()?;
-        let key = (url.to_owned(), cols, rows);
+        let queue = self.queue.as_ref()?;
+        let key = (hash(url), cols, rows);
+        let frame = self.frame;
         if !self.cache.contains_key(&key) {
-            if tx.send(key.clone()).is_err() {
-                return None;
-            }
+            let (lock, wake) = &**queue;
+            lock.lock().unwrap_or_else(|e| e.into_inner()).jobs.push((key, url.to_owned()));
+            wake.notify_one();
             self.pending += 1;
-            self.cache.insert(key.clone(), Slot::Pending);
-            self.order.push_back(key.clone());
+            self.cache.insert(key, (Slot::Pending, frame));
             self.evict();
         }
-        match self.cache.get(&key) {
-            Some(Slot::Ready(p)) => Some(p),
-            _ => None,
+        match self.cache.get_mut(&key) {
+            Some((slot, used)) => {
+                *used = frame;
+                match slot {
+                    Slot::Ready(p) => Some(p),
+                    _ => None,
+                }
+            }
+            None => None,
         }
     }
 
-    /// Takes finished pictures from the thread. Returns true if any arrived.
+    /// Takes finished pictures from the threads. Returns true if any arrived.
     pub fn poll(&mut self) -> bool {
         let Some(rx) = &self.rx else { return false };
         let mut any = false;
@@ -123,22 +150,62 @@ impl Images {
             self.pending = self.pending.saturating_sub(1);
             any = true;
             // It may have been evicted while loading; then it is not wanted any more.
-            if let Some(slot) = self.cache.get_mut(&key) {
+            if let Some((slot, _)) = self.cache.get_mut(&key) {
                 *slot = protocol.map_or(Slot::Failed, Slot::Ready);
             }
         }
         any
     }
 
+    /// Starts a draw: pictures still waiting that the last draw did not use (a list scrolled
+    /// past them) are not loaded.
+    pub fn begin_frame(&mut self) {
+        if let Some(queue) = &self.queue {
+            let frame = self.frame;
+            let cache = &mut self.cache;
+            let mut dropped = 0;
+            let mut q = queue.0.lock().unwrap_or_else(|e| e.into_inner());
+            q.jobs.retain(|(key, _)| {
+                let wanted = cache.get(key).is_some_and(|(_, used)| *used >= frame);
+                if !wanted {
+                    cache.remove(key);
+                    dropped += 1;
+                }
+                wanted
+            });
+            self.pending = self.pending.saturating_sub(dropped);
+        }
+        self.frame += 1;
+    }
+
     pub fn busy(&self) -> bool {
         self.pending > 0
     }
 
+    /// Removes the pictures used least recently, down to `CACHE`.
     fn evict(&mut self) {
-        while self.order.len() > CACHE {
-            if let Some(old) = self.order.pop_front() {
-                self.cache.remove(&old);
-            }
+        let over = self.cache.len().saturating_sub(CACHE);
+        if over == 0 {
+            return;
+        }
+        let mut uses: Vec<(u64, Key)> = self
+            .cache
+            .iter()
+            .filter(|(_, (slot, _))| !matches!(slot, Slot::Pending))
+            .map(|(k, (_, used))| (*used, *k))
+            .collect();
+        uses.sort_unstable();
+        for (_, key) in uses.into_iter().take(over + CACHE / 10) {
+            self.cache.remove(&key);
+        }
+    }
+}
+
+impl Drop for Images {
+    fn drop(&mut self) {
+        if let Some(queue) = &self.queue {
+            queue.0.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+            queue.1.notify_all();
         }
     }
 }

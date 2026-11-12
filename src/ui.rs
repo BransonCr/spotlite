@@ -119,6 +119,7 @@ fn draw_cover(f: &mut Frame, images: &mut Images, list: &[ImageRef], area: Rect)
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits = Hits::default();
+    app.images.begin_frame();
     let t = theme::c();
     let full = f.area().inner(Margin::new(1, 0));
     app.screen_w = f.area().width;
@@ -1630,6 +1631,7 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         .and_then(|pb| pb.device.as_ref())
         .is_some_and(|d| d.is_active);
     let (dot, label) = match app.device.as_deref() {
+        _ if app.offline => (theme::c().red, "offline".to_owned()),
         Some(name) => (if active { theme::c().green } else { theme::c().muted }, name.to_owned()),
         None if app.device_checked => (theme::c().red, "no device".into()),
         None => (theme::c().faint, "connecting".into()),
