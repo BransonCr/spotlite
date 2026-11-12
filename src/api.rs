@@ -681,9 +681,13 @@ impl Spotify {
         self.page(&format!("/albums/{album_id}/tracks"), offset, Some)
     }
 
-    /// Adds tracks to the end of a playlist (needs playlist-modify-*).
-    pub fn add_to_playlist(&mut self, playlist_id: &str, uris: &[String]) -> Result<()> {
-        self.send("POST", &format!("/playlists/{playlist_id}/items"), &[], Some(json!({ "uris": uris })))
+    /// Adds tracks to a playlist, at the end or at `position` (needs playlist-modify-*).
+    pub fn add_to_playlist(&mut self, playlist_id: &str, uris: &[String], position: Option<usize>) -> Result<()> {
+        let mut body = json!({ "uris": uris });
+        if let Some(p) = position {
+            body["position"] = json!(p);
+        }
+        self.send("POST", &format!("/playlists/{playlist_id}/items"), &[], Some(body))
     }
 
     /// Removes every occurrence of the tracks from a playlist (needs playlist-modify-*).

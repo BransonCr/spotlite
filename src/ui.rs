@@ -118,8 +118,12 @@ fn draw_cover(f: &mut Frame, images: &mut Images, list: &[ImageRef], area: Rect)
     );
 }
 
+/// The player shows the time left (set from `App::remaining` at each draw).
+static REMAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits = Hits::default();
+    REMAINING.store(app.remaining, std::sync::atomic::Ordering::Relaxed);
     app.images.begin_frame();
     let t = theme::c();
     let full = f.area().inner(Margin::new(1, 0));
@@ -1490,12 +1494,36 @@ fn peak_at(peaks: &viz::Peaks, pos: f32) -> f32 {
     viz_at(&viz::Frame { levels: peaks.level }, pos)
 }
 
-fn count_label<T>(l: &Listing<T>) -> String {
-    match (l.loading, l.total) {
-        (true, _) => " loading… ".into(),
+fn count_label<T: crate::app::Viewable>(l: &Listing<T>, filtering: bool) -> String {
+    let mut out = match (l.loading, l.total) {
+        (true, _) => " loading… ".to_owned(),
         (false, Some(t)) if l.items.len() < t => format!(" {} of {t} ", l.items.len()),
         (false, Some(t)) => format!(" {t} "),
         (false, None) => String::new(),
+    };
+    if let Some((by, rev)) = l.sort {
+        out = format!(" {} {}{out}", by.name(), if rev { "▼" } else { "▲" });
+    }
+    if let Some(f) = &l.filter {
+        let caret = if filtering { "▏" } else { "" };
+        out = format!(" / {f}{caret}  {} match{} ·{out}", l.len(), if l.len() == 1 { "" } else { "es" });
+    }
+    out
+}
+
+/// A song or playlist name with the part the filter matched underlined.
+fn with_match(name: String, query: Option<&str>, style: Style) -> Vec<Span<'static>> {
+    let word = query.and_then(|q| q.split_whitespace().next()).map(str::to_lowercase).filter(|w| !w.is_empty());
+    let lower = name.to_lowercase();
+    // Only where lower case keeps the byte places (most names): else no underline.
+    let at = word.as_deref().and_then(|w| lower.find(w).map(|i| (i, i + w.len()))).filter(|_| lower.len() == name.len());
+    match at {
+        Some((i, j)) if name.is_char_boundary(i) && name.is_char_boundary(j) => vec![
+            Span::styled(name[..i].to_owned(), style),
+            Span::styled(name[i..j].to_owned(), style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD)),
+            Span::styled(name[j..].to_owned(), style),
+        ],
+        _ => vec![Span::styled(name, style)],
     }
 }
 
@@ -1818,15 +1846,18 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::raw(" "));
     }
     let title = Line::from(spans);
-    let empty = if app.searched.is_empty() {
-        "Search Spotify\n/ to type · Enter to search · t for songs, artists, albums or playlists"
+    let empty = if app.searched.is_empty() && !app.search_history.is_empty() {
+        let recent: Vec<String> = app.search_history.iter().take(3).map(|q| format!("“{q}”")).collect();
+        format!("Search Spotify\n/ to type · ↑ in the box for earlier searches: {}", recent.join(", "))
+    } else if app.searched.is_empty() {
+        "Search Spotify\n/ to type · Enter to search · t for songs, artists, albums or playlists".to_owned()
     } else {
-        "No results.\nTry other words, or t for another kind"
+        "No results.\nTry other words, or t for another kind".to_owned()
     };
     if app.search_kind == SearchKind::Songs {
-        draw_tracks(f, app, list, title, empty);
+        draw_tracks(f, app, list, title, &empty);
     } else {
-        draw_found(f, app, list, title, empty);
+        draw_found(f, app, list, title, &empty);
     }
 }
 
@@ -1838,17 +1869,23 @@ fn draw_found(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &str
     let l = &mut app.found;
     let block = panel()
         .title(title)
-        .title(Line::from(Span::styled(count_label(l), theme::faint())).right_aligned());
+        .title(Line::from(Span::styled(count_label(l, app.filtering), theme::faint())).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
     if l.items.is_empty() {
         draw_centered(f, inner, if l.loading { "Loading…" } else { empty });
         return;
     }
+    if l.len() == 0 {
+        draw_centered(f, inner, "Nothing matches the filter.\nesc clears it");
+        return;
+    }
     let widths = [Constraint::Length(thumb), Constraint::Fill(1), Constraint::Length(12)];
     let cols = column_widths(inner.width, &widths);
-    let win = window(&mut l.state, l.items.len(), inner.height, PLAYLIST_ROW, 0);
-    let rows = l.items[win.clone()].iter().map(|item| {
+    let len = l.len();
+    let win = window(&mut l.state, len, inner.height, PLAYLIST_ROW, 0);
+    let rows = l.rows().skip(win.start).take(win.len()).map(|(_, item)| item).collect::<Vec<_>>();
+    let rows = rows.into_iter().map(|item| {
         let (sub, right, uri) = match item {
             Found::Artist(a) => ("Artist  ·  ⏎ opens the page, with radios".to_owned(), String::new(), format!("spotify:artist:{}", a.id)),
             Found::Album(a) => {
@@ -1890,12 +1927,13 @@ fn draw_found(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &str
     });
     let marker = Span::styled(theme::marker(), theme::accent());
     let table = Table::new(rows, widths).highlight_symbol(Text::from(vec![Line::from(marker.clone()), Line::from(marker)]));
-    let len = l.items.len();
-    draw_table(f, table, inner, area, &mut l.state, len, PLAYLIST_ROW, 0, Some(win.start));
+    let len = l.len();
+    app.hits.scrollbar = draw_table(f, table, inner, area, &mut l.state, len, PLAYLIST_ROW, 0, Some(win.start));
     let offset = l.state.offset();
     let visible = (inner.height / PLAYLIST_ROW) as usize;
     let images = &mut app.images;
-    for (n, item) in app.found.items.iter().skip(offset).take(visible).enumerate() {
+    let shown: Vec<usize> = app.found.rows().skip(offset).take(visible).map(|(i, _)| i).collect();
+    for (n, item) in shown.into_iter().map(|i| &app.found.items[i]).enumerate() {
         let rect = Rect::new(inner.x + 1, inner.y + n as u16 * PLAYLIST_ROW, thumb, PLAYLIST_ROW);
         if rect.right() <= inner.right() && rect.bottom() <= inner.bottom() {
             draw_cover(f, images, item.images(), rect);
@@ -1924,6 +1962,9 @@ fn track_columns(width: u16) -> (bool, bool) {
 
 fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &str) {
     let playing = app.playing_uri().map(str::to_owned);
+    let filtering = app.filtering;
+    let marks = std::mem::take(&mut app.marks);
+    let hover = app.hover;
     let is_on = app.playback.as_ref().is_some_and(|pb| pb.is_playing);
     let mark = theme::playing_mark(is_on, anim(250));
     let empty_set = std::collections::HashSet::new();
@@ -1945,12 +1986,17 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
     };
     let block = panel()
         .title(title)
-        .title(Line::from(Span::styled(count_label(listing), theme::faint())).right_aligned());
+        .title(Line::from(Span::styled(count_label(listing, filtering), theme::faint())).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if listing.items.is_empty() {
         let msg = if listing.loading { "Loading…" } else { empty };
+        draw_centered(f, inner, msg);
+        return;
+    }
+    if listing.len() == 0 {
+        let msg = if listing.loading { "Loading…" } else { "No song matches the filter.\nesc clears it" };
         draw_centered(f, inner, msg);
         return;
     }
@@ -1974,10 +2020,14 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
     head.push(Cell::from(Line::from("Time").right_aligned()));
 
     let cols = column_widths(inner.width, &widths);
-    let win = window(&mut listing.state, listing.items.len(), inner.height, 1, 2);
-    let rows = listing.items.iter().enumerate().skip(win.start).take(win.len()).map(|(i, t): (usize, &Track)| {
+    let len = listing.len();
+    let win = window(&mut listing.state, len, inner.height, 1, 2);
+    let query = listing.filter.as_ref().map(|f| f.to_string());
+    let rows = listing.rows().skip(win.start).take(win.len()).map(|(i, t): (usize, &Track)| {
         let is_playing = playing.as_deref() == Some(t.uri.as_str());
-        let num = if is_playing {
+        let num = if marks.contains(&t.uri) {
+            Span::styled("◆", theme::accent().add_modifier(Modifier::BOLD))
+        } else if is_playing {
             Span::styled(mark.to_string(), theme::accent())
         } else {
             Span::styled((i + 1).to_string(), theme::faint())
@@ -1987,14 +2037,15 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
             Cell::from(""),
             Cell::from({
                 let name = fit(&t.name, cols[2]);
+                let width = name.width();
                 let style = if is_playing { theme::accent() } else { theme::text() };
-                if theme::c().leaders && cols[2] > name.width() + 3 {
+                let mut spans = with_match(name, query.as_deref(), style);
+                if theme::c().leaders && cols[2] > width + 3 {
                     // A printed track list: dots lead from the title toward the next column.
-                    let dots = ".".repeat(cols[2] - name.width() - 2);
-                    Line::from(vec![Span::styled(name, style), Span::styled(format!(" {dots}"), Style::new().fg(theme::dim()))])
-                } else {
-                    Line::from(Span::styled(name, style))
+                    let dots = ".".repeat(cols[2] - width - 2);
+                    spans.push(Span::styled(format!(" {dots}"), Style::new().fg(theme::dim())));
                 }
+                Line::from(spans)
             }),
         ];
         if show_artist {
@@ -2014,20 +2065,39 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
     let table = Table::new(rows, widths)
         .header(Row::new(head).style(theme::faint()).bottom_margin(1))
         .highlight_symbol(Text::from(Span::styled(theme::marker(), theme::accent())));
-    let len = listing.items.len();
-    draw_table(f, table, inner, area, &mut listing.state, len, 1, 2, Some(win.start));
+    let len = listing.len();
+    let bar = draw_table(f, table, inner, area, &mut listing.state, len, 1, 2, Some(win.start));
     let offset = listing.state.offset();
     let rows_area = Rect { y: inner.y + 2, height: inner.height.saturating_sub(2), ..inner };
 
     // Thumbnails over the empty second column of each visible row.
     let x = inner.x + 1 + cols[0] as u16 + 2;
-    for (n, t) in listing.items.iter().skip(offset).take(rows_area.height as usize).enumerate() {
+    // The row under the pointer: its text a little brighter.
+    if let Some(h) = hover.filter(|h| *h >= offset && Some(*h) != listing.state.selected()) {
+        let y = rows_area.y + (h - offset) as u16;
+        if y < rows_area.bottom() {
+            let t = theme::c();
+            let buf = f.buffer_mut();
+            for x in rows_area.left()..rows_area.right() {
+                let cell = &mut buf[(x, y)];
+                if cell.fg == t.text || cell.fg == t.muted {
+                    cell.set_fg(t.bright);
+                } else if cell.fg == t.faint {
+                    cell.set_fg(t.muted);
+                }
+            }
+        }
+    }
+    let shown: Vec<&Track> = listing.rows().skip(offset).take(rows_area.height as usize).map(|(_, t)| t).collect();
+    for (n, t) in shown.into_iter().enumerate() {
         let rect = Rect::new(x, rows_area.y + n as u16, thumb, 1);
         if rect.right() <= inner.right() {
             draw_cover(f, &mut app.images, t.images(), rect);
         }
     }
-    draw_position(f, area, listing.selected(), listing.items.len());
+    draw_position(f, area, listing.selected(), listing.len());
+    app.marks = marks;
+    app.hits.scrollbar = bar;
     app.hits.list = rows_area;
     app.hits.row_height = 1;
     app.hits.list_offset = offset;
@@ -2076,11 +2146,11 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     let images = &mut app.images;
     let (entries, state, label, loading): (Vec<Entry>, &mut TableState, String, bool) = if foldered {
         let l = &mut app.rows;
-        let label = if app.playlists.loading { " loading… ".into() } else { format!(" {} ", l.items.len()) };
-        let entries = l
-            .items
+        let label = if app.playlists.loading { " loading… ".into() } else { count_label(l, app.filtering) };
+        let idx: Vec<usize> = l.rows().map(|(i, _)| i).collect();
+        let entries = idx
             .iter()
-            .map(|r| match r {
+            .map(|&i| match &l.items[i] {
                 PlRow::Folder { name, count, .. } => Entry::Folder { name, count: *count },
                 PlRow::Playlist(p) => Entry::Playlist(p),
             })
@@ -2088,8 +2158,9 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
         (entries, &mut l.state, label, app.playlists.loading)
     } else {
         let l = &mut app.playlists;
-        let label = count_label(l);
-        (l.items.iter().map(Entry::Playlist).collect(), &mut l.state, label, l.loading)
+        let label = count_label(l, app.filtering);
+        let idx: Vec<usize> = l.rows().map(|(i, _)| i).collect();
+        (idx.iter().map(|&i| Entry::Playlist(&l.items[i])).collect(), &mut l.state, label, l.loading)
     };
     let block = panel()
         .title(title)
@@ -2097,7 +2168,13 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     if entries.is_empty() {
-        draw_centered(f, inner, if loading { "Loading…" } else { "No playlists.\nR reloads the list" });
+        let filtered = if foldered { app.rows.filter.is_some() } else { app.playlists.filter.is_some() };
+        let msg = match (loading, filtered) {
+            (true, _) => "Loading…",
+            (false, true) => "No playlist matches the filter.\nesc clears it",
+            (false, false) => "No playlists.\nR reloads the list",
+        };
+        draw_centered(f, inner, msg);
         return;
     }
 
@@ -2133,7 +2210,7 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     let marker = Span::styled(theme::marker(), theme::accent());
     let table = Table::new(rows, widths).highlight_symbol(Text::from(vec![Line::from(marker.clone()), Line::from(marker)]));
     let len = entries.len();
-    draw_table(f, table, inner, area, state, len, PLAYLIST_ROW, 0, Some(win.start));
+    let bar = draw_table(f, table, inner, area, state, len, PLAYLIST_ROW, 0, Some(win.start));
     let offset = state.offset();
 
     // Covers (or folder marks) go over the empty first column of each visible row.
@@ -2150,6 +2227,7 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.list = inner;
     app.hits.row_height = PLAYLIST_ROW;
     app.hits.list_offset = offset;
+    app.hits.scrollbar = bar;
 }
 
 /// The rows of a list that fit in `height` (after `header` rows), from the list's scroll: it
@@ -2182,7 +2260,7 @@ fn draw_table(
     row_height: u16,
     header_rows: u16,
     start: Option<usize>,
-) {
+) -> Rect {
     let t = theme::c();
     let row_style = match t.select {
         theme::Select::Bar => Style::new().bg(t.selected).add_modifier(Modifier::BOLD),
@@ -2224,7 +2302,12 @@ fn draw_table(
     }
 
     let visible = (inner.height.saturating_sub(header_rows) / row_height.max(1)) as usize;
-    if len > visible {
+    let track = outer.inner(Margin::new(0, 1));
+    let track = Rect { x: track.right().saturating_sub(1), width: 1, ..track };
+    if len <= visible {
+        return Rect::default();
+    }
+    {
         let mut sb = ScrollbarState::new(len.saturating_sub(visible)).position(state.offset());
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -2238,6 +2321,7 @@ fn draw_table(
             &mut sb,
         );
     }
+    track
 }
 
 /// Animation frame: `period_ms` per step, from a clock that starts with the program.
@@ -2391,6 +2475,7 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     // Line 3: progress bar.
     let (line, bar) = progress_line(app.progress_ms(), track.duration_ms, pb.is_playing, l3.width);
     app.hits.progress = Rect { x: l3.x + bar.0, width: bar.1, ..l3 };
+    app.hits.time = Rect { x: l3.x + bar.0 + bar.1, width: l3.width.saturating_sub(bar.0 + bar.1), ..l3 };
     f.render_widget(line, l3);
 }
 
@@ -2543,6 +2628,7 @@ fn draw_transport(f: &mut Frame, app: &mut App, line: Rect) {
     let bar_area = Rect { x: line.x + 11, width: line.width.saturating_sub(13 + vol_w + modes_w), ..line };
     let (bar, at) = progress_line(app.progress_ms(), track.duration_ms, pb.is_playing, bar_area.width);
     app.hits.progress = Rect { x: bar_area.x + at.0, width: at.1, ..bar_area };
+    app.hits.time = Rect { x: bar_area.x + at.0 + at.1, width: bar_area.width.saturating_sub(at.0 + at.1), ..bar_area };
     f.render_widget(bar, bar_area);
     if let (Some(volume), true) = (app.volume(), vol_w > 0) {
         let (vline, vbar) = volume_line(volume, app.muted(), vol_w - 7, false);
@@ -2603,6 +2689,7 @@ fn draw_player_compact(f: &mut Frame, app: &mut App, inner: Rect) {
     let bar_area = Rect { x: l2.x + 10, width: l2.width.saturating_sub(10 + vol_w), ..l2 };
     let (line, bar) = progress_line(app.progress_ms(), track.duration_ms, pb.is_playing, bar_area.width);
     app.hits.progress = Rect { x: bar_area.x + bar.0, width: bar.1, ..bar_area };
+    app.hits.time = Rect { x: bar_area.x + bar.0 + bar.1, width: bar_area.width.saturating_sub(bar.0 + bar.1), ..bar_area };
     f.render_widget(line, bar_area);
     if let (Some(volume), true) = (app.volume(), vol_w > 0) {
         let (line, vbar) = volume_line(volume, app.muted(), vol_w - 7, false);
@@ -2616,7 +2703,12 @@ fn draw_player_compact(f: &mut Frame, app: &mut App, inner: Rect) {
 /// Also returns where the bar is: (offset from the left, width).
 pub fn progress_line(progress: u64, duration: u64, playing: bool, width: u16) -> (Line<'static>, (u16, u16)) {
     let left = format!("{} ", format_ms(progress));
-    let right = format!(" {}", format_ms(duration));
+    // A click on the time shows the time left instead (and back).
+    let right = if REMAINING.load(std::sync::atomic::Ordering::Relaxed) {
+        format!(" -{}", format_ms(duration.saturating_sub(progress)))
+    } else {
+        format!(" {}", format_ms(duration))
+    };
     let bar = (width as usize).saturating_sub(left.width() + right.width());
     let ratio = if duration > 0 { (progress as f64 / duration as f64).clamp(0.0, 1.0) } else { 0.0 };
     let filled = (ratio * bar as f64).round() as usize;
@@ -2703,7 +2795,19 @@ pub fn volume_line(volume: u8, muted: bool, bar: u16, with_label: bool) -> (Line
 fn hints(app: &App) -> Vec<(String, &'static str)> {
     let fixed = |list: &[(&str, &'static str)]| list.iter().map(|(k, w)| ((*k).to_owned(), *w)).collect();
     if app.typing {
-        return fixed(&[("⏎", "search"), ("esc", "done"), ("← →", "move"), ("^⌫", "word"), ("^u", "clear")]);
+        return fixed(&[("⏎", "search"), ("esc", "done"), ("↑", "earlier"), ("← →", "move"), ("^⌫", "word"), ("^u", "clear")]);
+    }
+    if app.filtering {
+        return fixed(&[("type", "filter"), ("⏎", "keep it"), ("esc", "clear it"), ("^⌫", "word")]);
+    }
+    if !app.marks.is_empty() {
+        let k = &app.keys;
+        let mut out = vec![(format!("{} marked", app.marks.len()), "·")];
+        for (act, word) in [(Act::Queue, "queue"), (Act::AddToPlaylist, "add to…"), (Act::Like, "like"), (Act::Remove, "remove"), (Act::MarkAll, "all / none")] {
+            out.push((k.show(act), word));
+        }
+        out.push(("esc".into(), "clear"));
+        return out;
     }
     if app.undo.is_some() {
         return fixed(&[("↑↓", "move"), ("⏎", "go there"), ("click", "go there"), ("esc", "close")]);

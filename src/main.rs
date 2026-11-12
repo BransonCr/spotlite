@@ -314,6 +314,7 @@ fn run_tui() -> Result<()> {
     let mut save_at = std::time::Instant::now();
     let result = (|| -> Result<()> {
         let mut last_draw = std::time::Instant::now();
+        let mut shown_title = String::new();
         // Something on screen changed by input (or it is the first frame): draw.
         let mut input = true;
         // The program that started spotlite (the terminal, or a shell in it). If it goes away
@@ -353,6 +354,12 @@ fn run_tui() -> Result<()> {
             if dirty {
                 draw(&mut terminal, &mut app)?;
                 last_draw = std::time::Instant::now();
+                // The window title follows the song (task bars and window lists show it).
+                let title = app.window_title();
+                if title != shown_title {
+                    let _ = execute!(std::io::stdout(), ratatui::crossterm::terminal::SetTitle(&title));
+                    shown_title = title;
+                }
             }
             // Sleep until the next frame is due (1 s idle, faster while music or the visualizer
             // moves). While a request or a picture is open, wake often so its result shows at

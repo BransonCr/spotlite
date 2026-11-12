@@ -35,6 +35,12 @@ pub struct State {
     /// Songs, albums and playlists pinned in the sidebar's Library, newest first.
     #[serde(default)]
     pub pins: Vec<crate::sidebar::Pin>,
+    /// Earlier searches, newest first.
+    #[serde(default)]
+    pub searches: Vec<String>,
+    /// Playlists songs were added to, most recent first (by id).
+    #[serde(default)]
+    pub recent_playlists: Vec<String>,
 }
 
 /// The sidebar: open or shut, and which view it shows.

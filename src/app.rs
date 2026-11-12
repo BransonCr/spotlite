@@ -67,7 +67,110 @@ impl Tab {
     }
 }
 
-/// A paged list with its own selection and scroll position.
+/// How a list can be sorted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortBy {
+    Title,
+    Artist,
+    Album,
+    Time,
+}
+
+impl SortBy {
+    pub fn name(self) -> &'static str {
+        match self {
+            SortBy::Title => "title",
+            SortBy::Artist => "artist",
+            SortBy::Album => "album",
+            SortBy::Time => "time",
+        }
+    }
+}
+
+/// What a row offers to the filter and the sort.
+pub trait Viewable {
+    /// The text the filter looks in (lower case).
+    fn haystack(&self) -> String;
+    /// The sort key for `by`; None when the row cannot be sorted that way.
+    fn sort_key(&self, _by: SortBy) -> Option<String> {
+        None
+    }
+    fn sort_ms(&self) -> u64 {
+        0
+    }
+}
+
+impl Viewable for Track {
+    fn haystack(&self) -> String {
+        format!("{}\n{}\n{}", self.name, self.artist_names(), self.album_name()).to_lowercase()
+    }
+    fn sort_key(&self, by: SortBy) -> Option<String> {
+        Some(match by {
+            SortBy::Title => self.name.to_lowercase(),
+            SortBy::Artist => self.artist_names().to_lowercase(),
+            SortBy::Album => self.album_name().to_lowercase(),
+            SortBy::Time => String::new(),
+        })
+    }
+    fn sort_ms(&self) -> u64 {
+        self.duration_ms
+    }
+}
+
+impl Viewable for Playlist {
+    fn haystack(&self) -> String {
+        format!("{}\n{}", self.name, self.owner_name()).to_lowercase()
+    }
+    fn sort_key(&self, by: SortBy) -> Option<String> {
+        match by {
+            SortBy::Title => Some(self.name.to_lowercase()),
+            SortBy::Artist => Some(self.owner_name().to_lowercase()),
+            _ => None,
+        }
+    }
+    fn sort_ms(&self) -> u64 {
+        self.track_count().unwrap_or(0) as u64
+    }
+}
+
+impl Viewable for Row {
+    fn haystack(&self) -> String {
+        match self {
+            Row::Folder { name, .. } => name.to_lowercase(),
+            Row::Playlist(p) => p.haystack(),
+        }
+    }
+    fn sort_key(&self, by: SortBy) -> Option<String> {
+        match self {
+            // Folders stay before playlists whatever the sort.
+            Row::Folder { name, .. } => Some(format!("\0{}", name.to_lowercase())),
+            Row::Playlist(p) => p.sort_key(by),
+        }
+    }
+}
+
+impl Viewable for Found {
+    fn haystack(&self) -> String {
+        self.name().to_lowercase()
+    }
+    fn sort_key(&self, by: SortBy) -> Option<String> {
+        (by == SortBy::Title).then(|| self.name().to_lowercase())
+    }
+}
+
+impl Viewable for ArtistRow {
+    fn haystack(&self) -> String {
+        String::new()
+    }
+}
+
+/// True when every word of `query` is in `haystack`.
+pub fn matches(haystack: &str, query: &str) -> bool {
+    query.split_whitespace().all(|w| haystack.contains(&w.to_lowercase()))
+}
+
+/// A paged list with its own selection and scroll position, and an optional filter and sort
+/// over what is loaded. The selection and the scroll count the rows shown.
 pub struct Listing<T> {
     pub items: Vec<T>,
     /// Entries fetched so far, null ones included (the offset of the next page).
@@ -76,6 +179,11 @@ pub struct Listing<T> {
     pub total: Option<usize>,
     pub loading: bool,
     pub state: TableState,
+    /// The rows shown, as indexes into `items`, when a filter or a sort is on.
+    shown: Option<Vec<usize>>,
+    /// The filter typed (Ctrl+F), and the sort (`,`): field and reversed.
+    pub filter: Option<Input>,
+    pub sort: Option<(SortBy, bool)>,
 }
 
 impl<T> Default for Listing<T> {
@@ -86,39 +194,81 @@ impl<T> Default for Listing<T> {
             total: None,
             loading: false,
             state: TableState::default(),
+            shown: None,
+            filter: None,
+            sort: None,
         }
     }
 }
 
-impl<T> Listing<T> {
+impl<T: Viewable> Listing<T> {
     pub fn selected(&self) -> usize {
         self.state.selected().unwrap_or(0)
     }
 
+    /// Rows shown (all of them, or what the filter keeps).
+    pub fn len(&self) -> usize {
+        self.shown.as_ref().map_or(self.items.len(), Vec::len)
+    }
+
+    /// The index into `items` of shown row `pos`.
+    pub fn index(&self, pos: usize) -> Option<usize> {
+        match &self.shown {
+            Some(s) => s.get(pos).copied(),
+            None => (pos < self.items.len()).then_some(pos),
+        }
+    }
+
+    /// The shown row of `items[i]`, if it is shown.
+    pub fn pos_of(&self, i: usize) -> Option<usize> {
+        match &self.shown {
+            Some(s) => s.iter().position(|&j| j == i),
+            None => (i < self.items.len()).then_some(i),
+        }
+    }
+
+    /// The rows shown, in order: (index into `items`, row).
+    pub fn rows(&self) -> impl Iterator<Item = (usize, &T)> + '_ {
+        let n = self.len();
+        (0..n).filter_map(move |pos| self.index(pos).map(|i| (i, &self.items[i])))
+    }
+
+    /// True when a filter or a sort changes what shows.
+    pub fn reshaped(&self) -> bool {
+        self.shown.is_some()
+    }
+
     pub fn current(&self) -> Option<&T> {
-        self.items.get(self.selected())
+        self.items.get(self.index(self.selected())?)
     }
 
     fn has_more(&self) -> bool {
         self.total.is_none_or(|t| self.fetched < t)
     }
 
-    /// Offset of the next page to fetch, if one is needed now.
+    /// Offset of the next page to fetch, if one is needed now. With a filter or a sort on, the
+    /// whole list loads (the rows it needs can be anywhere).
     fn wants_page(&self) -> Option<usize> {
-        let near_end = self.items.len().saturating_sub(self.selected()) <= PREFETCH;
-        (!self.loading && self.has_more() && (self.items.is_empty() || near_end)).then_some(self.fetched)
+        let near_end = self.len().saturating_sub(self.selected()) <= PREFETCH;
+        (!self.loading && self.has_more() && (self.items.is_empty() || near_end || self.reshaped())).then_some(self.fetched)
+    }
+
+    /// The next page when the whole list is wanted now (`c` looks for the playing song).
+    fn more_for(&self, wanted: bool) -> Option<usize> {
+        (wanted && !self.loading && self.has_more()).then_some(self.fetched)
     }
 
     fn move_by(&mut self, delta: isize) {
-        if self.items.is_empty() {
+        if self.len() == 0 {
             return;
         }
-        let max = self.items.len() as isize - 1;
+        let max = self.len() as isize - 1;
         let next = (self.selected() as isize).saturating_add(delta).clamp(0, max);
         self.state.select(Some(next as usize));
     }
 
     fn apply(&mut self, offset: usize, page: ApiPage<T>) {
+        let keep = self.index(self.selected());
         if offset == 0 {
             self.items.clear();
             self.fetched = 0;
@@ -132,25 +282,141 @@ impl<T> Listing<T> {
             self.total = Some(if page.raw == 0 { self.fetched } else { page.total });
         }
         self.loading = false;
-        if self.state.selected().is_none() || self.selected() >= self.items.len() {
-            self.state.select((!self.items.is_empty()).then_some(0));
-        }
+        self.reshape(if offset == 0 { None } else { keep });
     }
 
     fn reset(&mut self) {
+        let (filter, sort) = (self.filter.take(), self.sort);
         *self = Listing::default();
+        // A reload keeps the filter and the sort.
+        self.filter = filter;
+        self.sort = sort;
     }
 
     /// The whole list at once (from a saved copy): nothing more to load.
     fn fill(&mut self, items: Vec<T>) {
-        let sel = self.state.selected();
+        let keep = self.state.selected();
         self.fetched = items.len();
         self.total = Some(items.len());
         self.items = items;
         self.loading = false;
-        let len = self.items.len();
-        self.state.select((len > 0).then(|| sel.unwrap_or(0).min(len - 1)));
+        self.shown = None;
+        self.state.select(keep);
+        self.reshape(None);
     }
+
+    /// The items changed (added, removed): the filter and the sort apply again, and the
+    /// selection stays on the same row where it can.
+    pub fn changed(&mut self) {
+        let keep = self.index(self.selected());
+        self.reshape(keep);
+    }
+
+    /// Works out the rows shown from the filter and the sort. The selection goes to `keep`
+    /// (an index into `items`) if it shows, else it stays in range.
+    pub(crate) fn reshape(&mut self, keep: Option<usize>) {
+        let pos = self.state.selected();
+        let query = self.filter.as_ref().map(|f| f.trim().to_lowercase()).unwrap_or_default();
+        self.shown = if query.is_empty() && self.sort.is_none() {
+            None
+        } else {
+            let mut shown: Vec<usize> =
+                (0..self.items.len()).filter(|&i| query.is_empty() || matches(&self.items[i].haystack(), &query)).collect();
+            if let Some((by, rev)) = self.sort {
+                let items = &self.items;
+                match by {
+                    SortBy::Time => shown.sort_by_key(|&i| items[i].sort_ms()),
+                    _ => shown.sort_by_cached_key(|&i| items[i].sort_key(by).unwrap_or_default()),
+                }
+                if rev {
+                    shown.reverse();
+                }
+            }
+            Some(shown)
+        };
+        let len = self.len();
+        let sel = keep.and_then(|i| self.pos_of(i)).or(pos).map(|p| p.min(len.saturating_sub(1)));
+        self.state.select(if len == 0 { None } else { Some(sel.unwrap_or(0)) });
+        if self.state.offset() >= len {
+            *self.state.offset_mut() = 0;
+        }
+    }
+
+    /// Sets the filter text (None: no filter). While typing, the first match is selected; when
+    /// the filter goes, the selection stays on its song.
+    pub fn set_filter(&mut self, filter: Option<Input>) {
+        let keep = if filter.is_none() { self.index(self.selected()) } else { None };
+        self.filter = filter;
+        if keep.is_none() {
+            *self.state.offset_mut() = 0;
+            self.state.select(Some(0));
+        }
+        self.reshape(keep);
+    }
+
+    /// The next sort: title, artist, album, time (longest last), then the list's own order.
+    /// Rows that cannot sort a way skip it.
+    pub fn next_sort(&mut self) {
+        let order = [SortBy::Title, SortBy::Artist, SortBy::Album, SortBy::Time];
+        let start = match self.sort {
+            None => 0,
+            Some((by, _)) => order.iter().position(|b| *b == by).map_or(order.len(), |p| p + 1),
+        };
+        let can = |by: SortBy| by == SortBy::Time || self.items.first().is_none_or(|t| t.sort_key(by).is_some());
+        self.sort = order[start.min(order.len())..].iter().copied().find(|b| can(*b)).map(|b| (b, false));
+        let keep = self.index(self.selected());
+        self.reshape(keep);
+    }
+
+    /// Turns the sort round (or the list's own order, when there is no sort).
+    pub fn reverse_sort(&mut self) {
+        self.sort = Some(match self.sort {
+            Some((by, rev)) => (by, !rev),
+            None => (SortBy::Time, false),
+        });
+        let keep = self.index(self.selected());
+        self.reshape(keep);
+    }
+}
+
+/// A list whose filter and sort the keys change, whatever its rows are.
+pub trait Shape {
+    fn filter(&self) -> Option<&Input>;
+    fn set_filter(&mut self, filter: Option<Input>);
+    fn next_sort(&mut self);
+    fn reverse_sort(&mut self);
+    fn sort(&self) -> Option<(SortBy, bool)>;
+}
+
+impl<T: Viewable> Shape for Listing<T> {
+    fn filter(&self) -> Option<&Input> {
+        self.filter.as_ref()
+    }
+    fn set_filter(&mut self, filter: Option<Input>) {
+        Listing::set_filter(self, filter);
+    }
+    fn next_sort(&mut self) {
+        Listing::next_sort(self);
+    }
+    fn reverse_sort(&mut self) {
+        Listing::reverse_sort(self);
+    }
+    fn sort(&self) -> Option<(SortBy, bool)> {
+        self.sort
+    }
+}
+
+/// A change that `u` undoes.
+#[derive(Debug, Clone)]
+pub enum Change {
+    /// Songs removed from a playlist, with the place each had.
+    Removed { playlist_id: String, playlist: String, songs: Vec<(String, usize)> },
+    /// Songs added to the end of a playlist.
+    Added { playlist_id: String, playlist: String, uris: Vec<String> },
+    /// Songs liked (true) or unliked.
+    Liked { uris: Vec<String>, saved: bool },
+    /// A pin taken off the sidebar, and its place.
+    Unpinned(Box<Pin>, usize),
 }
 
 /// A row of the Playlists tab when the account has folders.
@@ -243,6 +509,8 @@ pub enum Action {
     Theme(String),
     /// A sidebar effect (the effect menu, `V`).
     SideFx(SideFx),
+    /// A Spotify Connect device to play on (the device menu).
+    Device { id: String, name: String },
 }
 
 /// A pop-up list of actions: for a track (`.` or right-click), or the radio filters (`F`).
@@ -338,8 +606,11 @@ pub struct Hits {
     pub shuffle: Rect,
     pub repeat: Rect,
     pub like: Rect,
-    /// The bar part of the progress line.
+    /// The scrollbar of the list shown (empty when the list fits).
+    pub scrollbar: Rect,
+    /// The bar part of the progress line, and the time after it.
     pub progress: Rect,
+    pub time: Rect,
     /// The bar part of the volume slider.
     pub volume: Rect,
     /// Now playing: artist name and album (title, cover) open their pages.
@@ -375,6 +646,8 @@ pub struct TabsList {
 enum Drag {
     Progress,
     Volume,
+    /// The list's scrollbar.
+    Scroll,
 }
 
 /// 0.0 at the left edge of `r`, 1.0 at the right edge.
@@ -514,6 +787,27 @@ pub struct App {
     queue: std::collections::VecDeque<Track>,
     /// Spotify cannot be reached: the header says so, and the poll waits longer.
     pub offline: bool,
+    /// The playlists shown came from the saved copy: the first page is asked for again.
+    playlists_stale: bool,
+    /// Typing into the filter of the list shown (Ctrl+F).
+    pub filtering: bool,
+    /// Songs marked in the list shown (by URI): actions then apply to all of them.
+    pub marks: std::collections::HashSet<String>,
+    /// Changes that `u` can undo, newest last.
+    changes: Vec<Change>,
+    /// Playlists songs were added to, most recent first (by id): the picker lists them first.
+    pub recent_playlists: Vec<String>,
+    /// Earlier searches, newest first, and the one the search box shows (↑ ↓).
+    pub search_history: Vec<String>,
+    history_at: Option<usize>,
+    /// A song to select once its list has loaded (`c` opened the list it plays from).
+    pending_jump: Option<String>,
+    /// Playlists opened before, with their scroll, selection, filter and sort.
+    open_cache: Vec<OpenPlaylist>,
+    /// The list row under the mouse pointer (it gets a faint highlight).
+    pub hover: Option<usize>,
+    /// The player shows the time left instead of the time played (a click on it).
+    pub remaining: bool,
     /// When Recently played last loaded, and the song playing then.
     recent_at: Option<(Instant, Option<String>)>,
     /// What played last (kept when playback stops), saved for the next start.
@@ -625,6 +919,17 @@ impl App {
             up_next: None,
             queue: Default::default(),
             offline: false,
+            playlists_stale: false,
+            filtering: false,
+            marks: Default::default(),
+            changes: Vec::new(),
+            recent_playlists: Vec::new(),
+            search_history: Vec::new(),
+            history_at: None,
+            pending_jump: None,
+            open_cache: Vec::new(),
+            hover: None,
+            remaining: false,
             recent_at: None,
             last_playback: None,
             resume: None,
@@ -1215,6 +1520,7 @@ impl App {
     }
 
     fn load_more(&mut self) {
+        let jumping = self.pending_jump.is_some();
         let request = match self.view() {
             View::Search if self.searched.is_empty() => None,
             View::Search => match self.search_kind.api() {
@@ -1229,11 +1535,12 @@ impl App {
                 (!l.loading && l.total.is_none_or(|t| l.fetched < t)).then_some((List::Playlists, l.fetched))
             }
             View::Playlists => self.playlists.wants_page().map(|o| (List::Playlists, o)),
-            View::Liked => self.liked.wants_page().map(|o| (List::Liked, o)),
+            View::Liked => self.liked.wants_page().or_else(|| self.liked.more_for(jumping)).map(|o| (List::Liked, o)),
             View::Recent => self.recent.wants_page().map(|o| (List::Recent, o)),
             View::Playlist => self.open.as_ref().and_then(|o| {
                 o.tracks
                     .wants_page()
+                    .or_else(|| o.tracks.more_for(jumping))
                     .map(|off| (List::Playlist(o.playlist.id.clone()), off))
             }),
             View::Album => match self.page() {
@@ -1248,6 +1555,14 @@ impl App {
             let wanted = self.picker.is_some() || (self.sidebar.open && self.sidebar.view == SideView::Library);
             (wanted && !l.loading && l.total.is_none_or(|t| l.fetched < t))
                 .then_some((List::Playlists, l.fetched))
+        });
+        // Playlists shown from the saved copy: the first page once more (the worker answers
+        // from its copy when it is recent, so this costs a request only when it is old).
+        let request = request.or_else(|| {
+            (self.playlists_stale && !self.playlists.loading).then(|| {
+                self.playlists_stale = false;
+                (List::Playlists, 0)
+            })
         });
         // A list Spotify limited loads again when the limit ends.
         let now = Instant::now();
@@ -1527,16 +1842,17 @@ impl App {
                 }
                 self.library = Some(library);
             }
-            Msg::Removed { playlist_id, uri } => {
+            Msg::Removed { playlist_id, uris, text } => {
+                self.info(format!("{text} · {} undo", self.keys.show(Act::Undo)));
                 if let Some(o) = self.open.as_mut().filter(|o| o.playlist.id == playlist_id) {
                     let before = o.tracks.items.len();
-                    o.tracks.items.retain(|t| t.uri != uri);
+                    o.tracks.items.retain(|t| !uris.contains(&t.uri));
                     let removed = before - o.tracks.items.len();
                     o.tracks.total = o.tracks.total.map(|t| t.saturating_sub(removed));
-                    let len = o.tracks.items.len();
-                    let sel = o.tracks.selected().min(len.saturating_sub(1));
-                    o.tracks.state.select((len > 0).then_some(sel));
+                    o.tracks.fetched = o.tracks.fetched.saturating_sub(removed);
+                    o.tracks.changed();
                 }
+                self.open_cache.retain(|o| o.playlist.id != playlist_id);
             }
             Msg::UpNext(next) => {
                 self.queue = next.into();
@@ -1552,7 +1868,10 @@ impl App {
                 self.playlists.total = self.playlists.total.map(|t| t + 1);
                 self.rebuild_rows();
             }
-            Msg::Added { playlist_id } => {
+            Msg::Devices(list) => self.open_devices(list),
+            Msg::Added { playlist_id, text } => {
+                self.info(format!("{text} · {} undo", self.keys.show(Act::Undo)));
+                self.open_cache.retain(|o| o.playlist.id != playlist_id);
                 // Reload an open copy of that playlist so the new song shows.
                 if let Some(o) = self.open.as_mut().filter(|o| o.playlist.id == playlist_id) {
                     o.tracks.reset();
@@ -1567,6 +1886,7 @@ impl App {
                 if let Some(listing) = self.listing_for(&list) {
                     listing.apply(offset, page);
                 }
+                self.finish_jump();
             }
             Msg::Playlists { offset, page } => {
                 self.playlists.apply(offset, page);
@@ -1611,12 +1931,11 @@ impl App {
                 if saved {
                     // The song goes to the top of Liked Songs (no new load).
                     if let Some(t) = self.find_track(&uri).filter(|_| !self.liked.items.iter().any(|t| t.uri == uri)) {
+                        let keep = self.liked.index(self.liked.selected()).map(|i| i + 1);
                         self.liked.items.insert(0, t);
                         self.liked.fetched += 1;
                         self.liked.total = self.liked.total.map(|n| n + 1);
-                        if let Some(sel) = self.liked.state.selected().filter(|_| self.view() == View::Liked) {
-                            self.liked.state.select(Some(sel + 1));
-                        }
+                        self.liked.reshape(keep);
                     }
                     if let Some(lib) = self.library.as_mut() {
                         if !lib.liked_order.contains(&uri) {
@@ -1628,9 +1947,8 @@ impl App {
                     self.liked.items.retain(|t| t.uri != uri);
                     if self.liked.items.len() < before {
                         self.liked.total = self.liked.total.map(|t| t.saturating_sub(1));
-                        let len = self.liked.items.len();
-                        let sel = self.liked.selected().min(len.saturating_sub(1));
-                        self.liked.state.select((len > 0).then_some(sel));
+                        self.liked.fetched = self.liked.fetched.saturating_sub(1);
+                        self.liked.changed();
                     }
                 }
             }
@@ -1684,6 +2002,9 @@ impl App {
     /// Shows a tab without a back step.
     fn show(&mut self, loc: Loc) {
         self.typing = false;
+        self.filtering = false;
+        self.marks.clear();
+        self.hover = None;
         match loc {
             Loc::Base(t) => {
                 self.tab = t;
@@ -1750,6 +2071,8 @@ impl App {
             side_fx: self.side_fx,
             sidebar: Some(crate::state::SavedSidebar { open: self.sidebar.open, view: self.sidebar.view }),
             pins: self.pins.clone(),
+            searches: self.search_history.clone(),
+            recent_playlists: self.recent_playlists.clone(),
             // The live state (a shuffle just pressed counts), else the last one seen.
             playback: self.snapshot().or_else(|| self.last_playback.clone()),
         }
@@ -1776,6 +2099,23 @@ impl App {
             self.sidebar.view = sb.view;
         }
         self.pins = state.pins;
+        self.search_history = state.searches;
+        self.recent_playlists = state.recent_playlists;
+        // Your playlists from the saved copy, so the tab and the sidebar show them at once; the
+        // first page loads again soon (tick), so a change shows too.
+        let mut offset = 0;
+        while let Some(page) = crate::store::read::<ApiPage<Playlist>>(&format!("{}-{offset}.json", crate::worker::kept::PLAYLISTS)) {
+            let raw = page.raw;
+            self.playlists.apply(offset, page);
+            offset += raw;
+            if raw == 0 || self.playlists.total.is_some_and(|t| offset >= t) {
+                break;
+            }
+        }
+        if offset > 0 {
+            self.playlists_stale = true;
+            self.rebuild_rows();
+        }
         // Liked Songs from the saved copy: the tab shows at once, with no request.
         if let Some(songs) = crate::store::read::<Vec<Track>>("liked.json").filter(|s| !s.is_empty()) {
             self.liked.fill(songs);
@@ -1905,7 +2245,16 @@ impl App {
     /// Back one step: close an open playlist or folder, else go to the tab you were on before.
     /// Pages stay open.
     fn back(&mut self) {
-        if self.active.is_none() && (self.open.take().is_some() || self.close_folder()) {
+        // Esc first clears what the list shows on top: the marks, then the filter.
+        if !self.marks.is_empty() {
+            self.marks.clear();
+            return;
+        }
+        if let Some(shape) = self.shape_mut().filter(|s| s.filter().is_some()) {
+            shape.set_filter(None);
+            return;
+        }
+        if self.active.is_none() && (self.close_playlist() || self.close_folder()) {
             return;
         }
         let open: std::collections::HashSet<String> = self.pages.iter().map(Page::key).collect();
@@ -2200,6 +2549,12 @@ impl App {
             });
             return;
         }
+        if let Action::Device { id, name } = action {
+            self.menu = None;
+            self.send(Cmd::Transfer { id, name });
+            self.poll_soon();
+            return;
+        }
         if let Action::Filter(item) = action {
             // Filters stay open: change, see the list update, change again.
             if item == FilterItem::Discover {
@@ -2239,7 +2594,7 @@ impl App {
             Action::AddToPlaylist => self.open_picker(track),
             Action::RemoveFromPlaylist => self.ask_remove(track),
             Action::Like => self.toggle_like(Some(track)),
-            Action::Filter(_) | Action::Theme(_) | Action::SideFx(_) => {}
+            Action::Filter(_) | Action::Theme(_) | Action::SideFx(_) | Action::Device { .. } => {}
         }
     }
 
@@ -2463,12 +2818,16 @@ impl App {
     /// Playlists the user may add to, narrowed by the picker's text.
     pub fn picker_choices(&self) -> Vec<&Playlist> {
         let q = self.picker.as_ref().map(|p| p.query.to_lowercase()).unwrap_or_default();
-        self.playlists
+        let mut list: Vec<&Playlist> = self
+            .playlists
             .items
             .iter()
             .filter(|p| self.owns(p))
             .filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q))
-            .collect()
+            .collect();
+        // The playlists you added to last come first.
+        list.sort_by_key(|p| self.recent_playlists.iter().position(|id| *id == p.id).unwrap_or(usize::MAX));
+        list
     }
 
     fn pick_playlist(&mut self) {
@@ -2476,12 +2835,7 @@ impl App {
         let Some(pl) = self.picker_choices().get(picker.cursor).map(|p| (*p).clone()) else { return };
         let track = picker.track.clone();
         self.picker = None;
-        self.send(Cmd::AddToPlaylist {
-            playlist_id: pl.id,
-            playlist: pl.name,
-            uris: vec![track.uri],
-            what: track.name,
-        });
+        self.add_to(pl, track);
     }
 
     fn ask_remove(&mut self, track: Track) {
@@ -2493,19 +2847,79 @@ impl App {
             self.info("Open one of your playlists to remove songs from it.");
             return;
         };
-        self.confirm = Some(Confirm {
-            text: format!("Remove “{}” from {}?", track.name, pl.name),
-            cmd: Cmd::RemoveFromPlaylist { playlist_id: pl.id, playlist: pl.name, uri: track.uri, what: track.name },
-        });
+        let songs = self.chosen(track);
+        let o = self.open.as_ref();
+        let places: Vec<(String, usize)> = songs
+            .iter()
+            .filter_map(|t| o.and_then(|o| o.tracks.items.iter().position(|x| x.uri == t.uri)).map(|i| (t.uri.clone(), i)))
+            .collect();
+        let what = describe(&songs);
+        let uris: Vec<String> = songs.iter().map(|t| t.uri.clone()).collect();
+        self.send(Cmd::RemoveFromPlaylist { playlist_id: pl.id.clone(), playlist: pl.name.clone(), uris, what });
+        self.marks.clear();
+        self.changes.push(Change::Removed { playlist_id: pl.id, playlist: pl.name, songs: places });
     }
 
     /// Moves the cursor to the playing track, if the current list has it.
+    /// `c`: selects the playing song. When this list does not have it, the list it plays from
+    /// opens (its playlist, album, Liked Songs or artist), and the song is selected there.
     fn jump_to_playing(&mut self) {
-        let Some(uri) = self.playing_uri().map(str::to_owned) else { return };
-        let found = self.tracks().and_then(|l| l.items.iter().position(|t| t.uri == uri));
-        match found {
-            Some(i) => self.select(i),
-            None => self.info("The playing song is not in this list."),
+        let Some(uri) = self.playing_uri().map(str::to_owned) else {
+            self.info("Nothing plays.");
+            return;
+        };
+        if let Some(pos) = self.tracks().and_then(|l| l.items.iter().position(|t| t.uri == uri).and_then(|i| l.pos_of(i))) {
+            self.select(pos);
+            return;
+        }
+        let pb = self.playback.as_ref();
+        let context = pb.and_then(|p| p.context.as_ref()).map(|c| c.uri.clone());
+        let track = pb.and_then(|p| p.item.clone());
+        let shuffled = self.shuffled.as_ref().map(|(c, _)| c.clone());
+        let context = context.or(shuffled);
+        self.pending_jump = Some(uri);
+        match context.as_deref() {
+            Some(c) if c.starts_with("spotify:playlist:") => {
+                let name = self.context_name().unwrap_or_default();
+                match self.playlists.items.iter().find(|p| p.uri == c).cloned() {
+                    Some(pl) => {
+                        self.go(Loc::Base(Tab::Playlists));
+                        self.open_playlist(pl);
+                    }
+                    None => {
+                        self.pending_jump = None;
+                        self.info(format!("It plays from {name}, which is not in your playlists."));
+                        return;
+                    }
+                }
+            }
+            Some(c) if c.ends_with(":collection") => self.go(Loc::Base(Tab::Liked)),
+            Some(c) if c.starts_with("spotify:artist:") => {
+                let id = c.trim_start_matches("spotify:artist:").to_owned();
+                let name = track.as_ref().and_then(|t| t.artists.first()).map(|a| a.name.clone()).unwrap_or_default();
+                self.open_artist(id, name);
+            }
+            _ => match track.and_then(|t| t.album.filter(|a| a.id.is_some())) {
+                Some(album) => self.open_album(album),
+                None => {
+                    self.pending_jump = None;
+                    self.info("The playing song is not in this list.");
+                    return;
+                }
+            },
+        }
+        self.finish_jump();
+    }
+
+    /// Selects the song `c` asked for, once the list that has it shows it.
+    fn finish_jump(&mut self) {
+        let Some(uri) = self.pending_jump.clone() else { return };
+        let Some(l) = self.tracks() else { return };
+        if let Some(pos) = l.items.iter().position(|t| t.uri == uri).and_then(|i| l.pos_of(i)) {
+            self.pending_jump = None;
+            self.select(pos);
+        } else if !l.has_more() && !l.loading && !l.items.is_empty() {
+            self.pending_jump = None;
         }
     }
 
@@ -2540,8 +2954,13 @@ impl App {
 
     /// The palette's entries for its query (what the palette lists).
     pub fn palette_entries(&self) -> Vec<crate::palette::Entry> {
-        let q = self.palette.as_ref().map(|p| p.query.clone()).unwrap_or_default();
-        crate::palette::filter(crate::palette::entries(self), &q)
+        let q = self.palette.as_ref().map(|p| p.query.to_string()).unwrap_or_default();
+        let mut all = crate::palette::entries(self);
+        // Typed text also finds playlists, earlier searches, themes and genres, after the actions.
+        if q.trim().chars().count() >= 2 {
+            all.extend(crate::palette::places(self));
+        }
+        crate::palette::filter(all, &q)
     }
 
     fn move_palette(&mut self, delta: isize) {
@@ -2562,6 +2981,15 @@ impl App {
 
     fn play_selected(&mut self) {
         match self.view() {
+            View::Album | View::Liked | View::Playlist if self.tracks().is_some_and(|l| l.reshaped()) => {
+                // Filtered or sorted: the songs play as they show.
+                let Some(l) = self.tracks() else { return };
+                let (uris, offset) = shown_play(l);
+                if !uris.is_empty() {
+                    self.send(Cmd::Play(Play::Tracks { uris, offset }));
+                    self.poll_soon();
+                }
+            }
             View::Album => {
                 let Some(Page::Album(a)) = self.page() else { return };
                 let Some(t) = a.tracks.current() else { return };
@@ -2571,27 +2999,24 @@ impl App {
             }
             View::Recent => {
                 // The same song can be in the list twice; play the list as it is.
-                let uris: Vec<String> = self.recent.items.iter().map(|t| t.uri.clone()).collect();
+                let (uris, offset) = shown_play(&self.recent);
                 if !uris.is_empty() {
-                    let offset = self.recent.selected();
                     self.send(Cmd::Play(Play::Tracks { uris, offset }));
                     self.poll_soon();
                 }
             }
             View::Random => {
                 let Some(Page::Random(r)) = self.page() else { return };
-                let uris: Vec<String> = r.tracks.items.iter().map(|t| t.uri.clone()).collect();
+                let (uris, offset) = shown_play(&r.tracks);
                 if !uris.is_empty() {
-                    let offset = r.tracks.selected();
                     self.send(Cmd::Play(Play::Tracks { uris, offset }));
                     self.poll_soon();
                 }
             }
             View::Radio => {
                 let Some(Page::Radio(r)) = self.page() else { return };
-                let uris: Vec<String> = r.tracks.items.iter().map(|t| t.uri.clone()).collect();
+                let (uris, offset) = shown_play(&r.tracks);
                 if !uris.is_empty() {
-                    let offset = r.tracks.selected();
                     self.send(Cmd::Play(Play::Tracks { uris, offset }));
                     self.poll_soon();
                 }
@@ -2619,9 +3044,8 @@ impl App {
             }
             View::Search if self.search_kind != SearchKind::Songs => self.open_found(),
             View::Search => {
-                let uris: Vec<String> = self.search.items.iter().map(|t| t.uri.clone()).collect();
+                let (uris, offset) = shown_play(&self.search);
                 if !uris.is_empty() {
-                    let offset = self.search.selected();
                     self.send(Cmd::Play(Play::Tracks { uris, offset }));
                     self.poll_soon();
                 }
@@ -2651,11 +3075,8 @@ impl App {
                     return;
                 }
                 let Some(pl) = self.current_playlist() else { return };
-                if self.owns(&pl) {
-                    self.open = Some(OpenPlaylist {
-                        playlist: pl,
-                        tracks: Listing::default(),
-                    });
+                if self.owns(&pl) || crate::client::AVAILABLE {
+                    self.open_playlist(pl);
                 } else {
                     self.play_playlist(pl);
                 }
@@ -2688,13 +3109,15 @@ impl App {
     }
 
     fn queue_selected(&mut self) {
-        if let Some(t) = self.tracks().and_then(|l| l.current()) {
-            let cmd = Cmd::Queue {
-                uri: t.uri.clone(),
-                name: t.name.clone(),
-            };
-            self.send(cmd);
+        let Some(t) = self.tracks().and_then(|l| l.current()).cloned() else { return };
+        let songs = self.chosen(t);
+        for t in &songs {
+            self.send(Cmd::Queue { uri: t.uri.clone(), name: t.name.clone() });
         }
+        if songs.len() > 1 {
+            self.info(format!("Adding {} songs to the queue", songs.len()));
+        }
+        self.marks.clear();
     }
 
     /// Whether a song is in Liked Songs, if spotlite knows.
@@ -2715,6 +3138,17 @@ impl App {
             self.info("Select a song first.");
             return;
         };
+        if self.marks.len() > 1 || (self.marks.len() == 1 && !self.marks.contains(&track.uri)) {
+            // Marked songs: like them all, or unlike them all when all are liked.
+            let songs = self.chosen(track);
+            let saved = !songs.iter().all(|t| self.is_liked(&t.uri) == Some(true));
+            let uris: Vec<String> = songs.iter().map(|t| t.uri.clone()).collect();
+            self.changes.push(Change::Liked { uris: uris.clone(), saved });
+            self.send(Cmd::SetSavedMany { uris, saved });
+            self.marks.clear();
+            return;
+        }
+        self.changes.push(Change::Liked { uris: vec![track.uri.clone()], saved: self.is_liked(&track.uri) != Some(true) });
         match &self.saved {
             Some((u, saved)) if *u == track.uri => {
                 // The playing song: the heart changes at once (Spotify confirms after).
@@ -2955,7 +3389,7 @@ impl App {
             // Your own playlist opens in the Playlists tab, like there; so does any other when
             // the client protocol can list its songs.
             Found::Playlist(p) if self.owns(&p) || crate::client::AVAILABLE => {
-                self.open = Some(OpenPlaylist { playlist: p, tracks: Listing::default() });
+                self.open_playlist(p);
                 self.switch_tab(Tab::Playlists);
             }
             Found::Playlist(p) => {
@@ -2987,6 +3421,11 @@ impl App {
     }
 
     fn run_search(&mut self, q: String) {
+        // Typing makes searches for every few letters: only one a pause or Enter kept goes in.
+        self.search_history.retain(|h| *h != q && !q.starts_with(h.as_str()));
+        self.search_history.insert(0, q.clone());
+        self.search_history.truncate(30);
+        self.history_at = None;
         self.searched = q;
         self.search.reset();
         self.found.reset();
@@ -3065,10 +3504,10 @@ impl App {
             return a.rows.items.len();
         }
         match self.view() {
-            View::Playlists if self.foldered() => self.rows.items.len(),
-            View::Playlists => self.playlists.items.len(),
-            View::Search if self.search_kind != SearchKind::Songs => self.found.items.len(),
-            _ => self.tracks().map_or(0, |l| l.items.len()),
+            View::Playlists if self.foldered() => self.rows.len(),
+            View::Playlists => self.playlists.len(),
+            View::Search if self.search_kind != SearchKind::Songs => self.found.len(),
+            _ => self.tracks().map_or(0, |l| l.len()),
         }
     }
 
@@ -3230,6 +3669,7 @@ impl App {
                 Some(Drag::Progress) => {
                     self.seek_preview = self.seek_to_fraction(fraction(self.hits.progress, m.column));
                 }
+                Some(Drag::Scroll) => self.scroll_to(m.row),
                 None => {}
             },
             MouseEventKind::Up(MouseButton::Left) => {
@@ -3254,6 +3694,10 @@ impl App {
     }
 
     fn on_click(&mut self, pos: Position) {
+        if self.hits.time.contains(pos) {
+            self.remaining = !self.remaining;
+            return;
+        }
         let h = &self.hits;
         if let Some(&(_, kind)) = h.search_kinds.iter().find(|(r, _)| r.contains(pos)) {
             self.set_search_kind(kind);
@@ -3295,6 +3739,9 @@ impl App {
         } else if h.progress.contains(pos) {
             self.drag = Some(Drag::Progress);
             self.seek_preview = self.seek_to_fraction(fraction(h.progress, pos.x));
+        } else if h.scrollbar.contains(pos) {
+            self.drag = Some(Drag::Scroll);
+            self.scroll_to(pos.y);
         } else if let Some(i) = self.row_at(pos) {
             self.typing = false;
             let double = self
@@ -3415,13 +3862,33 @@ impl App {
         if !self.typing && self.side_key(key) {
             return;
         }
+        if self.filtering {
+            self.filter_key(key);
+            return;
+        }
         if self.typing {
             match key.code {
                 KeyCode::Esc => {
                     self.typing = false;
                     self.search_due = None;
                 }
-                KeyCode::Down => self.typing = false,
+                // ↑ ↓ go through earlier searches; ↓ past the newest leaves the box.
+                KeyCode::Up if !self.search_history.is_empty() => {
+                    let next = self.history_at.map_or(0, |i| (i + 1).min(self.search_history.len() - 1));
+                    self.history_at = Some(next);
+                    self.query.set(self.search_history[next].clone());
+                    self.search_due = Some(Instant::now() + SEARCH_DELAY);
+                }
+                KeyCode::Down if self.history_at.is_some_and(|i| i > 0) => {
+                    let next = self.history_at.unwrap_or(1) - 1;
+                    self.history_at = Some(next);
+                    self.query.set(self.search_history[next].clone());
+                    self.search_due = Some(Instant::now() + SEARCH_DELAY);
+                }
+                KeyCode::Down => {
+                    self.typing = false;
+                    self.history_at = None;
+                }
                 KeyCode::Enter => self.submit_search(),
                 _ => {
                     if self.query.edit(&key) == Edit::Changed {
@@ -3604,15 +4071,38 @@ impl App {
             Act::Sidebar => self.toggle_sidebar(),
             Act::SidePlaying => self.show_side(SideView::Playing),
             Act::SideLibrary => self.show_side(SideView::Library),
-            Act::Filter | Act::Sort | Act::Mark | Act::MarkAll | Act::Undo | Act::AddAgain | Act::Devices => {}
+            Act::Filter => self.start_filter(),
+            Act::Sort => self.sort_list(false),
+            Act::SortReverse => self.sort_list(true),
+            Act::Mark => self.mark(),
+            Act::MarkAll => self.mark_all(),
+            Act::Undo => self.undo_change(),
+            Act::AddAgain => self.add_again(),
+            Act::Devices => self.send(Cmd::Devices),
         }
     }
 
     /// Runs a palette entry.
     pub fn run_entry(&mut self, run: crate::palette::Run) {
+        use crate::palette::Run;
         match run {
-            crate::palette::Run::Act(act) => self.run(act),
-            crate::palette::Run::Go(loc) => self.go(loc),
+            Run::Act(act) => self.run(act),
+            Run::Go(loc) => self.go(loc),
+            Run::Playlist(pl) => {
+                self.go(Loc::Base(Tab::Playlists));
+                if self.owns(&pl) || crate::client::AVAILABLE {
+                    self.open_playlist(pl);
+                } else {
+                    self.play_playlist(pl);
+                }
+            }
+            Run::Theme(name) => self.try_theme(&name, true),
+            Run::Genre(genre) => self.randomize(genre),
+            Run::Search(q) => {
+                self.switch_tab(Tab::Search);
+                self.query.set(q.clone());
+                self.run_search(q);
+            }
         }
     }
 }
@@ -3630,6 +4120,15 @@ impl App {
     /// The pointer moved (no button). True if the screen changes: the list opens, closes, or
     /// another row is under the pointer.
     pub fn on_hover(&mut self, pos: Position) -> bool {
+        // The list row under the pointer (only when no pop-up covers the list).
+        let popup = self.menu.is_some() || self.picker.is_some() || self.palette.is_some() || self.genre_picker.is_some() || self.help;
+        let row = if popup { None } else { self.row_at(pos) };
+        let row_changed = row != self.hover;
+        self.hover = row;
+        row_changed | self.hover_tabs(pos)
+    }
+
+    fn hover_tabs(&mut self, pos: Position) -> bool {
         let over_chip = self.hits.tabs_more.contains(pos);
         let over_list = self.hits.tabs_list.contains(pos);
         let row = self.hits.tabs_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i);
@@ -3910,8 +4409,8 @@ impl App {
     /// list its songs to spotlite).
     fn open_playlist_uri(&mut self, uri: &str, name: &str) {
         match self.playlists.items.iter().find(|p| p.uri == uri).cloned() {
-            Some(pl) if self.owns(&pl) => {
-                self.open = Some(OpenPlaylist { playlist: pl, tracks: Listing::default() });
+            Some(pl) if self.owns(&pl) || crate::client::AVAILABLE => {
+                self.open_playlist(pl);
                 self.switch_tab(Tab::Playlists);
             }
             _ => {
@@ -3968,7 +4467,8 @@ impl App {
     fn unpin(&mut self, i: usize) {
         if i < self.pins.len() {
             let pin = self.pins.remove(i);
-            self.info(format!("Unpinned {}", pin.name()));
+            self.info(format!("Unpinned {} · {} undo", pin.name(), self.keys.show(Act::Undo)));
+            self.changes.push(Change::Unpinned(Box::new(pin.clone()), i));
             if self.sidebar.view == SideView::Library {
                 self.fix_side_cursor();
             }
@@ -4014,6 +4514,282 @@ impl App {
 pub(crate) fn test_app() -> (App, std::sync::mpsc::Receiver<Cmd>) {
     let (tx, rx) = std::sync::mpsc::channel();
     (App::new(tx, true, Images::disabled()), rx)
+}
+
+/// The rows of a song list as shown, to play: their URIs and the selected one's place. A list
+/// longer than one play request takes starts at the selected song.
+fn shown_play(l: &Listing<Track>) -> (Vec<String>, usize) {
+    const MAX: usize = 500;
+    let uris: Vec<String> = l.rows().map(|(_, t)| t.uri.clone()).collect();
+    let sel = l.selected().min(uris.len().saturating_sub(1));
+    if uris.len() <= MAX {
+        (uris, sel)
+    } else {
+        (uris.into_iter().skip(sel).take(MAX).collect(), 0)
+    }
+}
+
+/// "“Teardrop”", or "3 songs".
+fn describe(songs: &[Track]) -> String {
+    match songs {
+        [one] => format!("“{}”", one.name),
+        many => format!("{} songs", many.len()),
+    }
+}
+
+/// Lists, marks and changes: the filter (Ctrl+F), the sort (`,`), marks (`w`), undo (`u`).
+impl App {
+    /// The scrollbar is dragged to row `y`: the selection goes to that part of the list.
+    fn scroll_to(&mut self, y: u16) {
+        let bar = self.hits.scrollbar;
+        let len = self.list_len();
+        if bar.height == 0 || len == 0 {
+            return;
+        }
+        let f = (y.saturating_sub(bar.y) as f32 / (bar.height.max(2) - 1) as f32).clamp(0.0, 1.0);
+        self.select(((len - 1) as f32 * f).round() as usize);
+    }
+
+    /// The terminal window's title: the song and its artist while one plays.
+    pub fn window_title(&self) -> String {
+        match self.playback.as_ref().filter(|p| p.is_playing).and_then(|p| p.item.as_ref()) {
+            Some(t) => format!("{} — {} · spotlite", t.name, t.artist_names()),
+            None => "spotlite".to_owned(),
+        }
+    }
+
+    /// The list shown, for its filter and sort.
+    pub fn shape_mut(&mut self) -> Option<&mut dyn Shape> {
+        match self.view() {
+            View::Artist => None,
+            View::Playlists if self.foldered() => Some(&mut self.rows),
+            View::Playlists => Some(&mut self.playlists),
+            View::Search if self.search_kind != SearchKind::Songs => Some(&mut self.found),
+            _ => self.tracks_mut().map(|l| l as &mut dyn Shape),
+        }
+    }
+
+    /// Opens a playlist in the Playlists tab. One opened before in this run comes back as you
+    /// left it (its songs, place, filter and sort).
+    fn open_playlist(&mut self, pl: Playlist) {
+        if self.open.as_ref().is_some_and(|o| o.playlist.id == pl.id) {
+            return;
+        }
+        self.close_playlist();
+        let open = match self.open_cache.iter().position(|o| o.playlist.id == pl.id) {
+            Some(i) => self.open_cache.remove(i),
+            None => OpenPlaylist { playlist: pl, tracks: Listing::default() },
+        };
+        self.open = Some(open);
+        self.marks.clear();
+        self.filtering = false;
+    }
+
+    /// Closes the open playlist and keeps it for a later visit. True if one was open.
+    fn close_playlist(&mut self) -> bool {
+        let Some(open) = self.open.take() else { return false };
+        // A list still loading starts again next time.
+        if !open.tracks.loading {
+            self.open_cache.retain(|o| o.playlist.id != open.playlist.id);
+            self.open_cache.insert(0, open);
+            self.open_cache.truncate(8);
+        }
+        self.marks.clear();
+        self.filtering = false;
+        true
+    }
+
+    /// The songs an action is for: the marked ones (in list order) if there are any, else
+    /// `track`.
+    fn chosen(&self, track: Track) -> Vec<Track> {
+        if self.marks.is_empty() {
+            return vec![track];
+        }
+        let marked: Vec<Track> = self
+            .tracks()
+            .map(|l| l.items.iter().filter(|t| self.marks.contains(&t.uri)).cloned().collect())
+            .unwrap_or_default();
+        if marked.is_empty() { vec![track] } else { marked }
+    }
+
+    /// Adds the chosen songs to a playlist, and keeps it as the last one used.
+    fn add_to(&mut self, pl: Playlist, track: Track) {
+        let songs = self.chosen(track);
+        let uris: Vec<String> = songs.iter().map(|t| t.uri.clone()).collect();
+        // A song already in the playlist (when it is loaded here) is not added twice by mistake.
+        let known: Option<std::collections::HashSet<&str>> = self
+            .open
+            .iter()
+            .chain(self.open_cache.iter())
+            .find(|o| o.playlist.id == pl.id && !o.tracks.has_more())
+            .map(|o| o.tracks.items.iter().map(|t| t.uri.as_str()).collect());
+        let (fresh, there): (Vec<String>, Vec<String>) = match &known {
+            Some(set) => uris.iter().cloned().partition(|u| !set.contains(u.as_str())),
+            None => (uris.clone(), Vec::new()),
+        };
+        self.marks.clear();
+        self.recent_playlists.retain(|id| *id != pl.id);
+        self.recent_playlists.insert(0, pl.id.clone());
+        self.recent_playlists.truncate(20);
+        if fresh.is_empty() {
+            self.info(format!("{} is already in {}", describe(&songs), pl.name));
+            return;
+        }
+        let what = if there.is_empty() { describe(&songs) } else { format!("{} new songs ({} were there)", fresh.len(), there.len()) };
+        self.changes.push(Change::Added { playlist_id: pl.id.clone(), playlist: pl.name.clone(), uris: fresh.clone() });
+        self.send(Cmd::AddToPlaylist { playlist_id: pl.id, playlist: pl.name, uris: fresh, what, position: None });
+    }
+
+    /// `E`: adds the song (or the marked ones) to the playlist used last.
+    fn add_again(&mut self) {
+        let Some(t) = self.selected_track() else {
+            self.info("Select a song first.");
+            return;
+        };
+        let last = self.recent_playlists.first().and_then(|id| self.playlists.items.iter().find(|p| p.id == *id)).cloned();
+        match last {
+            Some(pl) if self.can_edit => self.add_to(pl, t),
+            _ => self.open_picker(t),
+        }
+    }
+
+    /// Ctrl+F: type to narrow the list shown.
+    fn start_filter(&mut self) {
+        let Some(shape) = self.shape_mut() else {
+            self.info("This page has no list to filter.");
+            return;
+        };
+        if shape.filter().is_none() {
+            shape.set_filter(Some(Input::default()));
+        }
+        self.filtering = true;
+    }
+
+    /// Keys while typing a filter: Enter or ↓ keeps it and goes to the list, Esc clears it.
+    fn filter_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.filtering = false;
+                if let Some(shape) = self.shape_mut() {
+                    shape.set_filter(None);
+                }
+            }
+            KeyCode::Enter | KeyCode::Down => {
+                self.filtering = false;
+                // An empty filter goes away.
+                if let Some(shape) = self.shape_mut().filter(|s| s.filter().is_some_and(|f| f.trim().is_empty())) {
+                    shape.set_filter(None);
+                }
+            }
+            KeyCode::Up => self.filtering = false,
+            _ => {
+                let Some(shape) = self.shape_mut() else {
+                    self.filtering = false;
+                    return;
+                };
+                let mut text = shape.filter().cloned().unwrap_or_default();
+                if text.edit(&key) != Edit::Ignored {
+                    shape.set_filter(Some(text));
+                }
+            }
+        }
+    }
+
+    /// `,`: the next sort; `;`: turns it round.
+    fn sort_list(&mut self, reverse: bool) {
+        let Some(shape) = self.shape_mut() else {
+            self.info("This page has no list to sort.");
+            return;
+        };
+        if reverse {
+            shape.reverse_sort();
+        } else {
+            shape.next_sort();
+        }
+        let text = match shape.sort() {
+            Some((by, rev)) => format!("Sorted by {}{}", by.name(), if rev { ", reversed" } else { "" }),
+            None => "The list's own order".to_owned(),
+        };
+        self.info(text);
+    }
+
+    /// `w`: marks the song (or takes the mark off) and moves down.
+    fn mark(&mut self) {
+        let Some(t) = self.tracks().and_then(|l| l.current()).map(|t| t.uri.clone()) else {
+            self.info("Marks are for songs: select one first.");
+            return;
+        };
+        if !self.marks.remove(&t) {
+            self.marks.insert(t);
+        }
+        self.move_selection(1);
+    }
+
+    /// `W`: marks every song shown, or none when all are marked.
+    fn mark_all(&mut self) {
+        let Some(l) = self.tracks() else { return };
+        let shown: Vec<String> = l.rows().map(|(_, t)| t.uri.clone()).collect();
+        if !shown.is_empty() && shown.iter().all(|u| self.marks.contains(u)) {
+            self.marks.clear();
+        } else {
+            self.marks.extend(shown);
+            self.info(format!("{} songs marked · actions apply to all · esc clears", self.marks.len()));
+        }
+    }
+
+    /// `u`: undoes the last change (a remove, an add, a like, an unpin).
+    fn undo_change(&mut self) {
+        let Some(change) = self.changes.pop() else {
+            self.info("Nothing to undo.");
+            return;
+        };
+        match change {
+            Change::Removed { playlist_id, playlist, mut songs } => {
+                // Back at their places, the first place first, so each lands where it was.
+                songs.sort_by_key(|(_, at)| *at);
+                for (uri, at) in &songs {
+                    self.send(Cmd::AddToPlaylist {
+                        playlist_id: playlist_id.clone(),
+                        playlist: playlist.clone(),
+                        uris: vec![uri.clone()],
+                        what: "the song".into(),
+                        position: Some(*at),
+                    });
+                }
+                self.info(format!("Putting {} back in {playlist}", if songs.len() == 1 { "the song".into() } else { format!("{} songs", songs.len()) }));
+            }
+            Change::Added { playlist_id, playlist, uris } => {
+                let what = if uris.len() == 1 { "the song".to_owned() } else { format!("{} songs", uris.len()) };
+                self.send(Cmd::RemoveFromPlaylist { playlist_id, playlist, uris, what });
+            }
+            Change::Liked { uris, saved } => {
+                if let [uri] = uris.as_slice() {
+                    if self.playing_uri() == Some(uri.as_str()) {
+                        self.saved = Some((uri.clone(), !saved));
+                    }
+                }
+                self.send(Cmd::SetSavedMany { uris, saved: !saved });
+            }
+            Change::Unpinned(pin, at) => {
+                self.info(format!("Pinned {} again", pin.name()));
+                self.pins.insert(at.min(self.pins.len()), *pin);
+            }
+        }
+    }
+
+    /// The device menu: every Spotify Connect device; the one chosen plays from now on.
+    fn open_devices(&mut self, list: Vec<(String, String, bool)>) {
+        if list.is_empty() {
+            self.info("Spotify sees no devices. Is spotifyd running?");
+            return;
+        }
+        let cursor = list.iter().position(|d| d.2).unwrap_or(0);
+        let items = list
+            .into_iter()
+            .map(|(id, name, active)| ("", if active { format!("{name}  · playing here") } else { name.clone() }, Action::Device { id, name }))
+            .collect();
+        self.menu = Some(Menu { title: "Play on".into(), items, cursor, track: None, at: None });
+    }
 }
 
 #[cfg(test)]
@@ -4915,6 +5691,148 @@ mod tests {
         assert_eq!(app.query, "massive attacsk", "typing goes in at the cursor");
     }
 
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::from(KeyCode::Char(c))
+    }
+
+    fn liked_songs(app: &mut App) {
+        let songs = vec![
+            track_by("1", ("ma", "Massive Attack"), ("me", "Mezzanine")),
+            track_by("2", ("po", "Portishead"), ("du", "Dummy")),
+            track_by("3", ("ma", "Massive Attack"), ("bl", "Blue Lines")),
+            track_by("4", ("tr", "Tricky"), ("ma", "Maxinquaye")),
+        ];
+        app.liked.fill(songs);
+        app.on_key(key('3'));
+        assert_eq!(app.view(), View::Liked);
+    }
+
+    #[test]
+    fn filter_narrows_the_list_and_plays_what_shows() {
+        let (mut app, rx) = test_app();
+        liked_songs(&mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(app.filtering);
+        for c in "massive".chars() {
+            app.on_key(key(c));
+        }
+        assert_eq!(app.liked.len(), 2, "two songs by Massive Attack");
+        assert_eq!(app.liked.current().map(|t| t.uri.as_str()), Some("spotify:track:1"));
+        // Enter keeps the filter and goes to the list; j moves inside what shows.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(!app.filtering);
+        app.on_key(key('j'));
+        assert_eq!(app.liked.current().map(|t| t.uri.as_str()), Some("spotify:track:3"));
+        drain(&rx);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let cmds = drain(&rx);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::Play(Play::Tracks { uris, offset: 1 }) if uris == &["spotify:track:1", "spotify:track:3"])),
+            "the shown songs play, from the selected one: {cmds:?}"
+        );
+        // Esc clears the filter (and only then goes back).
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!((app.liked.len(), app.view()), (4, View::Liked));
+        assert_eq!(app.liked.current().map(|t| t.uri.as_str()), Some("spotify:track:3"), "the selection stays on its song");
+    }
+
+    #[test]
+    fn sort_cycles_and_keeps_the_selection() {
+        let (mut app, _rx) = test_app();
+        liked_songs(&mut app);
+        app.on_key(key('j'));
+        app.on_key(key(','));
+        assert_eq!(app.liked.sort, Some((SortBy::Title, false)));
+        app.on_key(key(','));
+        assert_eq!(app.liked.sort, Some((SortBy::Artist, false)));
+        let order: Vec<&str> = app.liked.rows().map(|(_, t)| t.artists[0].name.as_str()).collect();
+        assert_eq!(order, ["Massive Attack", "Massive Attack", "Portishead", "Tricky"]);
+        assert_eq!(app.liked.current().map(|t| t.uri.as_str()), Some("spotify:track:2"), "still on the same song");
+        app.on_key(key(';'));
+        assert_eq!(app.liked.rows().next().map(|(_, t)| t.artists[0].name.as_str()), Some("Tricky"));
+        for _ in 0..3 {
+            app.on_key(key(','));
+        }
+        assert_eq!(app.liked.sort, None, "back to the list's own order");
+    }
+
+    #[test]
+    fn marks_make_actions_apply_to_many() {
+        let (mut app, rx) = test_app();
+        liked_songs(&mut app);
+        app.on_key(key('w'));
+        app.on_key(key('j'));
+        app.on_key(key('w'));
+        assert_eq!(app.marks.len(), 2);
+        drain(&rx);
+        app.on_key(key('a'));
+        let queued: Vec<String> = drain(&rx).into_iter().filter_map(|c| match c {
+            Cmd::Queue { uri, .. } => Some(uri),
+            _ => None,
+        }).collect();
+        assert_eq!(queued, ["spotify:track:1", "spotify:track:3"], "in list order");
+        assert!(app.marks.is_empty(), "an action uses the marks up");
+        app.on_key(key('W'));
+        assert_eq!(app.marks.len(), 4);
+        app.library = Some(Library::default());
+        app.on_key(key('f'));
+        let cmds = drain(&rx);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SetSavedMany { uris, saved: true } if uris.len() == 4)), "{cmds:?}");
+        app.on_key(key('u'));
+        let cmds = drain(&rx);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SetSavedMany { uris, saved: false } if uris.len() == 4)), "undo: {cmds:?}");
+        // Esc first clears marks.
+        app.on_key(key('W'));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.marks.is_empty());
+    }
+
+    #[test]
+    fn c_opens_the_list_the_song_plays_from() {
+        let (mut app, _rx) = test_app();
+        let mut pb = playing_song("spotify:track:3");
+        pb.context = Some(serde_json::from_value(serde_json::json!({ "uri": "spotify:user:me:collection" })).unwrap());
+        app.on_msg(Msg::Playback(Some(Box::new(pb))));
+        liked_songs(&mut app);
+        app.on_key(key('1'));
+        assert_eq!(app.view(), View::Search);
+        app.on_key(key('c'));
+        assert_eq!(app.view(), View::Liked);
+        assert_eq!(app.liked.current().map(|t| t.uri.as_str()), Some("spotify:track:3"));
+    }
+
+    #[test]
+    fn search_history_and_palette_places() {
+        let (mut app, _rx) = test_app();
+        app.on_key(key('/'));
+        for q in ["bowie", "massive attack"] {
+            app.query.set(q);
+            app.on_key(KeyEvent::from(KeyCode::Enter));
+            app.on_key(key('/'));
+        }
+        app.query.clear();
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.query, "massive attack");
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.query, "bowie");
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.query, "massive attack");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        // The palette finds a playlist by name and opens it.
+        app.user_id = Some("me".into());
+        app.on_msg(Msg::Playlists { offset: 0, page: ApiPage { items: vec![pl("p1", "Gym")], raw: 1, total: 1 } });
+        app.on_key(key(':'));
+        for c in "gym".chars() {
+            app.on_key(key(c));
+        }
+        assert!(app.palette_entries().iter().any(|e| e.label == "Playlist: Gym"));
+        let at = app.palette_entries().iter().position(|e| e.label == "Playlist: Gym").unwrap();
+        app.palette.as_mut().unwrap().cursor = at;
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.view(), View::Playlist);
+        assert_eq!(app.open.as_ref().map(|o| o.playlist.name.as_str()), Some("Gym"));
+    }
+
     #[test]
     fn a_song_change_asks_little() {
         let (mut app, rx) = test_app();
@@ -5208,17 +6126,25 @@ mod tests {
         let cmds = drain(&rx);
         assert!(cmds.iter().any(|c| matches!(c, Cmd::AddToPlaylist { playlist_id, uris, .. } if playlist_id == "p2" && uris == &["spotify:track:1"])), "{cmds:?}");
 
+        // E adds to the same playlist again; it is first in the picker now.
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert_eq!(app.picker_choices()[0].name, "Chill", "the one used last comes first");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+
+        // D removes at once (no question), and u puts it back at its place.
         app.on_key(KeyEvent::from(KeyCode::Char('D')));
-        assert!(app.confirm.is_some());
-        app.on_key(KeyEvent::from(KeyCode::Char('n')));
         assert!(app.confirm.is_none());
-        assert!(drain(&rx).is_empty(), "cancel sends nothing");
-        app.on_key(KeyEvent::from(KeyCode::Char('D')));
-        app.on_key(KeyEvent::from(KeyCode::Char('y')));
         let cmds = drain(&rx);
-        assert!(cmds.iter().any(|c| matches!(c, Cmd::RemoveFromPlaylist { playlist_id, uri, .. } if playlist_id == "p1" && uri == "spotify:track:1")), "{cmds:?}");
-        app.on_msg(Msg::Removed { playlist_id: "p1".into(), uri: "spotify:track:1".into() });
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::RemoveFromPlaylist { playlist_id, uris, .. } if playlist_id == "p1" && uris == &["spotify:track:1"])), "{cmds:?}");
+        app.on_msg(Msg::Removed { playlist_id: "p1".into(), uris: vec!["spotify:track:1".into()], text: String::new() });
         assert!(app.open.as_ref().unwrap().tracks.items.is_empty());
+        app.on_key(KeyEvent::from(KeyCode::Char('u')));
+        let cmds = drain(&rx);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::AddToPlaylist { playlist_id, position: Some(0), .. } if playlist_id == "p1")), "{cmds:?}");
+        // Then the add to Chill is undone: the song comes out again.
+        app.on_key(KeyEvent::from(KeyCode::Char('u')));
+        let cmds = drain(&rx);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::RemoveFromPlaylist { playlist_id, .. } if playlist_id == "p2")), "{cmds:?}");
     }
 
     #[test]

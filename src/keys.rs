@@ -27,6 +27,7 @@ pub enum Act {
     Palette,
     Filter,
     Sort,
+    SortReverse,
     // Sidebar
     Sidebar,
     SidePlaying,
@@ -109,7 +110,8 @@ pub const ALL: &[Info] = &[
     i(Act::SearchType, "search_type", "Move", "results: songs, artists, albums…", &["t"]),
     i(Act::Palette, "palette", "Move", "do anything (palette)", &[":", "ctrl-p"]),
     i(Act::Filter, "filter", "Move", "filter the list as you type", &["ctrl-f"]),
-    i(Act::Sort, "sort", "Move", "sort the list", &[","]),
+    i(Act::Sort, "sort", "Move", "sort: title, artist, album, time", &[","]),
+    i(Act::SortReverse, "sort_reverse", "Move", "turn the sort round", &[";"]),
     i(Act::Play, "play", "Play", "play the song, or open", &["enter", "l"]),
     i(Act::PlayAll, "play_all", "Play", "play the whole playlist or album", &["P"]),
     i(Act::PlayPause, "play_pause", "Play", "play / pause", &["space"]),

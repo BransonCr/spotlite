@@ -66,7 +66,8 @@ pub enum Cmd {
     RadioMore { radio: String, seeds: Vec<String> },
     /// Every Liked Songs track and artist, for the radio filters.
     Library,
-    AddToPlaylist { playlist_id: String, playlist: String, uris: Vec<String>, what: String },
+    /// Adds songs to a playlist: at the end, or at `position` (undo puts a song back there).
+    AddToPlaylist { playlist_id: String, playlist: String, uris: Vec<String>, what: String, position: Option<usize> },
     /// Plays a genre's `nth` most popular song (0: the top one), from 20% in. The app fades
     /// the volume around it.
     Sample { genre: String, nth: usize },
@@ -76,7 +77,13 @@ pub enum Cmd {
     Randomize(String),
     /// Reload: the saved copy with this name (see `kept`) is not used until a new one is saved.
     Refresh(String),
-    RemoveFromPlaylist { playlist_id: String, playlist: String, uri: String, what: String },
+    RemoveFromPlaylist { playlist_id: String, playlist: String, uris: Vec<String>, what: String },
+    /// Likes or unlikes many songs (marked ones, or an undo).
+    SetSavedMany { uris: Vec<String>, saved: bool },
+    /// The Spotify Connect devices, for the device menu.
+    Devices,
+    /// Moves playback to a device.
+    Transfer { id: String, name: String },
 }
 
 #[derive(Debug)]
@@ -107,9 +114,11 @@ pub enum Msg {
     /// Loading a page (artist id, album id or radio seed) failed; it shows the error.
     PageFailed { id: String, error: String },
     /// A track was removed from a playlist.
-    Removed { playlist_id: String, uri: String },
+    Removed { playlist_id: String, uris: Vec<String>, text: String },
+    /// The Spotify Connect devices: (id, name, active).
+    Devices(Vec<(String, String, bool)>),
     /// A track was added to a playlist.
-    Added { playlist_id: String },
+    Added { playlist_id: String, text: String },
     /// The songs that play next, in order (up to 20).
     UpNext(Vec<Track>),
     /// Every Liked Song, newest first (from the saved copy, brought up to date).
@@ -166,6 +175,9 @@ fn control_lane(cmd: &Cmd) -> bool {
             | Cmd::Queue { .. }
             | Cmd::CheckSaved(_)
             | Cmd::SetSaved { .. }
+            | Cmd::SetSavedMany { .. }
+            | Cmd::Devices
+            | Cmd::Transfer { .. }
             | Cmd::ToggleSaved(_)
             | Cmd::UpNext
             | Cmd::Resume(_)
@@ -556,11 +568,38 @@ impl Worker {
             Cmd::CreatePlaylist { name, description, uris } => {
                 let pl = self.api.create_playlist(&name, &description)?;
                 for chunk in uris.chunks(100) {
-                    self.api.add_to_playlist(&pl.id, chunk)?;
+                    self.api.add_to_playlist(&pl.id, chunk, None)?;
                 }
                 self.stale.insert(kept::PLAYLISTS.to_owned(), SystemTime::now());
                 self.send(Msg::Created(Box::new(pl)));
                 self.send(Msg::Info(format!("Saved {} songs to the new playlist “{name}”", uris.len())));
+                Ok(())
+            }
+            Cmd::SetSavedMany { uris, saved } => {
+                // Spotify takes up to 40 songs in one request.
+                for chunk in uris.chunks(40) {
+                    self.api.set_saved(&chunk.join(","), saved)?;
+                    for uri in chunk {
+                        self.send(Msg::Saved { uri: uri.clone(), saved });
+                    }
+                }
+                let n = uris.len();
+                let what = if n == 1 { "1 song".to_owned() } else { format!("{n} songs") };
+                self.send(Msg::Info(if saved { format!("Liked {what}") } else { format!("Unliked {what}") }));
+                Ok(())
+            }
+            Cmd::Devices => {
+                let devices = self.api.devices()?;
+                let list = devices.into_iter().filter_map(|d| Some((d.id?, d.name, d.is_active))).collect();
+                self.send(Msg::Devices(list));
+                Ok(())
+            }
+            Cmd::Transfer { id, name } => {
+                let playing = self.last.as_ref().is_some_and(|pb| pb.is_playing);
+                self.api.transfer(&id, playing)?;
+                self.shared().device = Some(id);
+                self.send(Msg::Device(Some(name.clone())));
+                self.send(Msg::Info(format!("Playing on {name}")));
                 Ok(())
             }
             Cmd::SetSaved { uri, saved } => {
@@ -686,18 +725,20 @@ impl Worker {
                 self.send(Msg::Random { genre, result });
                 Ok(())
             }
-            Cmd::AddToPlaylist { playlist_id, playlist, uris, what } => {
-                self.api.add_to_playlist(&playlist_id, &uris)?;
+            Cmd::AddToPlaylist { playlist_id, playlist, uris, what, position } => {
+                for chunk in uris.chunks(100) {
+                    self.api.add_to_playlist(&playlist_id, chunk, position)?;
+                }
                 self.changed(&playlist_id);
-                self.send(Msg::Added { playlist_id });
-                self.send(Msg::Info(format!("Added {what} to {playlist}")));
+                self.send(Msg::Added { playlist_id, text: format!("Added {what} to {playlist}") });
                 Ok(())
             }
-            Cmd::RemoveFromPlaylist { playlist_id, playlist, uri, what } => {
-                self.api.remove_from_playlist(&playlist_id, std::slice::from_ref(&uri))?;
+            Cmd::RemoveFromPlaylist { playlist_id, playlist, uris, what } => {
+                for chunk in uris.chunks(100) {
+                    self.api.remove_from_playlist(&playlist_id, chunk)?;
+                }
                 self.changed(&playlist_id);
-                self.send(Msg::Removed { playlist_id, uri });
-                self.send(Msg::Info(format!("Removed {what} from {playlist}")));
+                self.send(Msg::Removed { playlist_id, uris, text: format!("Removed {what} from {playlist}") });
                 Ok(())
             }
         }

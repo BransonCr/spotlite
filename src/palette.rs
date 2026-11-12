@@ -12,10 +12,17 @@ pub struct Palette {
 }
 
 /// What a palette entry does.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Run {
     Act(Act),
     Go(Loc),
+    /// Open one of your playlists.
+    Playlist(crate::api::Playlist),
+    Theme(String),
+    /// Randomize a genre.
+    Genre(String),
+    /// Search again for an earlier search.
+    Search(String),
 }
 
 #[derive(Clone)]
@@ -112,12 +119,37 @@ pub fn entries(app: &App) -> Vec<Entry> {
     add("Help: all keys", Act::Help);
     add("Quit (music keeps playing)", Act::Quit);
     add("Quit and stop spotifyd", Act::QuitStop);
+    add("Filter the list…", Act::Filter);
+    add("Sort the list", Act::Sort);
+    add("Mark all songs", Act::MarkAll);
+    add("Undo the last change", Act::Undo);
+    add("Play on another device…", Act::Devices);
+    add("Add to the last playlist again", Act::AddAgain);
     // One entry per action: the first (the one for this view) stays.
     let mut seen = std::collections::HashSet::new();
     out.retain(|e| match &e.run {
         Run::Act(a) => seen.insert(*a),
-        Run::Go(_) => true,
+        _ => true,
     });
+    out
+}
+
+/// Places to go and things to start, found by name when something is typed: your playlists,
+/// earlier searches, themes and genres. (They would bury the actions in an empty palette.)
+pub fn places(app: &App) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::new();
+    for p in app.playlists.items.iter().filter(|p| app.owns(p) || p.collaborative) {
+        out.push(Entry { label: format!("Playlist: {}", p.name), key: String::new(), run: Run::Playlist(p.clone()) });
+    }
+    for q in &app.search_history {
+        out.push(Entry { label: format!("Search: {q}"), key: String::new(), run: Run::Search(q.clone()) });
+    }
+    for (name, _) in crate::theme::all() {
+        out.push(Entry { label: format!("Theme: {name}"), key: String::new(), run: Run::Theme(name) });
+    }
+    for g in &app.genre_list {
+        out.push(Entry { label: format!("Randomize: {}", g.name), key: String::new(), run: Run::Genre(g.name.to_owned()) });
+    }
     out
 }
 
