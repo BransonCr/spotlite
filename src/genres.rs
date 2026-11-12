@@ -213,7 +213,7 @@ impl Row {
 /// The picker's state: the search text, the open folders, the cursor.
 #[derive(Debug, Default)]
 pub struct Picker {
-    pub query: String,
+    pub query: crate::input::Input,
     pub open: HashSet<usize>,
     pub cursor: usize,
 }
@@ -285,8 +285,8 @@ impl Picker {
     }
 
     /// The search changed: the cursor goes to the first result.
-    pub fn set_query(&mut self, query: String) {
-        self.query = query;
+    pub fn set_query(&mut self, query: impl Into<crate::input::Input>) {
+        self.query = query.into();
         self.cursor = if self.query.trim().is_empty() { 1 } else { 0 };
     }
 
@@ -391,12 +391,12 @@ mod tests {
     fn search_finds_genres_and_takes_any_text() {
         let g = all();
         let mut p = Picker::new();
-        p.set_query("phonk".into());
+        p.set_query("phonk");
         let rows = p.rows(&g);
         assert_eq!(p.cursor, 0);
         assert!(matches!(rows[0], Row::Match(i) if g[i].name == "phonk"), "{rows:?}");
         assert!(rows.iter().any(|r| matches!(r, Row::Match(i) if g[*i].name == "drift phonk")));
-        p.set_query("Jersey Club".into());
+        p.set_query("Jersey Club");
         assert_eq!(p.choose(&g, 0), Choice::Randomize("jersey club".into()));
     }
 }

@@ -2,6 +2,8 @@ use crate::api::{Album, Found, Page as ApiPage, Play, Playback, Playlist, Track}
 use crate::control::Ctl;
 use crate::folders::Entry;
 use crate::images::Images;
+use crate::input::{is_ctrl_backspace, Edit, Input};
+use crate::keys::{Act, Keys};
 use crate::pages::{AlbumPage, ArtistPage, ArtistRow, FilterItem, Page, RadioPage, RandomPage};
 use crate::radio::Library;
 use crate::sidebar::{Item as SideItem, Pin, SideFx, SideView, Sidebar, SongAct};
@@ -308,7 +310,7 @@ pub enum FadeStep {
 /// Choose a playlist to add a track to; type to narrow the list.
 pub struct Picker {
     pub track: Track,
-    pub query: String,
+    pub query: Input,
     pub cursor: usize,
 }
 
@@ -392,7 +394,7 @@ pub struct Toast {
 pub struct App {
     pub tab: Tab,
     pub typing: bool,
-    pub query: String,
+    pub query: Input,
     pub search: Listing<Track>,
     /// Query the search results belong to.
     pub searched: String,
@@ -414,6 +416,11 @@ pub struct App {
     pub device_checked: bool,
     pub toast: Option<Toast>,
     pub help: bool,
+    /// The filter typed in help, and how far help is scrolled.
+    pub help_query: Input,
+    pub help_scroll: usize,
+    /// The keys in use (the table in keys.rs, with `[keys]` from config.toml).
+    pub keys: Keys,
     pub can_like: bool,
     pub quit: bool,
     /// Sound visualizer (v); off by default.
@@ -539,7 +546,7 @@ impl App {
         let mut app = App {
             tab: Tab::Search,
             typing: false,
-            query: String::new(),
+            query: Input::default(),
             search: Listing::default(),
             searched: String::new(),
             search_due: None,
@@ -557,6 +564,9 @@ impl App {
             device_checked: false,
             toast: None,
             help: false,
+            help_query: Input::default(),
+            help_scroll: 0,
+            keys: Keys::default(),
             can_like,
             quit: false,
             stop_services: false,
@@ -1752,7 +1762,7 @@ impl App {
         }
         if !state.search.is_empty() {
             // The last search is listed again (it loads in tick()).
-            self.query = state.search.clone();
+            self.query = state.search.as_str().into();
             self.searched = state.search;
             self.typing = false;
         }
@@ -2288,21 +2298,14 @@ impl App {
                     let at = p.cursor;
                     self.genre_choose(&genres, at);
                 }
-                _ if is_ctrl_backspace(&key) => {
+                _ => {
                     let mut q = p.query.clone();
-                    delete_word(&mut q);
-                    p.set_query(q);
+                    if q.edit(&key) == Edit::Changed {
+                        p.set_query(q);
+                    } else {
+                        p.query = q;
+                    }
                 }
-                KeyCode::Backspace => {
-                    let mut q = p.query.clone();
-                    q.pop();
-                    p.set_query(q);
-                }
-                KeyCode::Char(c) if !ctrl => {
-                    let q = format!("{}{c}", p.query);
-                    p.set_query(q);
-                }
-                _ => {}
             }
         }
         self.genre_list = genres;
@@ -2454,7 +2457,7 @@ impl App {
             self.error("Run `spotlite auth` again to allow editing playlists.");
             return;
         }
-        self.picker = Some(Picker { track, query: String::new(), cursor: 0 });
+        self.picker = Some(Picker { track, query: Input::default(), cursor: 0 });
     }
 
     /// Playlists the user may add to, narrowed by the picker's text.
@@ -2552,8 +2555,8 @@ impl App {
     pub fn run_palette(&mut self) {
         let entries = self.palette_entries();
         let Some(p) = self.palette.take() else { return };
-        if let Some(e) = entries.get(p.cursor.min(entries.len().saturating_sub(1))) {
-            self.on_key(e.event);
+        if let Some(e) = entries.get(p.cursor.min(entries.len().saturating_sub(1))).cloned() {
+            self.run_entry(e.run);
         }
     }
 
@@ -3316,7 +3319,7 @@ impl App {
             return;
         }
         if self.help {
-            self.help = false;
+            self.help_key(key);
             return;
         }
         if self.undo.is_some() {
@@ -3346,29 +3349,13 @@ impl App {
                 KeyCode::Up => self.move_palette(-1),
                 KeyCode::Char('n') if ctrl => self.move_palette(1),
                 KeyCode::Char('p') if ctrl => self.move_palette(-1),
-                KeyCode::Backspace => {
+                _ => {
                     if let Some(p) = self.palette.as_mut() {
-                        if is_ctrl_backspace(&key) {
-                            delete_word(&mut p.query);
-                        } else {
-                            p.query.pop();
+                        if p.query.edit(&key) == Edit::Changed {
+                            p.cursor = 0;
                         }
-                        p.cursor = 0;
                     }
                 }
-                _ if is_ctrl_backspace(&key) => {
-                    if let Some(p) = self.palette.as_mut() {
-                        delete_word(&mut p.query);
-                        p.cursor = 0;
-                    }
-                }
-                KeyCode::Char(c) if !ctrl => {
-                    if let Some(p) = self.palette.as_mut() {
-                        p.query.push(c);
-                        p.cursor = 0;
-                    }
-                }
-                _ => {}
             }
             return;
         }
@@ -3384,29 +3371,13 @@ impl App {
                 KeyCode::Up => self.move_popup(-1),
                 KeyCode::Char('n') if ctrl => self.move_popup(1),
                 KeyCode::Char('p') if ctrl => self.move_popup(-1),
-                KeyCode::Backspace => {
+                _ => {
                     if let Some(p) = self.picker.as_mut() {
-                        if is_ctrl_backspace(&key) {
-                            delete_word(&mut p.query);
-                        } else {
-                            p.query.pop();
+                        if p.query.edit(&key) == Edit::Changed {
+                            p.cursor = 0;
                         }
-                        p.cursor = 0;
                     }
                 }
-                _ if is_ctrl_backspace(&key) => {
-                    if let Some(p) = self.picker.as_mut() {
-                        delete_word(&mut p.query);
-                        p.cursor = 0;
-                    }
-                }
-                KeyCode::Char(c) if !ctrl => {
-                    if let Some(p) = self.picker.as_mut() {
-                        p.query.push(c);
-                        p.cursor = 0;
-                    }
-                }
-                _ => {}
             }
             return;
         }
@@ -3452,89 +3423,134 @@ impl App {
                 }
                 KeyCode::Down => self.typing = false,
                 KeyCode::Enter => self.submit_search(),
-                // Ctrl+Backspace (and Alt+Backspace, Ctrl+W): the last word.
-                _ if is_ctrl_backspace(&key) => {
-                    delete_word(&mut self.query);
-                    self.search_due = Some(Instant::now() + SEARCH_DELAY);
+                _ => {
+                    if self.query.edit(&key) == Edit::Changed {
+                        self.search_due = Some(Instant::now() + SEARCH_DELAY);
+                    }
                 }
-                KeyCode::Backspace => {
-                    self.query.pop();
-                    self.search_due = Some(Instant::now() + SEARCH_DELAY);
-                }
-                KeyCode::Char('u') if ctrl => self.query.clear(),
-                KeyCode::Char(c) if !ctrl => {
-                    self.query.push(c);
-                    self.search_due = Some(Instant::now() + SEARCH_DELAY);
-                }
-                _ => {}
             }
-            return;
-        }
-        let page = 10;
-        if crate::palette::opens(&key) {
-            self.palette = Some(Default::default());
             return;
         }
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('v') => {
-                self.viz_on = !self.viz_on;
-                self.viz_at = Some(Instant::now());
-                self.info(if self.viz_on { "Visualizer on" } else { "Visualizer off" });
-            }
-            KeyCode::Char('Q') => {
-                self.quit = true;
-                self.stop_services = true;
-            }
-            KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('/') => {
-                self.switch_tab(Tab::Search);
-                self.typing = true;
-            }
-            KeyCode::Tab if self.view() == View::Artist => {
-                if let Some(a) = self.artist_page_mut() {
-                    a.jump_section(1);
-                }
-            }
-            KeyCode::BackTab if self.view() == View::Artist => {
-                if let Some(a) = self.artist_page_mut() {
-                    a.jump_section(-1);
-                }
-            }
-            KeyCode::Tab | KeyCode::Char('L') => self.cycle_tab(1),
-            KeyCode::BackTab | KeyCode::Char('H') => self.cycle_tab(-1),
-            KeyCode::Char(c @ '1'..='9') => {
+            KeyCode::Char(c @ '1'..='9') if !ctrl => {
                 if let Some(loc) = self.locs().get(c as usize - '1' as usize).cloned() {
                     self.go(loc);
                 }
             }
-            KeyCode::Char('x') => self.close_page(),
-            KeyCode::Char('t') if self.view() == View::Search => {
+            _ => {
+                if let Some(act) = self.keys.get(&key) {
+                    self.run(act);
+                }
+            }
+        }
+    }
+
+    /// Text pasted into the terminal: it goes to the text box that is open, else to search.
+    pub fn on_paste(&mut self, text: &str) {
+        if let Some(p) = self.palette.as_mut() {
+            p.query.insert(text);
+            p.cursor = 0;
+        } else if let Some(p) = self.picker.as_mut() {
+            p.query.insert(text);
+            p.cursor = 0;
+        } else if let Some(p) = self.genre_picker.as_mut() {
+            let mut q = p.query.clone();
+            q.insert(text);
+            p.set_query(q);
+        } else if self.help {
+            self.help_query.insert(text);
+            self.help_scroll = 0;
+        } else if self.menu.is_none() && self.confirm.is_none() && self.undo.is_none() {
+            if !self.typing {
+                self.switch_tab(Tab::Search);
+                self.typing = true;
+            }
+            self.query.insert(text);
+            self.search_due = Some(Instant::now() + SEARCH_DELAY);
+        }
+    }
+
+    /// Keys in help: type to filter, ↑ ↓ to scroll, Esc (or ? with no filter) to close.
+    fn help_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc if !self.help_query.is_empty() => self.help_query.clear(),
+            KeyCode::Esc | KeyCode::Enter => self.help = false,
+            KeyCode::Char('?') if self.help_query.is_empty() => self.help = false,
+            KeyCode::Down => self.help_scroll += 1,
+            KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+            KeyCode::PageDown => self.help_scroll += 10,
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+            _ => {
+                if self.help_query.edit(&key) == Edit::Changed {
+                    self.help_scroll = 0;
+                }
+            }
+        }
+    }
+
+    /// Runs one action of the key table (a key, the palette, or a click).
+    pub fn run(&mut self, act: Act) {
+        let page = 10;
+        match act {
+            Act::Quit => self.quit = true,
+            Act::QuitStop => {
+                self.quit = true;
+                self.stop_services = true;
+            }
+            Act::Visualizer => {
+                self.viz_on = !self.viz_on;
+                self.viz_at = Some(Instant::now());
+                self.info(if self.viz_on { "Visualizer on" } else { "Visualizer off" });
+            }
+            Act::SideEffect => self.open_side_fx(),
+            Act::Help => {
+                self.help = true;
+                self.help_query.clear();
+                self.help_scroll = 0;
+            }
+            Act::Search => {
+                self.switch_tab(Tab::Search);
+                self.typing = true;
+            }
+            Act::Palette => self.palette = Some(Default::default()),
+            Act::UndoTree => self.open_undo(),
+            Act::NextSection | Act::PrevSection if self.view() == View::Artist => {
+                let step = if act == Act::NextSection { 1 } else { -1 };
+                if let Some(a) = self.artist_page_mut() {
+                    a.jump_section(step);
+                }
+            }
+            Act::NextTab | Act::NextSection => self.cycle_tab(1),
+            Act::PrevTab | Act::PrevSection => self.cycle_tab(-1),
+            Act::CloseTab => self.close_page(),
+            Act::SearchType if self.view() == View::Search => {
                 let i = SearchKind::ALL.iter().position(|k| *k == self.search_kind).unwrap_or(0);
                 self.set_search_kind(SearchKind::ALL[(i + 1) % SearchKind::ALL.len()]);
             }
-            KeyCode::Char('T') => self.open_themes(),
-            KeyCode::Char('*') => self.pin_selected(),
-            KeyCode::Char('C') => {
+            Act::SearchType => {}
+            Act::Theme => self.open_themes(),
+            Act::Pin => self.pin_selected(),
+            Act::Card => {
                 if let Some(t) = self.target_track() {
                     self.share_card(t);
                 }
             }
-            KeyCode::Char('d') if !ctrl && self.view() == View::Radio => self.discover_round(),
-            KeyCode::Char('d') if !ctrl && self.view() == View::Random => self.reroll(),
-            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => self.back(),
-            KeyCode::Char('.') => self.open_menu(),
-            KeyCode::Char('i') => {
+            Act::Discover if self.view() == View::Radio => self.discover_round(),
+            Act::Discover if self.view() == View::Random => self.reroll(),
+            Act::Discover => {}
+            Act::Back => self.back(),
+            Act::Actions => self.open_menu(),
+            Act::Artist => {
                 if let Some(t) = self.target_track() {
                     self.go_to_artist(&t);
                 }
             }
-            KeyCode::Char('b') => {
+            Act::Album => {
                 if let Some(t) = self.target_track() {
                     self.go_to_album(&t);
                 }
             }
-            KeyCode::Char('o') => {
+            Act::Radio => {
                 let radio_row = match self.page() {
                     Some(Page::Artist(a)) => match a.rows.current() {
                         Some(ArtistRow::Radio(seed)) => Some(seed.clone()),
@@ -3548,72 +3564,68 @@ impl App {
                     self.start_radio(t);
                 }
             }
-            KeyCode::Char('e') => {
+            Act::AddToPlaylist => {
                 if let Some(t) = self.selected_track() {
                     self.open_picker(t);
                 }
             }
-            KeyCode::Char('D') => {
+            Act::Remove => {
                 if let Some(t) = self.selected_track() {
                     self.ask_remove(t);
                 }
             }
-            KeyCode::Char('F') => self.open_filters(),
-            KeyCode::Char('c') => self.jump_to_playing(),
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.change_volume(true),
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.change_volume(false),
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Char('d') if ctrl => self.move_selection(page),
-            KeyCode::Char('u') if ctrl => self.move_selection(-page),
-            KeyCode::PageDown => self.move_selection(page),
-            KeyCode::PageUp => self.move_selection(-page),
-            KeyCode::Char('g') | KeyCode::Home => self.move_selection(isize::MIN / 2),
-            KeyCode::Char('G') | KeyCode::End => self.move_selection(isize::MAX / 2),
-            KeyCode::Enter | KeyCode::Char('l') => self.play_selected(),
-            KeyCode::Char('P') => self.play_whole_playlist(),
-            KeyCode::Char('a') => self.queue_selected(),
-            KeyCode::Char(' ') => self.toggle_play(),
-            KeyCode::Char('n') => self.skip(true),
-            KeyCode::Char('p') => self.skip(false),
-            KeyCode::Right => self.seek(true),
-            KeyCode::Left => self.seek(false),
-            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char(']') => self.change_volume(true),
-            KeyCode::Char('-') | KeyCode::Char('[') => self.change_volume(false),
-            KeyCode::Char('m') => self.toggle_mute(),
-            KeyCode::Char('s') => self.toggle_shuffle(),
-            KeyCode::Char('r') => self.cycle_repeat(),
-            KeyCode::Char('f') => self.toggle_like(None),
-            KeyCode::Char('S') if self.view() == View::Radio => self.ask_save_radio(),
-            KeyCode::Char('S') if self.view() == View::Random => self.ask_save_random(),
-            KeyCode::Char('z') if !ctrl => self.randomize_key(),
-            KeyCode::Char('R') => self.reload(),
-            _ => {}
+            Act::Filters => self.open_filters(),
+            Act::Jump => self.jump_to_playing(),
+            Act::VolumeUp => self.change_volume(true),
+            Act::VolumeDown => self.change_volume(false),
+            Act::Down => self.move_selection(1),
+            Act::Up => self.move_selection(-1),
+            Act::PageDown => self.move_selection(page),
+            Act::PageUp => self.move_selection(-page),
+            Act::Top => self.move_selection(isize::MIN / 2),
+            Act::Bottom => self.move_selection(isize::MAX / 2),
+            Act::Play => self.play_selected(),
+            Act::PlayAll => self.play_whole_playlist(),
+            Act::Queue => self.queue_selected(),
+            Act::PlayPause => self.toggle_play(),
+            Act::Next => self.skip(true),
+            Act::Previous => self.skip(false),
+            Act::Forward => self.seek(true),
+            Act::Rewind => self.seek(false),
+            Act::Mute => self.toggle_mute(),
+            Act::Shuffle => self.toggle_shuffle(),
+            Act::Repeat => self.cycle_repeat(),
+            Act::Like => self.toggle_like(None),
+            Act::Save if self.view() == View::Radio => self.ask_save_radio(),
+            Act::Save if self.view() == View::Random => self.ask_save_random(),
+            Act::Save => {}
+            Act::Randomize => self.randomize_key(),
+            Act::Reload => self.reload(),
+            Act::Sidebar => self.toggle_sidebar(),
+            Act::SidePlaying => self.show_side(SideView::Playing),
+            Act::SideLibrary => self.show_side(SideView::Library),
+            Act::Filter | Act::Sort | Act::Mark | Act::MarkAll | Act::Undo | Act::AddAgain | Act::Devices => {}
+        }
+    }
+
+    /// Runs a palette entry.
+    pub fn run_entry(&mut self, run: crate::palette::Run) {
+        match run {
+            crate::palette::Run::Act(act) => self.run(act),
+            crate::palette::Run::Go(loc) => self.go(loc),
         }
     }
 }
 
-/// Ctrl+Backspace, as terminals send it: ^H (most, ghostty too), ^W (some), or Backspace with
-/// Ctrl or Alt (kitty keyboard protocol, or Alt as a fallback).
 /// Deletes the last word of `text`, and the spaces after it (as Ctrl+Backspace does in most
 /// text boxes). Punctuation counts as part of the word.
+#[cfg(test)]
 pub fn delete_word(text: &mut String) {
-    let trimmed = text.trim_end().len();
-    text.truncate(trimmed);
-    let start = text.rfind(char::is_whitespace).map_or(0, |i| i + text[i..].chars().next().map_or(1, char::len_utf8));
-    text.truncate(start);
+    let mut input = Input::from(text.as_str());
+    input.edit(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    *text = input.to_string();
 }
 
-fn is_ctrl_backspace(key: &KeyEvent) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Backspace => key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
-        KeyCode::Char('h') | KeyCode::Char('w') => ctrl,
-        _ => false,
-    }
-}
-
-/// The tabs that do not fit in the bar: the "+N ▾" chip and its list.
 impl App {
     /// The pointer moved (no button). True if the screen changes: the list opens, closes, or
     /// another row is under the pointer.
@@ -3807,29 +3819,6 @@ impl App {
     /// Keys for the sidebar. True if the key was used.
     fn side_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('\\') => {
-                self.toggle_sidebar();
-                return true;
-            }
-            KeyCode::Char('b') if ctrl => {
-                self.toggle_sidebar();
-                return true;
-            }
-            KeyCode::Char('<') => {
-                self.show_side(SideView::Playing);
-                return true;
-            }
-            KeyCode::Char('>') => {
-                self.show_side(SideView::Library);
-                return true;
-            }
-            KeyCode::Char('V') => {
-                self.open_side_fx();
-                return true;
-            }
-            _ => {}
-        }
         if !(self.sidebar.open && self.sidebar.focus) {
             return false;
         }
@@ -4903,6 +4892,27 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char('1')));
         app.on_key(KeyEvent::from(KeyCode::Char('4')));
         assert!(app.recent.items.is_empty(), "another song played: loads again");
+    }
+
+    #[test]
+    fn keys_from_the_config_and_paste_work() {
+        let (mut app, rx) = test_app();
+        let mut custom = std::collections::HashMap::new();
+        custom.insert("next".to_owned(), crate::keys::Spec::One("N".into()));
+        app.keys = crate::keys::Keys::new(&custom).0;
+        app.on_msg(Msg::Playback(Some(Box::new(playing_song("spotify:track:a")))));
+        drain(&rx);
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(drain(&rx).is_empty(), "n does nothing now");
+        app.on_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Next)));
+        // Paste goes to the search box, as one piece, with the cursor after it.
+        app.on_paste("massive\nattack");
+        assert!(app.typing);
+        assert_eq!(app.query, "massive attack");
+        app.on_key(KeyEvent::from(KeyCode::Left));
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(app.query, "massive attacsk", "typing goes in at the cursor");
     }
 
     #[test]

@@ -13,6 +13,10 @@ pub struct Config {
     /// Local port for the OAuth redirect (http://127.0.0.1:<port>/callback).
     #[serde(default = "default_redirect_port")]
     pub redirect_port: u16,
+    /// Keys you set yourself: `[keys]` with `next = "n"` or `like = ["f", "ctrl-l"]` (see
+    /// the names in `spotlite keys`).
+    #[serde(default)]
+    pub keys: std::collections::HashMap<String, crate::keys::Spec>,
 }
 
 fn default_device_name() -> String {
@@ -67,6 +71,8 @@ mod tests {
     fn defaults_apply() {
         let cfg: Config = toml::from_str(r#"client_id = "abc""#).unwrap();
         assert_eq!(cfg.device_name, "spotlite");
+        let cfg: Config = toml::from_str("client_id = \"abc\"\n[keys]\nnext = \"N\"\nlike = [\"f\", \"ctrl-l\"]\n").unwrap();
+        assert_eq!(cfg.keys.len(), 2);
         assert_eq!(cfg.redirect_uri(), "http://127.0.0.1:8898/callback");
     }
 }

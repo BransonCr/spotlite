@@ -1,48 +1,52 @@
 //! Command palette (`:` or Ctrl+P): every action in one list, filtered as you type. Each
-//! entry runs the same key you could press, so the palette and the keys never disagree.
+//! entry runs an action of the key table, so the palette and the keys never disagree.
 
-use crate::app::{App, SearchKind, Tab, View};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::app::{App, Loc, SearchKind, Tab, View};
+use crate::input::Input;
+use crate::keys::Act;
 
 #[derive(Default)]
 pub struct Palette {
-    pub query: String,
+    pub query: Input,
     pub cursor: usize,
+}
+
+/// What a palette entry does.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Run {
+    Act(Act),
+    Go(Loc),
 }
 
 #[derive(Clone)]
 pub struct Entry {
     pub label: String,
     /// The key that does the same, shown on the right.
-    pub key: &'static str,
-    pub event: KeyEvent,
-}
-
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
+    pub key: String,
+    pub run: Run,
 }
 
 /// The actions that make sense now (the view, the selection, the open tabs).
 pub fn entries(app: &App) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
-    let mut add = |label: &str, k: &'static str, event: KeyEvent| {
-        out.push(Entry { label: label.to_owned(), key: k, event });
+    let mut add = |label: &str, act: Act| {
+        out.push(Entry { label: label.to_owned(), key: app.keys.show(act), run: Run::Act(act) });
     };
     let view = app.view();
     // What this view offers comes first.
     match view {
         View::Radio => {
-            add("Discover new music (another round)", "d", key('d'));
-            add("Radio filters", "F", key('F'));
-            add("Save this radio as a playlist", "S", key('S'));
-            add("Randomize a genre", "z", key('z'));
+            add("Discover new music (another round)", Act::Discover);
+            add("Radio filters", Act::Filters);
+            add("Save this radio as a playlist", Act::Save);
+            add("Randomize a genre", Act::Randomize);
         }
         View::Random => {
-            add("Roll again (50 new random songs)", "d", key('d'));
-            add("Save these songs as a playlist", "S", key('S'));
+            add("Roll again (50 new random songs)", Act::Discover);
+            add("Save these songs as a playlist", Act::Save);
         }
-        View::Artist => add("Next section", "tab", KeyEvent::from(KeyCode::Tab)),
-        View::Album | View::Playlist | View::Playlists => add("Play all", "P", key('P')),
+        View::Artist => add("Next section", Act::NextSection),
+        View::Album | View::Playlist | View::Playlists => add("Play all", Act::PlayAll),
         View::Search => {
             let next = match app.search_kind {
                 SearchKind::Songs => "artists",
@@ -50,63 +54,70 @@ pub fn entries(app: &App) -> Vec<Entry> {
                 SearchKind::Albums => "playlists",
                 SearchKind::Playlists => "songs",
             };
-            add(&format!("Search results: show {next}"), "t", key('t'));
+            add(&format!("Search results: show {next}"), Act::SearchType);
         }
         _ => {}
     }
     if app.selected_track().is_some() {
-        add("Song actions…", ".", key('.'));
-        add("Add the song to the queue", "a", key('a'));
-        add("Go to the song's artist", "i", key('i'));
-        add("Go to the song's album", "b", key('b'));
-        add("Song radio", "o", key('o'));
-        add("Add the song to a playlist…", "e", key('e'));
-        add("Like / unlike the song", "f", key('f'));
+        add("Song actions…", Act::Actions);
+        add("Add the song to the queue", Act::Queue);
+        add("Go to the song's artist", Act::Artist);
+        add("Go to the song's album", Act::Album);
+        add("Song radio", Act::Radio);
+        add("Add the song to a playlist…", Act::AddToPlaylist);
+        add("Like / unlike the song", Act::Like);
+        add("Pin the song to the library", Act::Pin);
     }
-    add(if app.sidebar.open { "Close the sidebar" } else { "Open the sidebar" }, "\\", key('\\'));
-    add("Sidebar: now playing", "<", key('<'));
-    add("Sidebar: library", ">", key('>'));
-    if app.selected_track().is_some() {
-        add("Pin the song to the library", "*", key('*'));
-    }
+    add(if app.sidebar.open { "Close the sidebar" } else { "Open the sidebar" }, Act::Sidebar);
+    add("Sidebar: now playing", Act::SidePlaying);
+    add("Sidebar: library", Act::SideLibrary);
+    add("Sidebar effect…", Act::SideEffect);
     if app.playback.as_ref().is_some_and(|p| p.item.is_some()) {
-        add("Share card of the song (picture)", "C", key('C'));
+        add("Share card of the song (picture)", Act::Card);
     }
-    add("Search", "/", key('/'));
-    for (i, tab) in Tab::ALL.iter().enumerate() {
-        let k: &'static str = ["1", "2", "3", "4"][i];
-        add(&format!("Go to {}", tab.title()), k, key(char::from(b'1' + i as u8)));
-    }
+    add("Search", Act::Search);
     const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        out.push(Entry { label: format!("Go to {}", tab.title()), key: DIGITS[i].into(), run: Run::Go(Loc::Base(*tab)) });
+    }
     for (i, p) in app.pages.iter().enumerate() {
         let n = i + Tab::ALL.len();
-        if n < 9 {
-            let (kind, name) = p.title();
-            add(&format!("Go to {kind}: {name}"), DIGITS[n], key(char::from(b'1' + n as u8)));
-        }
+        let (kind, name) = p.title();
+        let key = DIGITS.get(n).map_or(String::new(), |d| (*d).to_owned());
+        out.push(Entry { label: format!("Go to {kind}: {name}"), key, run: Run::Go(Loc::Page(p.key())) });
     }
+    let mut add = |label: &str, act: Act| {
+        out.push(Entry { label: label.to_owned(), key: app.keys.show(act), run: Run::Act(act) });
+    };
     if app.active.is_some() {
-        add("Close this tab", "x", key('x'));
+        add("Close this tab", Act::CloseTab);
     }
-    add("Back", "esc", KeyEvent::from(KeyCode::Esc));
-    add("Where you went (undo tree)", "^⌫", KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
-    add("Next tab", "L", key('L'));
-    add("Previous tab", "H", key('H'));
-    add("Play / pause", "space", key(' '));
-    add("Next song", "n", key('n'));
-    add("Previous song", "p", key('p'));
-    add("Shuffle on / off", "s", key('s'));
-    add("Repeat: off, all, one", "r", key('r'));
-    add("Jump to the playing song", "c", key('c'));
-    add("Volume up", "+", key('+'));
-    add("Volume down", "-", key('-'));
-    add("Mute / unmute", "m", key('m'));
-    add("Theme…", "T", key('T'));
-    add("Sound visualizer on / off", "v", key('v'));
-    add("Reload the list", "R", key('R'));
-    add("Help: all keys", "?", key('?'));
-    add("Quit (music keeps playing)", "q", key('q'));
-    add("Quit and stop spotifyd", "Q", key('Q'));
+    add("Back", Act::Back);
+    add("Where you went (undo tree)", Act::UndoTree);
+    add("Next tab", Act::NextTab);
+    add("Previous tab", Act::PrevTab);
+    add("Play / pause", Act::PlayPause);
+    add("Next song", Act::Next);
+    add("Previous song", Act::Previous);
+    add("Shuffle on / off", Act::Shuffle);
+    add("Repeat: off, all, one", Act::Repeat);
+    add("Jump to the playing song", Act::Jump);
+    add("Volume up", Act::VolumeUp);
+    add("Volume down", Act::VolumeDown);
+    add("Mute / unmute", Act::Mute);
+    add("Theme…", Act::Theme);
+    add("Sound visualizer on / off", Act::Visualizer);
+    add("Randomize a genre…", Act::Randomize);
+    add("Reload the list", Act::Reload);
+    add("Help: all keys", Act::Help);
+    add("Quit (music keeps playing)", Act::Quit);
+    add("Quit and stop spotifyd", Act::QuitStop);
+    // One entry per action: the first (the one for this view) stays.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|e| match &e.run {
+        Run::Act(a) => seen.insert(*a),
+        Run::Go(_) => true,
+    });
     out
 }
 
@@ -140,17 +151,13 @@ pub fn filter(entries: Vec<Entry>, query: &str) -> Vec<Entry> {
     scored.into_iter().map(|(_, _, e)| e).collect()
 }
 
-pub fn opens(key: &KeyEvent) -> bool {
-    key.code == KeyCode::Char(':') || (key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn filter_ranks_starts_then_contains_then_letters() {
-        let e = |l: &str| Entry { label: l.into(), key: "", event: key('x') };
+        let e = |l: &str| Entry { label: l.into(), key: String::new(), run: Run::Act(Act::Help) };
         let all = vec![e("Volume up"), e("Theme…"), e("Go to Liked"), e("Next tab"), e("Previous tab")];
         let names = |q: &str| filter(all.clone(), q).into_iter().map(|e| e.label).collect::<Vec<_>>();
         assert_eq!(names("th"), ["Theme…"]);

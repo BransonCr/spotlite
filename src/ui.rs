@@ -1,4 +1,5 @@
 use crate::api::{pick_image, Found, ImageRef, Playlist, Track};
+use crate::keys::Act;
 use crate::app::{Action, App, Hits, Listing, Loc, Row as PlRow, SearchKind, Tab, View, SAMPLE_LEN};
 use crate::pages::{ArtistRow, Page};
 use crate::images::Images;
@@ -238,7 +239,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_undo(f, app);
     }
     if app.help {
-        draw_help(f);
+        draw_help(f, app);
     }
     let playing = app.playback.as_ref().is_some_and(|pb| pb.is_playing);
     let area = f.area();
@@ -664,10 +665,10 @@ fn draw_genre_picker(f: &mut Frame, app: &mut App) {
     let line = if picker.query.is_empty() {
         Line::from(vec![Span::styled("/ ", theme::accent()), Span::styled(format!("search {} genres, or type any genre", genres.len()), theme::faint())])
     } else {
-        Line::from(vec![Span::styled("/ ", theme::accent()), Span::styled(picker.query.clone(), theme::text())])
+        Line::from(vec![Span::styled("/ ", theme::accent()), Span::styled(picker.query.to_string(), theme::text())])
     };
     f.render_widget(line, search);
-    f.set_cursor_position(Position::new(search.x + 2 + picker.query.width() as u16, search.y));
+    f.set_cursor_position(Position::new(search.x + 2 + picker.query.cursor_cols(), search.y));
     if rows.is_empty() {
         return;
     }
@@ -808,10 +809,10 @@ fn draw_picker(f: &mut Frame, app: &mut App) {
     app.hits.popup = area;
     let [query, _, list] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).areas(inner);
     f.render_widget(
-        Line::from(vec![Span::styled("/ ", theme::accent()), Span::styled(picker.query.clone(), theme::text())]),
+        Line::from(vec![Span::styled("/ ", theme::accent()), Span::styled(picker.query.to_string(), theme::text())]),
         query,
     );
-    f.set_cursor_position(Position::new(query.x + 2 + picker.query.width() as u16, query.y));
+    f.set_cursor_position(Position::new(query.x + 2 + picker.query.cursor_cols(), query.y));
     if choices.is_empty() {
         let msg = if loading { "Loading your playlists…" } else { "No playlist of yours matches." };
         f.render_widget(Span::styled(msg, theme::faint()), list);
@@ -850,10 +851,10 @@ fn draw_palette(f: &mut Frame, app: &mut App) {
     let prompt = if p.query.is_empty() {
         Line::from(vec![Span::styled(": ", theme::accent()), Span::styled("type what you want to do", theme::faint())])
     } else {
-        Line::from(vec![Span::styled(": ", theme::accent()), Span::styled(p.query.clone(), theme::text())])
+        Line::from(vec![Span::styled(": ", theme::accent()), Span::styled(p.query.to_string(), theme::text())])
     };
     f.render_widget(prompt, query);
-    f.set_cursor_position(Position::new(query.x + 2 + p.query.width() as u16, query.y));
+    f.set_cursor_position(Position::new(query.x + 2 + p.query.cursor_cols(), query.y));
     if entries.is_empty() {
         f.render_widget(Span::styled("Nothing matches.", theme::faint()), list);
         return;
@@ -1784,11 +1785,11 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("search songs, artists, albums or playlists", theme::faint()),
         ])
     } else {
-        Line::from(vec![Span::styled("/ ", theme::accent()), Span::styled(app.query.as_str(), theme::text())])
+        Line::from(vec![Span::styled("/ ", theme::accent()), Span::styled(app.query.to_string(), theme::text())])
     };
     f.render_widget(Paragraph::new(content).block(block), input);
     if app.typing {
-        let x = inner.x + 2 + app.query.width() as u16;
+        let x = inner.x + 2 + app.query.cursor_cols();
         f.set_cursor_position(Position::new(x.min(inner.right().saturating_sub(1)), inner.y));
     }
 
@@ -2699,34 +2700,51 @@ pub fn volume_line(volume: u8, muted: bool, bar: u16, with_label: bool) -> (Line
     (line, (label.width() as u16, bar))
 }
 
-fn hints(app: &App) -> &'static [(&'static str, &'static str)] {
+fn hints(app: &App) -> Vec<(String, &'static str)> {
+    let fixed = |list: &[(&str, &'static str)]| list.iter().map(|(k, w)| ((*k).to_owned(), *w)).collect();
     if app.typing {
-        return &[("⏎", "search"), ("esc", "done"), ("^⌫", "word"), ("^u", "clear")];
+        return fixed(&[("⏎", "search"), ("esc", "done"), ("← →", "move"), ("^⌫", "word"), ("^u", "clear")]);
     }
     if app.undo.is_some() {
-        return &[("↑↓", "move"), ("⏎", "go there"), ("click", "go there"), ("esc", "close")];
+        return fixed(&[("↑↓", "move"), ("⏎", "go there"), ("click", "go there"), ("esc", "close")]);
     }
     if app.menu.is_some() || app.picker.is_some() || app.confirm.is_some() || app.palette.is_some() {
-        return &[("↑↓", "move"), ("⏎", "choose"), ("esc", "close")];
+        return fixed(&[("↑↓", "move"), ("⏎", "choose"), ("esc", "close")]);
     }
+    let k = &app.keys;
+    let acts = |list: &[(Act, &'static str)]| -> Vec<(String, &'static str)> {
+        list.iter().map(|(a, w)| (k.show(*a), *w)).filter(|(key, _)| !key.is_empty()).collect()
+    };
     if app.sidebar.open && app.sidebar.focus {
         return match app.sidebar.view {
-            crate::sidebar::SideView::Playing => &[("⏎", "run"), ("f e o", "keys"), ("l", "library"), ("V", "effect"), ("esc", "list"), ("\\", "close"), ("?", "help")],
-            crate::sidebar::SideView::Library => &[("⏎", "open"), ("*", "pin"), ("h", "playing"), ("esc", "list"), ("\\", "close"), ("?", "help")],
+            crate::sidebar::SideView::Playing => {
+                let mut out = fixed(&[("⏎", "run"), ("f e o", "keys"), ("l", "library")]);
+                out.extend(acts(&[(Act::SideEffect, "effect")]));
+                out.extend(fixed(&[("esc", "list")]));
+                out.extend(acts(&[(Act::Sidebar, "close"), (Act::Help, "help")]));
+                out
+            }
+            crate::sidebar::SideView::Library => {
+                let mut out = fixed(&[("⏎", "open")]);
+                out.extend(acts(&[(Act::Pin, "pin")]));
+                out.extend(fixed(&[("h", "playing"), ("esc", "list")]));
+                out.extend(acts(&[(Act::Sidebar, "close"), (Act::Help, "help")]));
+                out
+            }
         };
     }
-    match app.view() {
-        View::Search if app.search_kind != SearchKind::Songs => &[("/", "search"), ("⏎", "open"), ("t", "type"), ("?", "help")],
-        View::Search => &[("/", "search"), ("⏎", "play"), ("t", "type"), (".", "actions"), ("o", "radio"), ("?", "help")],
-        View::Playlists => &[("⏎", "open"), ("P", "play all"), ("esc", "up"), ("␣", "pause"), ("?", "help")],
-        View::Playlist => &[("⏎", "play"), (".", "actions"), ("e", "add to…"), ("D", "remove"), ("esc", "back"), ("?", "help")],
-        View::Liked => &[("⏎", "play"), (".", "actions"), ("f", "unlike"), ("o", "radio"), ("c", "playing"), ("?", "help")],
-        View::Recent => &[("⏎", "play"), (".", "actions"), ("f", "like"), ("o", "radio"), ("R", "reload"), ("?", "help")],
-        View::Artist => &[("⏎", "play / open"), ("tab", "section"), ("H L", "tabs"), ("x", "close"), ("esc", "back"), ("?", "help")],
-        View::Album => &[("⏎", "play"), ("P", "play album"), (".", "actions"), ("x", "close"), ("esc", "back"), ("?", "help")],
-        View::Radio => &[("⏎", "play"), ("d", "discover"), ("z", "randomize"), ("F", "filters"), ("x", "close"), ("esc", "back"), ("?", "help")],
-        View::Random => &[("⏎", "play"), ("d", "roll again"), ("S", "save as playlist"), ("x", "close"), ("esc", "back"), ("?", "help")],
-    }
+    acts(match app.view() {
+        View::Search if app.search_kind != SearchKind::Songs => &[(Act::Search, "search"), (Act::Play, "open"), (Act::SearchType, "type"), (Act::Palette, "anything"), (Act::Help, "help")],
+        View::Search => &[(Act::Search, "search"), (Act::Play, "play"), (Act::SearchType, "type"), (Act::Actions, "actions"), (Act::Radio, "radio"), (Act::Palette, "anything"), (Act::Help, "help")],
+        View::Playlists => &[(Act::Play, "open"), (Act::PlayAll, "play all"), (Act::Filter, "filter"), (Act::Back, "up"), (Act::Palette, "anything"), (Act::Help, "help")],
+        View::Playlist => &[(Act::Play, "play"), (Act::Actions, "actions"), (Act::Filter, "filter"), (Act::Sort, "sort"), (Act::Mark, "mark"), (Act::AddToPlaylist, "add to…"), (Act::Back, "back"), (Act::Help, "help")],
+        View::Liked => &[(Act::Play, "play"), (Act::Actions, "actions"), (Act::Filter, "filter"), (Act::Sort, "sort"), (Act::Mark, "mark"), (Act::Like, "unlike"), (Act::Help, "help")],
+        View::Recent => &[(Act::Play, "play"), (Act::Actions, "actions"), (Act::Like, "like"), (Act::Radio, "radio"), (Act::Reload, "reload"), (Act::Help, "help")],
+        View::Artist => &[(Act::Play, "play / open"), (Act::NextSection, "section"), (Act::CloseTab, "close"), (Act::Back, "back"), (Act::Help, "help")],
+        View::Album => &[(Act::Play, "play"), (Act::PlayAll, "play album"), (Act::Actions, "actions"), (Act::Mark, "mark"), (Act::CloseTab, "close"), (Act::Back, "back"), (Act::Help, "help")],
+        View::Radio => &[(Act::Play, "play"), (Act::Discover, "discover"), (Act::Filters, "filters"), (Act::Filter, "filter"), (Act::Randomize, "randomize"), (Act::CloseTab, "close"), (Act::Help, "help")],
+        View::Random => &[(Act::Play, "play"), (Act::Discover, "roll again"), (Act::Save, "save as playlist"), (Act::Filter, "filter"), (Act::CloseTab, "close"), (Act::Help, "help")],
+    })
 }
 
 /// Key hints on the left; a message (✓ or ✕) as a pill on the right. Hints that do not fit
@@ -2749,7 +2767,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         if i > 0 {
             add.push(Span::styled(format!("  {}  ", t.bullet), Style::new().fg(theme::dim())));
         }
-        add.push(Span::styled(*key, theme::muted()));
+        add.push(Span::styled(key.clone(), theme::muted()));
         add.push(Span::styled(format!(" {what}"), theme::faint()));
         let w: usize = spans.iter().chain(add.iter()).map(|s| s.width()).sum();
         if w > room {
@@ -2764,79 +2782,74 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Help, in sections; drawn in two columns.
-const HELP: &[(&str, &[(&str, &str)])] = &[
-    ("Move", &[
-        ("1-9, tab", "go to tab"),
-        ("H L", "previous, next tab"),
-        ("x", "close an artist, album, radio tab"),
-        ("tab", "next section (artist page)"),
-        ("j k, ↑ ↓", "move"),
-        ("g G, ^d ^u", "top, bottom, page"),
-        ("esc h ⌫", "back to the last place"),
-        ("^⌫", "undo tree: every place, click to go"),
-        ("c", "jump to the playing song"),
-        ("/  t", "search, result type"),
-        (":  ^p", "do anything (palette)"),
-    ]),
-    ("Sidebar", &[
-        ("\\  ^b", "open, focus, close"),
-        ("<  >", "playing, library"),
-        ("h l, tab", "switch (in the sidebar)"),
-        ("*", "pin, unpin"),
-        ("C", "share card picture"),
-    ]),
-    ("Play", &[
-        ("⏎", "play, or open"),
-        ("P", "play the whole playlist / album"),
-        ("space", "play / pause"),
-        ("n p", "next / previous"),
-        ("← →", "seek 10 s"),
-        ("s  r", "true shuffle, repeat"),
-    ]),
-    ("Song", &[
-        (".", "all actions (or right-click)"),
-        ("a", "add to queue"),
-        ("i  b", "go to artist, album"),
-        ("o", "song radio (or artist)"),
-        ("z", "randomize: 50 random songs of a genre"),
-        ("e  D", "add to playlist, remove"),
-        ("f", "like / unlike"),
-    ]),
-    ("Other", &[
-        ("+ -  m", "volume, mute"),
-        ("F  d  S", "radio filters, discover, save"),
-        ("T", "theme"),
-        ("v  V", "visualizer, sidebar effect (liquid…)"),
-        ("R", "reload the list"),
-        ("q  Q", "quit, quit + stop spotifyd"),
-        ("mouse", "click, double-click, wheel, drag"),
-    ]),
-];
-
-fn draw_help(f: &mut Frame) {
-    let rows = HELP.chunks(2).map(|pair| pair.iter().map(|(_, k)| k.len()).max().unwrap_or(0) + 2).sum::<usize>();
-    let area = popup_area(f, 96, rows as u16 + 4);
+/// Help: every action of the key table with the keys in use, in sections, in two columns
+/// when there is room. Typing filters it; ↑ ↓ scroll it.
+fn draw_help(f: &mut Frame, app: &App) {
+    let q = app.help_query.to_lowercase();
+    let shown = |info: &crate::keys::Info| {
+        q.is_empty()
+            || info.help.to_lowercase().contains(&q)
+            || info.name.contains(&q)
+            || app.keys.show_all(info.act).to_lowercase().split(' ').any(|k| k == q)
+    };
+    let mut sections: Vec<Vec<Line>> = Vec::new();
+    for section in crate::keys::SECTIONS {
+        let rows: Vec<Line> = crate::keys::ALL
+            .iter()
+            .filter(|i| i.section == section && shown(i))
+            .map(|i| {
+                let keys = app.keys.show_all(i.act);
+                let keys = if keys.is_empty() { "—".to_owned() } else { keys };
+                Line::from(vec![Span::styled(format!("{keys:>13}"), theme::accent()), Span::styled(format!("   {}", i.help), theme::text())])
+            })
+            .collect();
+        if !rows.is_empty() {
+            let mut lines = vec![Line::from(Span::styled(section, theme::bright()))];
+            lines.extend(rows);
+            lines.push(Line::raw(""));
+            sections.push(lines);
+        }
+    }
+    let total: usize = sections.iter().map(Vec::len).sum();
+    let wide = f.area().width >= 100;
+    // Two columns: the sections split where the halves are closest in length.
+    let (left, right): (Vec<Line>, Vec<Line>) = if wide {
+        let mut best = (usize::MAX, 0);
+        let mut run = 0;
+        for (i, sec) in sections.iter().enumerate() {
+            run += sec.len();
+            let diff = run.abs_diff(total - run);
+            if diff < best.0 {
+                best = (diff, i + 1);
+            }
+        }
+        let right = sections.split_off(best.1.min(sections.len()));
+        (sections.into_iter().flatten().collect(), right.into_iter().flatten().collect())
+    } else {
+        (sections.into_iter().flatten().collect(), Vec::new())
+    };
+    let rows = left.len().max(right.len()).max(1) as u16;
+    let area = popup_area(f, if wide { 108 } else { 60 }, rows + 6);
+    let title = if app.help_query.is_empty() { " type to filter · ↑↓ scroll · esc close ".to_owned() } else { format!(" filter: {} · esc clears ", app.help_query) };
     let block = popup_block("keys".into())
-        .title_bottom(Line::from(Span::styled(" any key to close ", theme::faint())).right_aligned())
+        .title_bottom(Line::from(Span::styled(title, theme::faint())).right_aligned())
         .padding(Padding::new(2, 2, 1, 1));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
-    let [left, right] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).spacing(2).areas(inner);
-    for (col, area) in [left, right].into_iter().enumerate() {
-        let mut lines = Vec::new();
-        for (title, keys) in HELP.iter().skip(col).step_by(2) {
-            lines.push(Line::from(Span::styled(*title, theme::bright())));
-            for (k, v) in keys.iter() {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{k:>11}"), theme::accent()),
-                    Span::styled(format!("   {v}"), theme::text()),
-                ]));
-            }
-            lines.push(Line::raw(""));
-        }
-        f.render_widget(Paragraph::new(lines), area);
+    if left.is_empty() {
+        draw_centered(f, inner, "No key matches.\nesc clears the filter");
+        return;
+    }
+    let max_scroll = (rows as usize).saturating_sub(inner.height as usize);
+    let scroll = app.help_scroll.min(max_scroll) as u16;
+    let cols: Vec<Rect> = if wide {
+        Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).spacing(2).split(inner).to_vec()
+    } else {
+        vec![inner]
+    };
+    for (lines, area) in [left, right].into_iter().zip(cols) {
+        f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
     }
 }
 
@@ -3088,7 +3101,8 @@ mod tests {
             }
             app.help = true;
             let out = screen(&mut app, 100, 34);
-            assert!(out.contains("volume, mute"), "{name}: help: {out}");
+            assert!(out.contains("move down") && out.contains("all actions"), "{name}: help: {out}");
+            app.help = false;
         }
         crate::theme::apply("amber").unwrap();
     }
@@ -3403,7 +3417,16 @@ mod tests {
 
         app.help = true;
         let out = screen(&mut app, 90, 32);
-        assert!(out.contains("song radio") && out.contains("volume, mute"), "{out}");
+        assert!(out.contains("move down") && out.contains("type to filter"), "{out}");
+        // Typing filters it: the line far down shows.
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Char('r')));
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Char('a')));
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Char('d')));
+        let out = screen(&mut app, 90, 32);
+        assert!(out.contains("song radio") && !out.contains("move down"), "{out}");
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Esc));
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Esc));
+        assert!(!app.help, "esc clears the filter, then closes");
     }
 
     #[test]

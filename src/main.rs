@@ -8,6 +8,8 @@ mod folders;
 mod genre;
 mod genres;
 mod images;
+mod input;
+mod keys;
 mod liquid;
 mod log;
 mod pages;
@@ -28,7 +30,8 @@ use anyhow::{bail, Result};
 use api::Spotify;
 use config::Config;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyEventKind,
+    MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui_image::picker::Picker;
@@ -49,6 +52,7 @@ usage:
   spotlite theme file NAME    print the theme's file, copying a built-in one there first
   spotlite theme new NAME [FROM]  make a theme from FROM (default: the one in use)
   spotlite theme check NAME   check a theme file for mistakes
+  spotlite keys       list every action, its name for [keys] in config.toml, and its keys
   spotlite toggle     play/pause
   spotlite next       next track
   spotlite prev       previous track";
@@ -98,6 +102,21 @@ fn main() -> Result<()> {
             }
         }
         Some("theme") => theme_cmd(std::env::args().skip(2).collect()),
+        Some("keys") => {
+            let custom = Config::load().map(|c| c.keys).unwrap_or_default();
+            let (keys, problems) = keys::Keys::new(&custom);
+            for p in problems {
+                println!("! {p}");
+            }
+            for section in keys::SECTIONS {
+                println!("\n{section}");
+                for info in keys::ALL.iter().filter(|i| i.section == section) {
+                    println!("  {:<16} {:<18} {}", info.name, keys.show_all(info.act), info.help);
+                }
+            }
+            println!("\nChange a key in {} under [keys], e.g. next = \"N\" or like = [\"f\", \"ctrl-l\"].", config::config_path().display());
+            Ok(())
+        }
         Some("folders") => {
             let tree = folders::fetch()?;
             folders::save_cache(&tree)?;
@@ -211,7 +230,9 @@ fn theme_cmd(args: Vec<String>) -> Result<()> {
 }
 
 fn run_tui() -> Result<()> {
-    let api = Spotify::new(Config::load()?)?;
+    let cfg = Config::load()?;
+    let cfg_keys = cfg.keys.clone();
+    let api = Spotify::new(cfg)?;
     start_spotifyd();
     let can_like = api.has_scope("user-library-modify");
     let can_edit = api.has_scope("playlist-modify-private");
@@ -222,7 +243,7 @@ fn run_tui() -> Result<()> {
     // ratatui's panic hook restores the screen; also give the mouse back to the terminal.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         // A note for a bug report, beside the saved state (the release build stops at once).
         let path = state::path().with_file_name("crash.log");
         let note = format!(
@@ -235,7 +256,8 @@ fn run_tui() -> Result<()> {
         hook(info);
         eprintln!("A note about this crash is in {}", path.display());
     }));
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    // Paste arrives as one piece of text (not as keys that would run actions).
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     // Ask the terminal which graphics protocol it speaks (kitty in ghostty); half blocks if none.
     let images = if std::env::var_os("SPOTLITE_NO_IMAGES").is_some() {
         images::Images::disabled()
@@ -244,6 +266,11 @@ fn run_tui() -> Result<()> {
     };
     let mut app = app::App::new(tx.clone(), can_like, images);
     app.viz_on = std::env::var_os("SPOTLITE_VIZ").is_some();
+    let (keys, problems) = keys::Keys::new(&cfg_keys);
+    app.keys = keys;
+    if let Some(p) = problems.first() {
+        app.error(format!("{p} (config.toml){}", if problems.len() > 1 { format!(", and {} more", problems.len() - 1) } else { String::new() }));
+    }
     app.can_edit = can_edit;
     if let Some(tree) = folders::load_cached() {
         app.set_folders(tree);
@@ -351,6 +378,10 @@ fn run_tui() -> Result<()> {
                             app.on_mouse(m);
                             input = true;
                         }
+                        Event::Paste(text) => {
+                            app.on_paste(&text);
+                            input = true;
+                        }
                         Event::Resize(..) => input = true,
                         _ => {}
                     }
@@ -363,7 +394,7 @@ fn run_tui() -> Result<()> {
         Ok(())
     })();
     app.viz.stop();
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     // A trial run (SPOTLITE_THEME) saves nothing, so it never replaces your tabs or theme.
     if theme::env_override().is_none() {
