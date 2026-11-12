@@ -320,6 +320,7 @@ pub fn fetch(seed_uri: &str) -> anyhow::Result<(RadioTrack, Vec<RadioTrack>)> {
     Ok((seed, tracks.collect()))
 }
 
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
 /// The seed of an artist radio: only the artist, so "hide the seed's artist" works and the
 /// era filter lets everything through.
 pub fn artist_seed(uri: &str) -> RadioTrack {
