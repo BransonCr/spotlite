@@ -1132,8 +1132,20 @@ impl App {
             Duration::from_millis(120)
         } else if self.moving() {
             Duration::from_millis(250)
-        } else {
+        } else if self.playback.as_ref().is_some_and(|pb| pb.is_playing) {
+            // The time and the progress bar move each second.
             Duration::from_secs(1)
+        } else {
+            // Nothing moves: sleep until the next thing that is due (a poll, a message that
+            // ends), 5 s at most (the state is saved every 5 s).
+            let now = Instant::now();
+            let due = [Some(self.next_poll), self.toast.as_ref().map(|t| t.until), self.search_due]
+                .into_iter()
+                .flatten()
+                .map(|at| at.saturating_duration_since(now))
+                .min()
+                .unwrap_or(Duration::from_secs(5));
+            due.clamp(Duration::from_millis(50), Duration::from_secs(5))
         }
     }
 
@@ -4131,7 +4143,12 @@ mod tests {
         let (mut app, _rx) = test_app();
         let viz = Duration::from_millis(50);
         app.in_flight = 0;
-        assert_eq!(app.frame_period(viz), Duration::from_secs(1));
+        app.next_poll = Instant::now() + Duration::from_secs(30);
+        let idle = app.frame_period(viz);
+        assert!(idle > Duration::from_millis(4900) && idle <= Duration::from_secs(5), "nothing moves: {idle:?}");
+        app.info("hi");
+        assert!(app.frame_period(viz) <= Duration::from_secs(4), "wakes when the message ends");
+        app.toast = None;
         app.in_flight = 1;
         assert_eq!(app.frame_period(viz), Duration::from_millis(120));
         app.in_flight = 0;

@@ -406,7 +406,12 @@ fn watchdog(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
 fn draw(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> Result<()> {
     use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
     let _ = execute!(std::io::stdout(), BeginSynchronizedUpdate);
+    let started = std::time::Instant::now();
     let drawn = terminal.draw(|f| ui::draw(f, app));
+    let took = started.elapsed();
+    if took > Duration::from_millis(8) && log::on() {
+        log::line(&format!("slow frame: {} ms ({:?})", took.as_millis(), app.view()));
+    }
     let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);
     drawn?;
     Ok(())

@@ -404,7 +404,7 @@ fn draw_artist(f: &mut Frame, app: &mut App, area: Rect) {
     let marker = Span::styled(theme::marker(), theme::accent());
     let table = Table::new(rows, widths).highlight_symbol(Text::from(vec![Line::from(marker.clone()), Line::from(marker)]));
     let len = page.rows.items.len();
-    draw_table(f, table, list, area, &mut page.rows.state, len, PLAYLIST_ROW, 0);
+    draw_table(f, table, list, area, &mut page.rows.state, len, PLAYLIST_ROW, 0, None);
     let offset = page.rows.state.offset();
     let visible = (list.height / PLAYLIST_ROW) as usize;
     for (n, r) in page.rows.items.iter().skip(offset).take(visible).enumerate() {
@@ -1846,7 +1846,8 @@ fn draw_found(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &str
     }
     let widths = [Constraint::Length(thumb), Constraint::Fill(1), Constraint::Length(12)];
     let cols = column_widths(inner.width, &widths);
-    let rows = l.items.iter().map(|item| {
+    let win = window(&mut l.state, l.items.len(), inner.height, PLAYLIST_ROW, 0);
+    let rows = l.items[win.clone()].iter().map(|item| {
         let (sub, right, uri) = match item {
             Found::Artist(a) => ("Artist  ·  ⏎ opens the page, with radios".to_owned(), String::new(), format!("spotify:artist:{}", a.id)),
             Found::Album(a) => {
@@ -1889,7 +1890,7 @@ fn draw_found(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &str
     let marker = Span::styled(theme::marker(), theme::accent());
     let table = Table::new(rows, widths).highlight_symbol(Text::from(vec![Line::from(marker.clone()), Line::from(marker)]));
     let len = l.items.len();
-    draw_table(f, table, inner, area, &mut l.state, len, PLAYLIST_ROW, 0);
+    draw_table(f, table, inner, area, &mut l.state, len, PLAYLIST_ROW, 0, Some(win.start));
     let offset = l.state.offset();
     let visible = (inner.height / PLAYLIST_ROW) as usize;
     let images = &mut app.images;
@@ -1972,7 +1973,8 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
     head.push(Cell::from(Line::from("Time").right_aligned()));
 
     let cols = column_widths(inner.width, &widths);
-    let rows = listing.items.iter().enumerate().map(|(i, t): (usize, &Track)| {
+    let win = window(&mut listing.state, listing.items.len(), inner.height, 1, 2);
+    let rows = listing.items.iter().enumerate().skip(win.start).take(win.len()).map(|(i, t): (usize, &Track)| {
         let is_playing = playing.as_deref() == Some(t.uri.as_str());
         let num = if is_playing {
             Span::styled(mark.to_string(), theme::accent())
@@ -2012,7 +2014,7 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &st
         .header(Row::new(head).style(theme::faint()).bottom_margin(1))
         .highlight_symbol(Text::from(Span::styled(theme::marker(), theme::accent())));
     let len = listing.items.len();
-    draw_table(f, table, inner, area, &mut listing.state, len, 1, 2);
+    draw_table(f, table, inner, area, &mut listing.state, len, 1, 2, Some(win.start));
     let offset = listing.state.offset();
     let rows_area = Rect { y: inner.y + 2, height: inner.height.saturating_sub(2), ..inner };
 
@@ -2100,7 +2102,8 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
 
     let widths = [Constraint::Length(thumb), Constraint::Fill(1), Constraint::Length(12)];
     let cols = column_widths(inner.width, &widths);
-    let rows = entries.iter().map(|e| {
+    let win = window(state, entries.len(), inner.height, PLAYLIST_ROW, 0);
+    let rows = entries[win.clone()].iter().map(|e| {
         let (name, sub, count, is_playing) = match e {
             Entry::Folder { name, count } => (*name, "folder".to_owned(), format!("{count} playlists"), false),
             Entry::Playlist(p) => {
@@ -2129,7 +2132,7 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     let marker = Span::styled(theme::marker(), theme::accent());
     let table = Table::new(rows, widths).highlight_symbol(Text::from(vec![Line::from(marker.clone()), Line::from(marker)]));
     let len = entries.len();
-    draw_table(f, table, inner, area, state, len, PLAYLIST_ROW, 0);
+    draw_table(f, table, inner, area, state, len, PLAYLIST_ROW, 0, Some(win.start));
     let offset = state.offset();
 
     // Covers (or folder marks) go over the empty first column of each visible row.
@@ -2148,7 +2151,25 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.list_offset = offset;
 }
 
+/// The rows of a list that fit in `height` (after `header` rows), from the list's scroll: it
+/// moves, as the table's own does, only as far as needed to show the selection. A list then
+/// builds only these rows, not every row on every frame.
+fn window(state: &mut TableState, len: usize, height: u16, row_height: u16, header: u16) -> std::ops::Range<usize> {
+    let visible = (height.saturating_sub(header) / row_height.max(1)).max(1) as usize;
+    let mut offset = state.offset().min(len.saturating_sub(1));
+    if let Some(sel) = state.selected().map(|s| s.min(len.saturating_sub(1))) {
+        if sel < offset {
+            offset = sel;
+        } else if sel >= offset + visible {
+            offset = sel + 1 - visible;
+        }
+    }
+    *state.offset_mut() = offset;
+    offset..(offset + visible).min(len)
+}
+
 /// Renders a list table with the shared row style, and a scrollbar on the panel's right border.
+/// The table holds the list's rows from `start` on (see `window`), or all of them (None).
 #[allow(clippy::too_many_arguments)]
 fn draw_table(
     f: &mut Frame,
@@ -2159,6 +2180,7 @@ fn draw_table(
     len: usize,
     row_height: u16,
     header_rows: u16,
+    start: Option<usize>,
 ) {
     let t = theme::c();
     let row_style = match t.select {
@@ -2167,7 +2189,14 @@ fn draw_table(
         theme::Select::Underline | theme::Select::Arrow => Style::new().add_modifier(Modifier::BOLD),
     };
     let table = table.column_spacing(2).row_highlight_style(row_style).highlight_spacing(HighlightSpacing::Always);
-    f.render_stateful_widget(table, inner, state);
+    if let Some(start) = start {
+        // The rows given start at the scroll: the table draws them from its top.
+        let mut shown = TableState::default().with_selected(state.selected().and_then(|s| s.checked_sub(start)));
+        f.render_stateful_widget(table, inner, &mut shown);
+        *state.offset_mut() = start;
+    } else {
+        f.render_stateful_widget(table, inner, state);
+    }
     // Cell text keeps its own colour; the block and underline styles restyle the row's text.
     if let Some(sel) = state.selected().filter(|&s| s >= state.offset()) {
         let y0 = inner.y + header_rows + ((sel - state.offset()) as u16) * row_height.max(1);
@@ -3421,5 +3450,32 @@ mod tests {
         assert!(out.contains("Playlists 2"), "{out}");
         assert_eq!(app.hits.row_height, PLAYLIST_ROW);
         assert_eq!(app.hits.list.y as usize, jammer);
+    }
+
+    #[test]
+    fn a_long_list_draws_only_its_window_and_scrolls_like_before() {
+        let (mut app, _rx) = test_app();
+        app.typing = false;
+        app.searched = "x".into();
+        let items: Vec<Track> = (0..10_000).map(|i| track(&format!("Song{i:05}"), "A", "B")).collect();
+        app.on_msg(Msg::Tracks { list: List::Search("x".into()), offset: 0, page: Page { raw: items.len(), items, total: 10_000 } });
+        let out = screen(&mut app, 100, 30);
+        assert!(out.contains("Song00000") && !out.contains("Song00100"), "{out}");
+        // Far down: the selection is on screen, at the bottom (the scroll moves only as needed).
+        app.search.state.select(Some(5000));
+        let out = screen(&mut app, 100, 30);
+        let offset = app.search.state.offset();
+        assert!(out.contains("Song05000") && offset < 5000 && offset > 4970, "{offset}: {out}");
+        let last = out.lines().rfind(|l| l.contains("Song0")).unwrap_or_default();
+        assert!(last.contains("Song05000"), "{out}");
+        // Up a little: no jump.
+        app.search.state.select(Some(4998));
+        screen(&mut app, 100, 30);
+        assert_eq!(app.search.state.offset(), offset);
+        // Back to the top.
+        app.search.state.select(Some(0));
+        let out = screen(&mut app, 100, 30);
+        assert_eq!(app.search.state.offset(), 0);
+        assert!(out.contains("Song00000"), "{out}");
     }
 }
