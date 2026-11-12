@@ -1,5 +1,5 @@
-# Builds the Windows snapshot and attaches it to a GitHub Release. Runs for a `win-v*` tag
-# (see docs/windows.md); a manual run builds the zip as a workflow artifact only.
+# Builds the Windows snapshot and attaches the zip and spotlite.exe to a GitHub Release. Runs for
+# a `win-v*` tag (see docs/windows.md); a manual run builds them as a workflow artifact only.
 name: windows-release
 
 on:
@@ -30,17 +30,20 @@ jobs:
           Copy-Item target/release/spotlite.exe dist/spotlite/
           Copy-Item README-windows.md dist/spotlite/README.md
           Compress-Archive -Path dist/spotlite -DestinationPath "dist/$zip"
+          Copy-Item target/release/spotlite.exe dist/spotlite.exe
           "ZIP=dist/$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
       - uses: actions/upload-artifact@v4
         with:
           name: spotlite-windows
-          path: ${{ env.ZIP }}
+          path: |
+            ${{ env.ZIP }}
+            dist/spotlite.exe
       - name: Release
         if: github.ref_type == 'tag'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "$ZIP" \
+          gh release create "$GITHUB_REF_NAME" "$ZIP" dist/spotlite.exe \
             --title "spotlite $GITHUB_REF_NAME (Windows)" \
-            --notes "Windows snapshot of spotlite. Unzip it and read README.md. What changed: see CHANGELOG.md (Windows snapshots)."
+            --notes "Windows snapshot of spotlite. Download spotlite.exe, or the zip with spotlite.exe and README.md. What changed: see CHANGELOG.md (Windows snapshots)."

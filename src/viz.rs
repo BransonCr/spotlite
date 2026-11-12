@@ -156,7 +156,7 @@ impl Visualizer {
                 let mut analyzer = Analyzer::new();
                 let mut buf = [0u8; HOP * 2];
                 while !stop.load(Ordering::SeqCst) && out.read_exact(&mut buf).is_ok() {
-                    let samples = buf.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0);
+                    let samples = buf.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b) as f32 / 32768.0);
                     let next = analyzer.push(samples);
                     if let Ok(mut f) = frame.lock() {
                         *f = next;
