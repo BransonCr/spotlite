@@ -19,6 +19,8 @@ librespot-metadata = { version = "=0.8.0", default-features = false, features = 
 # Media keys and the system's media controls for the built-in player (MPRIS on Linux, the
 # media flyout on Windows).
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"], optional = true }
+# Messages from librespot (the audio device, errors), for the daemon's log.
+log = { version = "0.4", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 open = "5"
 rand = "0.8"
@@ -45,6 +47,7 @@ librespot-oauth = { version = "=0.8.0", default-features = false, features = ["r
 librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync"] }
 souvlaki = { version = "0.8", default-features = false }
+log = "0.4"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
@@ -54,7 +57,7 @@ default = ["client"]
 client = ["dep:librespot-core", "dep:librespot-protocol", "dep:protobuf", "dep:tokio"]
 # spotlite's own player (`spotlite daemon`, `backend = "builtin"`): librespot plays the audio,
 # so spotifyd is not needed. Always on in Windows builds.
-player = ["client", "dep:librespot-playback", "dep:librespot-connect", "dep:librespot-oauth", "dep:librespot-metadata", "dep:souvlaki", "tokio/rt-multi-thread", "tokio/sync"]
+player = ["client", "dep:librespot-playback", "dep:librespot-connect", "dep:librespot-oauth", "dep:librespot-metadata", "dep:souvlaki", "dep:log", "tokio/rt-multi-thread", "tokio/sync"]
 # Old name of `client`.
 folders = ["client"]
 

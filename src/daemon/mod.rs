@@ -31,6 +31,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tap::{Tap, TapSink};
 
+/// The sample format for the audio output. Windows shares the output in 32-bit float, so
+/// asking for that opens the device at once, without librespot's fallback.
+const OUTPUT_FORMAT: AudioFormat = if cfg!(windows) { AudioFormat::F32 } else { AudioFormat::S16 };
+
 /// The redirect that librespot's own login uses with Spotify's client (it allows this one).
 const LOGIN_REDIRECT: &str = "http://127.0.0.1:5588/login";
 /// What librespot's own login asks for.
@@ -108,6 +112,37 @@ fn log(text: &str) {
     }
 }
 
+/// Sends librespot's messages to the daemon's log: its warnings and errors, and which audio
+/// device it plays on.
+struct Messages;
+
+impl log::Log for Messages {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+            || (m.level() == log::Level::Info && m.target().starts_with("librespot_playback::audio_backend"))
+    }
+
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            log(&format!("{} {}: {}", r.level(), r.target(), r.args()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Logs librespot's messages, and a panic before the process ends (a release build aborts).
+fn log_messages() {
+    if log::set_logger(&Messages).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log(&format!("panic: {info}"));
+        previous(info);
+    }));
+}
+
 /// What the connections share with the player.
 struct Shared {
     started: Instant,
@@ -134,6 +169,7 @@ impl Shared {
 
 /// Runs the player until `quit`. Only one runs: if another answers on the port, this one ends.
 pub fn run(cfg: &Config) -> Result<()> {
+    log_messages();
     let result = serve(cfg);
     if let Err(e) = &result {
         log(&format!("stopped: {e:#}"));
@@ -274,7 +310,7 @@ async fn play(name: String, shared: Arc<Shared>, media: Option<std::sync::mpsc::
         let config = PlayerConfig { bitrate: Bitrate::Bitrate320, normalisation: true, ..Default::default() };
         let player = Player::new(config, session.clone(), mixer.get_soft_volume(), move || {
             let output = audio_backend::find(None).expect("an audio output");
-            Box::new(TapSink::new(output(None, AudioFormat::default()), tap))
+            Box::new(TapSink::new(output(None, OUTPUT_FORMAT), tap))
         });
         let events = tokio::spawn(follow(player.get_player_event_channel(), shared.clone(), media.clone()));
         let connect = ConnectConfig {

@@ -3564,6 +3564,7 @@ dependencies = [
  "librespot-oauth",
  "librespot-playback",
  "librespot-protocol",
+ "log",
  "open",
  "protobuf",
  "rand 0.8.8",
