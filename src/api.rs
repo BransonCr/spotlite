@@ -230,6 +230,7 @@ pub struct Playback {
     pub device: Option<Device>,
     #[serde(default)]
     pub is_playing: bool,
+    #[serde(default, deserialize_with = "position")]
     pub progress_ms: Option<u64>,
     #[serde(default)]
     pub shuffle_state: bool,
@@ -238,6 +239,12 @@ pub struct Playback {
     pub repeat_state: String,
     pub context: Option<Context>,
     pub item: Option<Track>,
+}
+
+/// A position in ms. Spotify sends a small negative one at times, just after a song starts:
+/// that is 0.
+fn position<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.map(|ms| ms.max(0.0) as u64))
 }
 
 fn repeat_off() -> String {
@@ -868,6 +875,10 @@ mod tests {
 
         let idle: Playback = serde_json::from_str(r#"{"device": null, "item": null}"#).unwrap();
         assert!(!idle.is_playing && idle.item.is_none());
+        assert_eq!(idle.progress_ms, None);
+
+        let early: Playback = serde_json::from_str(r#"{"progress_ms": -285, "item": null}"#).unwrap();
+        assert_eq!(early.progress_ms, Some(0));
         assert_eq!(idle.repeat_state, "off");
     }
 
