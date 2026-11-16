@@ -262,7 +262,9 @@ impl App {
         // Your playlists from the saved copy, so the tab and the sidebar show them at once; the
         // first page loads again soon (tick), so a change shows too.
         let mut offset = 0;
-        while let Some(page) = crate::store::read::<ApiPage<Playlist>>(&format!("{}-{offset}.json", crate::worker::kept::PLAYLISTS)) {
+        while let Some(page) = crate::store::read::<ApiPage<Playlist>>(&format!("{}-{offset}.json", crate::worker::kept::PLAYLISTS))
+            .filter(|p| !p.cut_short(offset))
+        {
             let raw = page.raw;
             self.playlists.apply(offset, page);
             offset += raw;

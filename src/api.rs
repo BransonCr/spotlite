@@ -270,6 +270,12 @@ impl<T> Page<T> {
     fn empty() -> Self {
         Page { items: Vec::new(), raw: 0, total: 0 }
     }
+
+    /// No entries where the total says there are some: Spotify sometimes answers so for a
+    /// short time. Such a page is not the end of the list and is not kept.
+    pub fn cut_short(&self, offset: usize) -> bool {
+        self.raw == 0 && offset < self.total
+    }
 }
 
 /// Spotify paging object. Items can be null (e.g. removed tracks), so they are skipped.
@@ -864,6 +870,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_empty_page_inside_the_total_is_cut_short() {
+        let empty = Page::<u32> { items: Vec::new(), raw: 0, total: 77 };
+        assert!(empty.cut_short(0));
+        assert!(!empty.cut_short(77), "past the end, an empty page ends the list");
+        assert!(!Page { items: vec![1], raw: 1, total: 77 }.cut_short(0));
+        assert!(!Page::<u32>::empty().cut_short(0), "an empty list");
+    }
 
     #[test]
     fn playback_with_nulls_parses() {
