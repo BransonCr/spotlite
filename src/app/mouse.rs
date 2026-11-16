@@ -29,11 +29,29 @@ impl App {
                     Drag::Volume => self.set_volume((fraction(self.hits.volume, m.column) * 100.0).round() as u8),
                     Drag::Progress => self.seek_preview = self.seek_to_fraction(fraction(self.hits.progress, m.column)),
                     Drag::Scroll => self.scroll_to(m.row),
+                    Drag::QueueRow { from, .. } => {
+                        // At the top or bottom edge the list scrolls on.
+                        let list = self.hits.list;
+                        let len = self.user_queue.len();
+                        let state = &mut self.user_queue.list.state;
+                        if m.row < list.y && state.offset() > 0 {
+                            *state.offset_mut() -= 1;
+                        } else if m.row >= list.bottom() && state.offset() + (list.height as usize) < len {
+                            *state.offset_mut() += 1;
+                        }
+                        let to = self.queue_drop_at(m.row);
+                        self.drag = Some(Drag::QueueRow { from, to });
+                    }
                 }
                 true
             }
             MouseEventKind::Up(_) => {
                 self.drag = None;
+                if let Drag::QueueRow { from, to } = drag {
+                    if from != to && self.queue_open {
+                        self.queue_move_to(from, to);
+                    }
+                }
                 if drag == Drag::Progress {
                     if let Some(ms) = self.seek_preview.take() {
                         self.seek_absolute(ms);
@@ -54,6 +72,10 @@ impl App {
     pub fn on_mouse(&mut self, m: MouseEvent) {
         let pos = Position::new(m.column, m.row);
         if self.drag_mouse(m) {
+            return;
+        }
+        if self.player_log.is_some() {
+            self.player_log_mouse(m, pos);
             return;
         }
         if self.help {
@@ -92,6 +114,25 @@ impl App {
                 _ => {}
             }
             self.genre_list = genres;
+            return;
+        }
+        if self.queue_add.is_some() {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    match self.hits.popup_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i) {
+                        Some(i) => self.queue_add_pick(i),
+                        None if !self.hits.popup.contains(pos) => self.queue_add = None,
+                        None => {}
+                    }
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let d: isize = if m.kind == MouseEventKind::ScrollUp { -1 } else { 1 };
+                    if let Some(p) = self.queue_add.as_mut().filter(|p| !p.found.is_empty()) {
+                        p.cursor = (p.cursor as isize + d).clamp(0, p.found.len() as isize - 1) as usize;
+                    }
+                }
+                _ => {}
+            }
             return;
         }
         if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.palette.is_some() || self.undo.is_some() {
@@ -142,6 +183,10 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+        if self.hits.device.contains(pos) && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.open_player_log();
             return;
         }
         if !self.sidebar.open && self.hits.side_open.contains(pos) && matches!(m.kind, MouseEventKind::Down(_)) {
@@ -252,6 +297,10 @@ impl App {
                 self.play_selected();
             } else {
                 self.last_click = Some((i, Instant::now()));
+                // A queue row moves when it is dragged.
+                if self.queue_open && !self.user_queue.is_locked(i) {
+                    self.drag = Some(Drag::QueueRow { from: i, to: i });
+                }
             }
         } else if self.typing {
             self.typing = false;
@@ -276,6 +325,7 @@ impl App {
     fn popup_open(&self) -> bool {
         self.menu.is_some()
             || self.picker.is_some()
+            || self.queue_add.is_some()
             || self.palette.is_some()
             || self.genre_picker.is_some()
             || self.confirm.is_some()
@@ -288,7 +338,7 @@ impl App {
     pub fn hot_at(&self, pos: Position) -> Option<(Rect, Hot)> {
         let h = &self.hits;
         let at = |r: Rect| r.contains(pos).then_some(r);
-        if self.help || self.drag.is_some() {
+        if self.help || self.player_log.is_some() || self.drag.is_some() {
             return None;
         }
         if self.tabs_list.is_some() && h.tabs_list.contains(pos) {
@@ -299,6 +349,9 @@ impl App {
         }
         if self.popup_open() {
             return h.popup_rows.iter().find(|(r, _)| r.contains(pos)).map(|(r, _)| (*r, Hot::Row));
+        }
+        if let Some(r) = at(h.device) {
+            return Some((r, Hot::Control));
         }
         if !self.sidebar.open {
             if let Some(r) = at(h.side_open) {

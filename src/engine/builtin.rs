@@ -19,6 +19,28 @@ pub fn log_path() -> PathBuf {
     state_dir().join("daemon.log")
 }
 
+/// The daemon's last `max` log lines, the time of each as UTC.
+pub fn log_tail(max: usize) -> (String, Result<Vec<String>, String>) {
+    let path = log_path();
+    let lines = match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let all: Vec<&str> = text.lines().collect();
+            Ok(all[all.len().saturating_sub(max)..].iter().map(|l| utc_line(l)).collect())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.to_string()),
+    };
+    (path.display().to_string(), lines)
+}
+
+/// "1794595198 text" becomes "12:39:58 text" (UTC).
+fn utc_line(line: &str) -> String {
+    match line.split_once(' ').and_then(|(t, rest)| Some((t.parse::<u64>().ok()?, rest))) {
+        Some((t, rest)) => format!("{:02}:{:02}:{:02}  {rest}", t / 3600 % 24, t / 60 % 60, t % 60),
+        None => line.to_owned(),
+    }
+}
+
 /// The secret each connection to the daemon starts with, so other programs cannot drive it.
 pub fn token_path() -> PathBuf {
     state_dir().join("daemon.token")

@@ -1,4 +1,4 @@
-//! Pop-ups: menus, pickers, the palette, the undo tree, confirm and help.
+//! Pop-ups: menus, pickers, the palette, the undo tree, confirm, help and the player's log.
 
 use super::*;
 
@@ -444,5 +444,84 @@ pub(super) fn draw_help(f: &mut Frame, app: &App) {
     };
     for (lines, area) in [left, right].into_iter().zip(cols) {
         f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
+    }
+}
+
+/// The player's log: the newest lines at the bottom, long lines wrapped, errors in red and
+/// warnings in the second accent.
+pub(super) fn draw_player_log(f: &mut Frame, app: &mut App) {
+    let Some(log) = app.player_log.as_mut() else { return };
+    let screen = f.area();
+    let area = popup_area(f, screen.width.saturating_sub(4).min(150), screen.height.saturating_sub(2));
+    let title = format!("{} log", crate::engine::name());
+    let keys = " ↑↓ scroll · g G oldest, newest · r read again · esc close ";
+    let block = popup_block(title)
+        .title(Line::from(Span::styled(format!(" {} ", fit(&log.source, area.width as usize / 2)), theme::faint())).right_aligned())
+        .title_bottom(Line::from(Span::styled(keys, theme::faint())).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    app.hits.popup = area;
+    let lines = match &log.lines {
+        Err(e) => {
+            draw_centered(f, inner, &format!("Cannot read the log.\n{e}"));
+            return;
+        }
+        Ok(lines) if lines.is_empty() => {
+            draw_centered(f, inner, "The log is empty.");
+            return;
+        }
+        Ok(lines) => lines,
+    };
+    let t = theme::c();
+    let width = inner.width.max(4) as usize;
+    let mut rows: Vec<Line> = Vec::new();
+    for line in lines {
+        let style = if line.contains("ERROR") || line.contains("panicked") {
+            Style::new().fg(t.red)
+        } else if line.contains("WARN") {
+            Style::new().fg(t.accent2)
+        } else {
+            theme::text()
+        };
+        for row in wrap_width(line, width) {
+            rows.push(Line::from(Span::styled(row, style)));
+        }
+    }
+    let height = inner.height as usize;
+    log.page = height.saturating_sub(1).max(1);
+    log.max_scroll = rows.len().saturating_sub(height);
+    log.scroll = log.scroll.min(log.max_scroll);
+    let start = rows.len().saturating_sub(height + log.scroll);
+    let shown: Vec<Line> = rows.into_iter().skip(start).take(height).collect();
+    f.render_widget(Paragraph::new(shown), inner);
+}
+
+/// `line` cut into rows of at most `width` columns; rows after the first start with two
+/// spaces, so a wrapped line reads as one.
+fn wrap_width(line: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for ch in line.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width && !row.is_empty() {
+            rows.push(std::mem::replace(&mut row, "  ".to_owned()));
+            used = 2;
+        }
+        row.push(ch);
+        used += w;
+    }
+    rows.push(row);
+    rows
+}
+
+#[cfg(test)]
+mod log_tests {
+    #[test]
+    fn wraps_long_lines_with_an_indent() {
+        assert_eq!(super::wrap_width("abcdefgh", 5), vec!["abcde", "  fgh"]);
+        assert_eq!(super::wrap_width("", 5), vec![""]);
+        assert_eq!(super::wrap_width("abc", 5), vec!["abc"]);
     }
 }

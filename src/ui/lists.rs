@@ -147,6 +147,10 @@ pub(super) fn draw_found(f: &mut Frame, app: &mut App, area: Rect, title: Line, 
 }
 
 pub(super) fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line, empty: &str) {
+    // The queue view: its first song may be with Spotify already, and a row may be dragged.
+    let queue = app.view() == View::Queue;
+    let locked = if queue { app.user_queue.locked() } else { 0 };
+    let dragged = app.queue_drag();
     let playing = app.playing_uri().map(str::to_owned);
     let filtering = app.filtering;
     let marks = std::mem::take(&mut app.marks);
@@ -166,6 +170,7 @@ pub(super) fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line,
             Some(Page::Random(r)) => Some(&mut r.tracks),
             _ => None,
         },
+        View::Queue => Some(&mut app.user_queue.list),
         View::Playlists | View::Artist => None,
     }) else {
         return;
@@ -210,8 +215,11 @@ pub(super) fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line,
     let win = window(&mut listing.state, len, inner.height, 1, 2);
     let query = listing.filter.as_ref().map(|f| f.to_string());
     let rows = listing.rows().skip(win.start).take(win.len()).map(|(i, t): (usize, &Track)| {
-        let is_playing = playing.as_deref() == Some(t.uri.as_str());
-        let num = if marks.contains(&t.uri) {
+        let is_playing = playing.as_deref() == Some(t.uri.as_str()) && !queue;
+        let moving = dragged.is_some_and(|(from, _)| from == i);
+        let num = if i < locked {
+            Span::styled("»", theme::accent().add_modifier(Modifier::BOLD))
+        } else if marks.contains(&t.uri) {
             Span::styled("◆", theme::accent().add_modifier(Modifier::BOLD))
         } else if is_playing {
             Span::styled(mark.to_string(), theme::accent())
@@ -224,8 +232,11 @@ pub(super) fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line,
             Cell::from({
                 let name = fit(&t.name, cols[2]);
                 let width = name.width();
-                let style = if is_playing { theme::accent() } else { theme::text() };
+                let style = if is_playing || moving { theme::accent().add_modifier(Modifier::BOLD) } else { theme::text() };
                 let mut spans = with_match(name, query.as_deref(), style);
+                if i < locked && cols[2] > width + 10 {
+                    spans.push(Span::styled("  next, sent", theme::faint()));
+                }
                 if theme::c().leaders && cols[2] > width + 3 {
                     // A printed track list: dots lead from the title toward the next column.
                     let dots = ".".repeat(cols[2] - width - 2);
@@ -279,6 +290,29 @@ pub(super) fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, title: Line,
         let rect = Rect::new(x, rows_area.y + n as u16, thumb, 1);
         if rect.right() <= inner.right() {
             draw_cover(f, &mut app.images, t.images(), rect);
+        }
+    }
+    // The drop line of a dragged queue row: under the row it lands after.
+    if let Some((from, to)) = dragged.filter(|(from, to)| from != to) {
+        let after = if to > from { Some(to) } else { to.checked_sub(1) };
+        let line_y = match after {
+            Some(r) if r >= offset => Some(rows_area.y + (r - offset) as u16),
+            _ => None,
+        };
+        if let Some(y) = line_y.filter(|y| *y < rows_area.bottom()) {
+            let accent = theme::c().accent;
+            let buf = f.buffer_mut();
+            for x in rows_area.left()..rows_area.right() {
+                let cell = &mut buf[(x, y)];
+                cell.modifier.insert(Modifier::UNDERLINED);
+                cell.underline_color = accent;
+            }
+        } else if to == locked && offset <= to {
+            // Before the first row: a mark at its left edge.
+            let y = rows_area.y + (to - offset) as u16;
+            if y < rows_area.bottom() {
+                f.buffer_mut()[(rows_area.x, y)].set_symbol("▸").set_fg(theme::c().accent);
+            }
         }
     }
     draw_position(f, area, listing.selected(), listing.len());

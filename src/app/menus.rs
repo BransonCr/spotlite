@@ -15,10 +15,15 @@ impl App {
             self.info("Select a song first.");
             return;
         };
-        let mut items: Vec<(&'static str, String, Action)> = vec![
-            ("⏎", "Play".into(), Action::Play),
-            ("a", "Add to queue".into(), Action::Queue),
-        ];
+        let mut items: Vec<(&'static str, String, Action)> = if self.queue_open {
+            vec![
+                ("⏎", "Play now".into(), Action::Play),
+                ("", "Move to the top".into(), Action::QueueTop),
+                ("D", "Remove from the queue".into(), Action::QueueRemove),
+            ]
+        } else {
+            vec![("⏎", "Play".into(), Action::Play), ("a", "Add to queue".into(), Action::Queue)]
+        };
         for a in track.artists.iter().filter(|a| a.id().is_some()).take(3) {
             items.push((
                 if items.iter().any(|i| matches!(i.2, Action::Artist { .. })) { "" } else { "i" },
@@ -36,7 +41,7 @@ impl App {
             items.push(("z", "Randomize a genre…".into(), Action::PickGenre));
         }
         items.push(("e", "Add to playlist…".into(), Action::AddToPlaylist));
-        if let Some(pl) = self.editable_open_playlist() {
+        if let Some(pl) = self.editable_open_playlist().filter(|_| !self.queue_open) {
             items.push(("D", format!("Remove from {}", pl.name), Action::RemoveFromPlaylist));
         }
         let label = match self.is_liked(&track.uri) {
@@ -226,10 +231,9 @@ impl App {
     pub(super) fn run_action(&mut self, action: Action, track: Track) {
         match action {
             Action::Play => self.play_selected(),
-            Action::Queue => {
-                let cmd = Cmd::Queue { uri: track.uri.clone(), name: track.name.clone() };
-                self.send(cmd);
-            }
+            Action::Queue => self.add_to_queue(vec![track]),
+            Action::QueueTop => self.queue_to_top(),
+            Action::QueueRemove => self.queue_remove(),
             Action::Artist { id, name } => self.open_artist(id, name),
             Action::Album(album) => self.open_album(album),
             Action::Radio => self.start_radio(track),

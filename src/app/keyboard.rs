@@ -9,6 +9,10 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.player_log.is_some() {
+            self.player_log_key(key);
+            return;
+        }
         if self.help {
             self.help_key(key);
             return;
@@ -52,6 +56,10 @@ impl App {
         }
         if self.genre_picker.is_some() {
             self.genre_key(key);
+            return;
+        }
+        if self.queue_add.is_some() {
+            self.queue_add_key(key);
             return;
         }
         if self.picker.is_some() {
@@ -161,6 +169,8 @@ impl App {
         if let Some(p) = self.palette.as_mut() {
             p.query.insert(text);
             p.cursor = 0;
+        } else if let Some(p) = self.queue_add.as_mut() {
+            p.query.insert(text);
         } else if let Some(p) = self.picker.as_mut() {
             p.query.insert(text);
             p.cursor = 0;
@@ -228,6 +238,7 @@ impl App {
                 self.switch_tab(Tab::Search);
                 self.typing = true;
             }
+            Act::PlayerLog => self.open_player_log(),
             Act::Palette => self.palette = Some(Default::default()),
             Act::UndoTree => self.open_undo(),
             Act::NextSection | Act::PrevSection if self.view() == View::Artist => {
@@ -267,7 +278,7 @@ impl App {
                 }
             }
             Act::Radio => {
-                let radio_row = match self.page() {
+                let radio_row = match self.page().filter(|_| !self.queue_open) {
                     Some(Page::Artist(a)) => match a.rows.current() {
                         Some(ArtistRow::Radio(seed)) => Some(seed.clone()),
                         _ => None,
@@ -285,6 +296,7 @@ impl App {
                     self.open_picker(t);
                 }
             }
+            Act::Remove if self.queue_open => self.queue_remove(),
             Act::Remove => {
                 if let Some(t) = self.selected_track() {
                     self.ask_remove(t);
@@ -302,7 +314,16 @@ impl App {
             Act::Bottom => self.move_selection(isize::MAX / 2),
             Act::Play => self.play_selected(),
             Act::PlayAll => self.play_whole_playlist(),
+            Act::Queue if self.queue_open => self.open_queue_add(),
             Act::Queue => self.queue_selected(),
+            Act::QueueView => self.toggle_queue(),
+            Act::QueueUp if self.queue_open => self.queue_move(-1),
+            Act::QueueDown if self.queue_open => self.queue_move(1),
+            Act::QueueShuffle if self.queue_open => self.queue_shuffle(),
+            Act::QueueClear if self.queue_open => self.queue_clear(),
+            Act::QueueUp | Act::QueueDown | Act::QueueShuffle | Act::QueueClear => {
+                self.info(format!("That key works in the queue: {} shows it.", self.keys.show(Act::QueueView)))
+            }
             Act::PlayPause => self.toggle_play(),
             Act::Next => self.skip(true),
             Act::Previous => self.skip(false),

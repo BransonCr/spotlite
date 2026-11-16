@@ -154,6 +154,9 @@ impl App {
 
     /// Shows a tab without a back step.
     pub(super) fn show(&mut self, loc: Loc) {
+        if self.queue_open {
+            self.close_queue();
+        }
         self.typing = false;
         self.filtering = false;
         self.marks.clear();
@@ -410,6 +413,10 @@ impl App {
         }
         if let Some(shape) = self.shape_mut().filter(|s| s.filter().is_some()) {
             shape.set_filter(None);
+            return;
+        }
+        if self.queue_open {
+            self.close_queue();
             return;
         }
         if self.active.is_none() && (self.close_playlist() || self.close_folder()) {

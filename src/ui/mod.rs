@@ -26,6 +26,7 @@ mod lists;
 mod pages;
 mod player;
 mod popups;
+mod queue;
 mod effects;
 mod widgets;
 #[cfg(test)]
@@ -36,6 +37,7 @@ use lists::*;
 use pages::*;
 pub use player::*;
 use popups::*;
+use queue::*;
 pub use aura::draw_aura;
 pub use effects::*;
 pub use widgets::*;
@@ -138,6 +140,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Album => draw_album(f, app, body),
         View::Radio => draw_radio(f, app, body),
         View::Random => draw_random(f, app, body),
+        View::Queue => draw_queue(f, app, body),
     }
     draw_now_playing(f, app, now);
     draw_footer(f, app, footer);
@@ -158,10 +161,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let popup = app.menu.is_some()
         || app.genre_picker.is_some()
         || app.picker.is_some()
+        || app.queue_add.is_some()
         || app.confirm.is_some()
         || app.palette.is_some()
         || app.undo.is_some()
-        || app.help;
+        || app.help
+        || app.player_log.is_some();
     if popup {
         // What is behind a pop-up steps back, so the pop-up stands out.
         let area = f.area();
@@ -178,6 +183,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_genre_picker(f, app);
     } else if app.picker.is_some() {
         draw_picker(f, app);
+    } else if app.queue_add.is_some() {
+        draw_queue_add(f, app);
     } else if app.confirm.is_some() {
         draw_confirm(f, app);
     } else if app.palette.is_some() {
@@ -187,6 +194,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if app.help {
         draw_help(f, app);
+    }
+    if app.player_log.is_some() {
+        draw_player_log(f, app);
     }
     // What a click would do lights up under the pointer (from this frame's click targets).
     if let Some((r, kind)) = app.pointer.and_then(|p| app.hot_at(p)) {

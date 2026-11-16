@@ -876,3 +876,71 @@ fn the_playlist_picker_shows_a_cover_and_count_per_playlist() {
     assert_eq!(hits, vec![(PLAYLIST_ROW, 0), (PLAYLIST_ROW, 1)]);
     assert_eq!(app.hits.popup_rows[0].0.y as usize, jammer);
 }
+
+#[test]
+fn a_click_on_the_device_opens_the_player_log() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton};
+    let (mut app, _rx) = test_app();
+    app.device = Some("spotlite".into());
+    screen(&mut app, 120, 30);
+    let dev = app.hits.device;
+    assert!(dev.width > 0, "the device is drawn and clickable");
+    assert!(matches!(app.hot_at(Position::new(dev.x, dev.y)), Some((_, Hot::Control))));
+    click(&mut app, dev.x, dev.y, MouseButton::Left);
+    assert!(app.player_log.is_some());
+
+    // Fixed lines in place of the real log; the newest show at the bottom.
+    let lines: Vec<String> = (0..60).map(|i| format!("line {i} [INFO] something")).collect();
+    app.player_log = Some(crate::app::PlayerLog {
+        source: "journalctl --user -u spotifyd".into(),
+        lines: Ok(lines),
+        scroll: 0,
+        max_scroll: 0,
+        page: 10,
+    });
+    let out = screen(&mut app, 120, 30);
+    assert!(out.contains("log") && out.contains("line 59 ") && !out.contains("line 10 "));
+    app.on_key(KeyEvent::from(KeyCode::Char('g')));
+    let out = screen(&mut app, 120, 30);
+    assert!(out.contains("line 0 ") && !out.contains("line 59 "));
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    assert!(app.player_log.is_none());
+    app.on_key(KeyEvent::from(KeyCode::Char('J')));
+    assert!(app.player_log.is_some(), "J opens it");
+}
+
+#[test]
+#[ignore = "prints the log pop-up"]
+fn player_log_preview() {
+    let (mut app, _rx) = test_app();
+    app.device = Some("spotlite".into());
+    app.player_log = Some(crate::app::PlayerLog {
+        source: "journalctl --user -u spotifyd".into(),
+        lines: Ok(vec![
+            "Nov 13 10:56:47  [INFO] Authenticated as 'user' !".into(),
+            "Nov 13 10:56:52  [WARN] couldn't load context info because: context is not available. type: Default".into(),
+            "Nov 13 10:56:52  [ERROR] failed to handle request: Invalid state { context is not available. type: Default } and a long tail to wrap round".into(),
+        ]),
+        scroll: 0,
+        max_scroll: 0,
+        page: 10,
+    });
+    println!("{}", screen(&mut app, 100, 16));
+}
+
+#[test]
+fn the_queue_view_shows_the_cover_panel_when_wide_and_the_list_always() {
+    let (mut app, _rx) = test_app();
+    let songs = vec![track("Teardrop", "Massive Attack", "Mezzanine"), track("Glory Box", "Portishead", "Dummy")];
+    app.user_queue.push(songs);
+    app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Char('A')));
+    let wide = screen(&mut app, 140, 40);
+    assert!(wide.contains("Queue") && wide.contains("Glory Box"), "{wide}");
+    assert!(wide.contains("Up next") && wide.contains("1 of 2 in the queue"), "{wide}");
+    assert!(wide.contains("2 songs · 11 min"), "{wide}");
+    let narrow = screen(&mut app, 70, 24);
+    assert!(narrow.contains("Glory Box") && !narrow.contains("Up next"), "{narrow}");
+    app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Char('a')));
+    let picker = screen(&mut app, 100, 30);
+    assert!(picker.contains("Add to the queue"), "{picker}");
+}

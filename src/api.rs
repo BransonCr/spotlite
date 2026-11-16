@@ -565,6 +565,12 @@ impl Spotify {
             .unwrap_or_default())
     }
 
+    /// One song, with its album.
+    pub fn track(&mut self, id: &str) -> Result<Track> {
+        self.get(&format!("/tracks/{id}"), &[])?
+            .ok_or_else(|| anyhow::anyhow!("empty /tracks response"))
+    }
+
     /// The configured spotifyd device if Spotify sees it, else the active device.
     pub fn find_device(&mut self) -> Result<Option<Device>> {
         let wanted = self.cfg.device_name.clone();

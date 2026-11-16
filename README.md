@@ -82,6 +82,7 @@ selected song, so you do not need to remember the keys below.
 | `P` | Play the whole playlist or album |
 | `.` | Action menu for the selected song |
 | `a` | Add the selected song to the queue |
+| `A` | Show the queue, or close it (see Queue below) |
 | `i` / `b` | Go to the song's artist / album |
 | `o` | Song radio from the selected song (or the selected radio on an artist page) |
 | `Tab` / `Shift+Tab` | Next / previous section on an artist page |
@@ -140,6 +141,27 @@ the keys in use; type in it to filter, `↑` `↓` to scroll.
   `Ctrl+E`, `Ctrl+←` `→` by word, `Ctrl+W`/`Ctrl+⌫` delete a word, `Ctrl+U` `Ctrl+K`, and
   paste. In the search box, `↑` `↓` go through earlier searches.
 - The palette (`:`) also finds your playlists, earlier searches, themes and genres by name.
+
+### Queue
+
+`a` adds the selected song (or the marked ones) to spotlite's own queue, and `A` shows it.
+Spotify's Web API can add a song to its queue but cannot remove, move or shuffle one, so
+spotlite keeps the order itself and gives Spotify only the next song, about 10 seconds
+before the playing one ends. Until then every song can still change place.
+
+- The left panel shows the selected song's cover, how long the queue is, and what Spotify
+  plays after the queue. A narrow window shows the list alone.
+- `Enter` (or a double-click) plays the song now. `n` also plays the queue's first song.
+- `Ctrl+↑` `Ctrl+↓` (or `{` `}`) move the song; with the mouse, drag a row to its new place.
+- `D` removes the song (or the marked ones), `Z` shuffles the queue, `u` undoes the change.
+  "Empty the queue" is in the palette (`:`).
+- `a` in the queue opens a search: type, `Enter` searches, then `Enter` adds the song under
+  the cursor. The search stays open for more; `Esc` closes it.
+- `A` again, `Esc` or any tab closes the queue. No click opens it.
+- The song given to Spotify shows `»` and cannot move: Spotify plays it next.
+
+The queue moves on only while spotlite runs. After `q`, Spotify plays on from its list as
+before, and the queue is still there at the next start (`~/.cache/spotlite/queue.json`).
 
 ### Search and Recent
 

@@ -148,6 +148,7 @@ pub(super) fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let right = Line::from(right);
     let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(right.width() as u16)]).areas(area);
+    app.hits.device = r;
     f.render_widget(Line::from(left), l);
     f.render_widget(right, r);
 }
@@ -338,6 +339,7 @@ pub(super) fn hints(app: &App) -> Vec<(String, &'static str)> {
         View::Artist => &[(Act::Play, "play / open"), (Act::NextSection, "section"), (Act::CloseTab, "close"), (Act::Back, "back"), (Act::Help, "help")],
         View::Album => &[(Act::Play, "play"), (Act::PlayAll, "play album"), (Act::Actions, "actions"), (Act::Mark, "mark"), (Act::CloseTab, "close"), (Act::Back, "back"), (Act::Help, "help")],
         View::Radio => &[(Act::Play, "play"), (Act::Discover, "discover"), (Act::Filters, "filters"), (Act::Filter, "filter"), (Act::Randomize, "randomize"), (Act::CloseTab, "close"), (Act::Help, "help")],
+        View::Queue => &[(Act::Play, "play now"), (Act::QueueUp, "up"), (Act::QueueDown, "down"), (Act::Remove, "remove"), (Act::QueueShuffle, "shuffle"), (Act::Queue, "add"), (Act::Undo, "undo"), (Act::QueueView, "close")],
         View::Random => &[(Act::Play, "play"), (Act::Discover, "roll again"), (Act::Save, "save as playlist"), (Act::Filter, "filter"), (Act::CloseTab, "close"), (Act::Help, "help")],
     })
 }

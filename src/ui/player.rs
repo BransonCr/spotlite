@@ -164,7 +164,7 @@ pub(super) fn draw_stage(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(Span::styled(fit(&track.artist_names(), w), Style::new().fg(t.accent))),
         Line::from(Span::styled(fit(&format!("{}{year}", track.album_name()), w), theme::muted())),
     ];
-    if let Some(next) = &app.up_next {
+    if let Some(next) = app.next_song() {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(theme::title("Up next"), theme::faint())));
         lines.push(Line::from(Span::styled(fit(&format!("{}  {}  {}", next.name, t.bullet, next.artist_names()), w), theme::text())));
