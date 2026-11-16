@@ -1363,7 +1363,7 @@ where
             Ok(page)
         }
         Err(e) => {
-            let Some(page) = crate::store::read::<Page<T>>(&name) else { return Err(e) };
+            let Some(page) = crate::store::read::<Page<T>>(&name).filter(|p| !p.cut_short(offset)) else { return Err(e) };
             if let Some(ApiError::RateLimited(secs)) = e.downcast_ref::<ApiError>() {
                 let _ = tx.send(Msg::RetryLater { list: list.clone(), secs: *secs });
             }

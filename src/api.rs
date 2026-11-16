@@ -278,12 +278,25 @@ impl<T> Page<T> {
     }
 }
 
-/// Spotify paging object. Items can be null (e.g. removed tracks), so they are skipped.
+/// Spotify paging object. Items can be null (e.g. removed tracks), so they are skipped. An
+/// item spotlite cannot read (a field missing or null) is skipped too, not the whole page.
 #[derive(Deserialize)]
+#[serde(bound(deserialize = "T: DeserializeOwned"))]
 struct RawPage<T> {
+    #[serde(deserialize_with = "each_or_none")]
     items: Vec<Option<T>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     total: usize,
+}
+
+/// Every entry of a list on its own: one that does not parse becomes None.
+fn each_or_none<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<Option<T>>, D::Error> {
+    let values: Vec<Value> = null_as_empty(d)?;
+    Ok(values.into_iter().map(|v| serde_json::from_value(v).ok()).collect())
+}
+
+fn null_as_zero<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    Ok(Option::<usize>::deserialize(d)?.unwrap_or(0))
 }
 
 impl<T> RawPage<T> {
@@ -930,6 +943,18 @@ mod tests {
         let raw: RawPage<SavedTrack> = serde_json::from_str(json).unwrap();
         let page = raw.into_page(|s| s.track);
         assert_eq!((page.items.len(), page.raw, page.total), (1, 3, 3));
+    }
+
+    #[test]
+    fn a_playlist_that_does_not_parse_leaves_the_rest_of_the_page() {
+        let json = r#"{"items": [
+            {"id": "1", "uri": "spotify:playlist:1", "name": "P", "owner": {"id": "me"}},
+            {"id": "2", "uri": "spotify:playlist:2", "name": null, "owner": null},
+            {"id": "3", "uri": "spotify:playlist:3", "name": "Q", "owner": {"id": "me"}}
+        ], "total": 77}"#;
+        let page = serde_json::from_str::<RawPage<Playlist>>(json).unwrap().into_page(Some);
+        assert_eq!(page.items.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["1", "3"]);
+        assert_eq!((page.raw, page.total), (3, 77));
     }
 
     #[test]
