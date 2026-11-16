@@ -1162,7 +1162,11 @@ impl Worker {
             List::Playlists => {
                 // The list from the last 10 minutes is used as it is; R asks Spotify.
                 let name = format!("{}-{offset}.json", kept::PLAYLISTS);
-                let recent = self.current(&name, kept::PLAYLISTS, Some(LIST_AGE)).then(|| crate::store::read(&name)).flatten();
+                let recent = self
+                    .current(&name, kept::PLAYLISTS, Some(LIST_AGE))
+                    .then(|| crate::store::read::<Page<Playlist>>(&name))
+                    .flatten()
+                    .filter(|p| !p.cut_short(offset));
                 let page: Page<Playlist> = match recent {
                     Some(page) => page,
                     None => saved_copy(&list, offset, self.api.playlists(offset), &self.tx)?,
@@ -1349,6 +1353,11 @@ where
         _ => format!("lists/playlists-{offset}.json"),
     };
     match fetched {
+        Ok(page) if page.cut_short(offset) => {
+            // An empty answer for a list that is not empty: the saved copy, if there is one.
+            let saved = crate::store::read::<Page<T>>(&name).filter(|p| !p.cut_short(offset));
+            Ok(saved.unwrap_or(page))
+        }
         Ok(page) => {
             crate::store::write(&name, &page);
             Ok(page)
