@@ -133,6 +133,8 @@ pub enum Msg {
     Liked(Vec<Track>),
     /// A true shuffle started: these songs play for `context`.
     Shuffled { context: String, uris: Vec<String> },
+    /// The player cannot play a shuffled song list: Spotify's own shuffle plays the list.
+    SpotifyShuffles,
     Random { genre: String, result: Result<Vec<Track>, String> },
     /// A sample plays (or could not start).
     Sampling { genre: String, result: Result<Track, String> },
@@ -905,6 +907,7 @@ impl Worker {
             Ok(uris) if !uris.is_empty() => uris,
             // Cannot list it: play it with Spotify's own shuffle.
             _ => {
+                self.send(Msg::SpotifyShuffles);
                 let _ = self.player(|api, dev| api.set_shuffle(dev, true));
                 let play = Play::Context { uri: context, from };
                 return self.player(|api, dev| api.play_at(dev, Some(&play), position_ms));
@@ -918,6 +921,8 @@ impl Worker {
         match self.player(|api, dev| api.play_at(dev, Some(&play), position_ms)) {
             Err(e) if refused_list(&e) => {
                 // spotifyd refuses song lists: play the context with Spotify's own shuffle.
+                // The app hears it first, so that a poll does not turn that shuffle off.
+                self.send(Msg::SpotifyShuffles);
                 let _ = self.player(|api, dev| api.set_shuffle(dev, true));
                 let play = Play::Context { uri: context, from };
                 return self.player(|api, dev| api.play_at(dev, Some(&play), position_ms)).map_err(|_| e);

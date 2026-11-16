@@ -217,6 +217,8 @@ impl App {
         if !self.true_shuffle {
             return cmd;
         }
+        // The worker can turn Spotify's shuffle off for a moment: a poll then must not count.
+        self.shuffle_hold = Some((true, Instant::now()));
         match cmd {
             Cmd::Play(Play::Context { uri, from }) if crate::worker::shufflable(&uri) => {
                 Cmd::PlayShuffled { context: uri, from, position_ms: 0 }
@@ -780,9 +782,16 @@ impl App {
     /// Spotify's state, with spotlite's shuffle: ⇄ shows the true shuffle, and the list a true
     /// shuffle plays shows as the source. Spotify's own shuffle, turned on elsewhere (a phone),
     /// becomes the true shuffle: spotlite turns Spotify's off and shuffles the list itself.
+    /// When the player refuses song lists, Spotify's own shuffle is the true shuffle.
     pub(super) fn own_shuffle(&mut self, p: &mut Playback) {
         let recent = self.shuffle_hold.is_some_and(|(_, at)| at.elapsed() < PLAYER_HOLD);
-        if p.shuffle_state && !recent {
+        if self.spotify_shuffles {
+            if !recent && !p.shuffle_state {
+                // Turned off elsewhere.
+                self.spotify_shuffles = false;
+                self.true_shuffle = false;
+            }
+        } else if p.shuffle_state && !recent {
             self.shuffle_hold = Some((true, Instant::now()));
             self.send(Cmd::Shuffle(false));
             if !self.true_shuffle {
@@ -823,6 +832,12 @@ impl App {
             (true, Some(context), Some(from)) if self.shuffled.is_none() => {
                 self.info("True shuffle on: the whole list, in a random order");
                 self.send(Cmd::PlayShuffled { context, from: Some(from), position_ms });
+                self.poll_soon();
+            }
+            (false, _, _) if self.spotify_shuffles => {
+                self.info("Shuffle off: back to the list's order");
+                self.spotify_shuffles = false;
+                self.send(Cmd::Shuffle(false));
                 self.poll_soon();
             }
             (false, Some(uri), Some(from)) if self.shuffled.is_some() => {

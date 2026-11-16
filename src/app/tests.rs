@@ -1798,3 +1798,30 @@ fn the_add_picker_searches_and_adds() {
     assert!(app.queue_add.is_none());
     assert_eq!(app.view(), View::Queue);
 }
+
+#[test]
+fn spotify_shuffle_stays_on_when_the_player_refuses_song_lists() {
+    let (mut app, rx) = test_app();
+    app.on_msg(playing_in("spotify:playlist:p1"));
+    app.on_key(KeyEvent::from(KeyCode::Char('s')));
+    drain(&rx);
+    // spotifyd refused the shuffled list: Spotify's own shuffle plays the playlist.
+    app.on_msg(Msg::SpotifyShuffles);
+    app.shuffle_hold = None;
+    let Msg::Playback(Some(mut pb)) = playing_in("spotify:playlist:p1") else { panic!() };
+    pb.shuffle_state = true;
+    app.on_msg(Msg::Playback(Some(pb)));
+    assert!(app.true_shuffle);
+    assert!(app.playback.as_ref().unwrap().shuffle_state);
+    let cmds = drain(&rx);
+    assert!(!cmds.iter().any(|c| matches!(c, Cmd::Shuffle(false) | Cmd::PlayShuffled { .. })), "{cmds:?}");
+    // Off: Spotify's shuffle goes off.
+    app.on_key(KeyEvent::from(KeyCode::Char('s')));
+    assert!(!app.true_shuffle);
+    assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Shuffle(false))));
+    // Turned off elsewhere: ⇄ goes off too.
+    app.on_msg(Msg::SpotifyShuffles);
+    app.shuffle_hold = None;
+    app.on_msg(playing_in("spotify:playlist:p1"));
+    assert!(!app.true_shuffle);
+}

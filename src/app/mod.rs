@@ -478,6 +478,8 @@ pub struct App {
     retries: Vec<(List, Instant)>,
     /// spotlite's own shuffle (Fisher-Yates over the whole list). Spotify's is kept off.
     pub true_shuffle: bool,
+    /// The true shuffle is Spotify's own (the player refuses song lists): its shuffle stays on.
+    spotify_shuffles: bool,
     /// Randomize: the genre picker (quick picks, search, folder tree), and its genres.
     pub genre_picker: Option<crate::genres::Picker>,
     pub genre_list: Vec<crate::genres::Genre>,
@@ -642,6 +644,7 @@ impl App {
             tabs_list: None,
             retries: Vec::new(),
             true_shuffle: false,
+            spotify_shuffles: false,
             genre_picker: None,
             genre_list: crate::genres::all(),
             sample: None,
@@ -1216,7 +1219,14 @@ impl App {
                 }
             }
             Msg::Shuffled { context, uris } => {
+                self.spotify_shuffles = false;
                 self.shuffled = Some((context, uris.into_iter().collect()));
+            }
+            Msg::SpotifyShuffles => {
+                self.shuffled = None;
+                self.true_shuffle = true;
+                self.spotify_shuffles = true;
+                self.shuffle_hold = Some((true, Instant::now()));
             }
             Msg::Sampling { genre, result } => match result {
                 Ok(track) => {
