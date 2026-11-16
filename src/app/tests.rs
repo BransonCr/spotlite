@@ -961,10 +961,7 @@ fn marks_make_actions_apply_to_many() {
     assert_eq!(app.marks.len(), 2);
     drain(&rx);
     app.on_key(key('a'));
-    let queued: Vec<String> = drain(&rx).into_iter().filter_map(|c| match c {
-        Cmd::Queue { uri, .. } => Some(uri),
-        _ => None,
-    }).collect();
+    let queued: Vec<&str> = app.user_queue.items().iter().map(|t| t.uri.as_str()).collect();
     assert_eq!(queued, ["spotify:track:1", "spotify:track:3"], "in list order");
     assert!(app.marks.is_empty(), "an action uses the marks up");
     app.on_key(key('W'));
@@ -1656,4 +1653,148 @@ fn a_song_played_30_s_goes_to_the_top_of_recent() {
     app.on_msg(poll(Some(pb)));
     app.note_listen();
     assert_eq!(app.recent.items.len(), 1);
+}
+
+fn queue_names(app: &App) -> Vec<String> {
+    app.user_queue.items().iter().map(|t| t.name.clone()).collect()
+}
+
+/// A Liked list of four songs, all added to the queue, and the queue view open.
+fn queued_four(app: &mut App) {
+    liked_songs(app);
+    app.on_key(key('W'));
+    app.on_key(key('a'));
+    app.on_key(key('A'));
+}
+
+#[test]
+fn a_adds_to_spotlites_queue_and_shift_a_shows_it() {
+    let (mut app, rx) = test_app();
+    liked_songs(&mut app);
+    drain(&rx);
+    app.on_key(key('a'));
+    assert_eq!(queue_names(&app), ["Song 1"]);
+    assert!(!drain(&rx).iter().any(|c| matches!(c, Cmd::Queue { .. })), "Spotify gets the song later, not now");
+    app.on_key(key('A'));
+    assert_eq!(app.view(), View::Queue);
+    assert_eq!(app.selected_track().map(|t| t.name), Some("Song 1".into()));
+    app.on_key(key('A'));
+    assert_eq!(app.view(), View::Liked, "A again closes it");
+    app.on_key(key('A'));
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    assert_eq!(app.view(), View::Liked, "Esc closes it too");
+    app.on_key(key('A'));
+    app.on_key(key('1'));
+    assert_eq!(app.view(), View::Search, "going to a tab closes it");
+}
+
+#[test]
+fn queue_songs_move_shuffle_go_and_come_back() {
+    let (mut app, _rx) = test_app();
+    queued_four(&mut app);
+    assert_eq!(queue_names(&app), ["Song 1", "Song 2", "Song 3", "Song 4"]);
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(queue_names(&app), ["Song 2", "Song 1", "Song 3", "Song 4"]);
+    app.on_key(key('}'));
+    assert_eq!(queue_names(&app), ["Song 2", "Song 3", "Song 1", "Song 4"]);
+    assert_eq!(app.selected_track().map(|t| t.name), Some("Song 1".into()), "the selection follows the song");
+    app.on_key(key('D'));
+    assert_eq!(queue_names(&app), ["Song 2", "Song 3", "Song 4"]);
+    app.on_key(key('u'));
+    assert_eq!(queue_names(&app), ["Song 2", "Song 3", "Song 1", "Song 4"], "undo puts it back");
+    app.on_key(key('Z'));
+    assert_eq!(app.user_queue.len(), 4);
+    app.on_key(key('u'));
+    assert_eq!(queue_names(&app), ["Song 2", "Song 3", "Song 1", "Song 4"], "undo goes back to the order before");
+}
+
+#[test]
+fn the_queue_goes_to_spotify_one_song_at_a_time() {
+    let (mut app, rx) = test_app();
+    queued_four(&mut app);
+    app.on_msg(Msg::Playback(Some(Box::new(playing_song("spotify:track:x")))));
+    app.tick();
+    drain(&rx);
+    assert!(!app.user_queue.is_locked(0), "a long time is left: nothing is given yet");
+    // 5 s left: the first song goes to Spotify, once.
+    app.playback.as_mut().unwrap().progress_ms = Some(195_000);
+    app.polled_at = Instant::now();
+    app.tick();
+    app.tick();
+    let given: Vec<String> = drain(&rx)
+        .into_iter()
+        .filter_map(|c| match c {
+            Cmd::Queue { uri, quiet: true, .. } => Some(uri),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(given, ["spotify:track:1"]);
+    assert!(app.user_queue.is_locked(0));
+    // It cannot move or go any more.
+    app.select(0);
+    app.on_key(key('D'));
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(queue_names(&app), ["Song 1", "Song 2", "Song 3", "Song 4"]);
+    // It plays: it leaves the queue, and the next one waits for its turn.
+    app.on_msg(Msg::Playback(Some(Box::new(playing_song("spotify:track:1")))));
+    assert_eq!(queue_names(&app), ["Song 2", "Song 3", "Song 4"]);
+    assert!(!app.user_queue.is_locked(0));
+}
+
+#[test]
+fn next_and_enter_in_the_queue_play_a_queue_song_now() {
+    let (mut app, rx) = test_app();
+    queued_four(&mut app);
+    app.on_msg(Msg::Playback(Some(Box::new(playing_song("spotify:track:x")))));
+    drain(&rx);
+    app.select(2);
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    let cmds = drain(&rx);
+    assert!(cmds.iter().any(|c| matches!(c, Cmd::QueueNext { uri } if uri == "spotify:track:3")), "{cmds:?}");
+    assert!(!cmds.iter().any(|c| matches!(c, Cmd::Next)), "{cmds:?}");
+    assert_eq!(queue_names(&app), ["Song 3", "Song 1", "Song 2", "Song 4"]);
+    assert_eq!(app.playing_uri(), Some("spotify:track:3"), "it shows at once");
+    // With the first song given, `n` is an ordinary skip.
+    app.switch = None;
+    app.on_key(key('n'));
+    assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::Next)));
+}
+
+#[test]
+fn queue_rows_move_with_a_mouse_drag() {
+    let (mut app, _rx) = test_app();
+    queued_four(&mut app);
+    app.hits.list = Rect::new(10, 5, 60, 10);
+    app.hits.row_height = 1;
+    app.hits.list_offset = 0;
+    let at = |kind, row| MouseEvent { kind, column: 20, row, modifiers: KeyModifiers::NONE };
+    app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 5));
+    app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 7));
+    assert_eq!(app.queue_drag(), Some((0, 2)));
+    app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 7));
+    assert_eq!(queue_names(&app), ["Song 2", "Song 3", "Song 1", "Song 4"]);
+    assert_eq!(app.queue_drag(), None);
+}
+
+#[test]
+fn the_add_picker_searches_and_adds() {
+    let (mut app, rx) = test_app();
+    app.on_key(key('A'));
+    app.on_key(key('a'));
+    assert!(app.queue_add.is_some());
+    for c in "dummy".chars() {
+        app.on_key(key(c));
+    }
+    drain(&rx);
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert!(drain(&rx).iter().any(|c| matches!(c, Cmd::QueueSearch(q) if q == "dummy")));
+    let found = vec![track_by("7", ("po", "Portishead"), ("du", "Dummy")), track_by("8", ("po", "Portishead"), ("du", "Dummy"))];
+    app.on_msg(Msg::QueueFound { query: "dummy".into(), found });
+    app.on_key(KeyEvent::from(KeyCode::Down));
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(queue_names(&app), ["Song 8"]);
+    assert!(app.queue_add.is_some(), "it stays open for more");
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    assert!(app.queue_add.is_none());
+    assert_eq!(app.view(), View::Queue);
 }

@@ -171,6 +171,8 @@ impl App {
                 self.rebuild_rows();
             }
             View::Liked => self.liked.reset(),
+            // What Spotify plays after the queue.
+            View::Queue => self.send(Cmd::UpNext),
             View::Recent => {
                 self.recent.reset();
                 self.recent_at = Some((Instant::now(), self.playing_uri().map(str::to_owned)));
@@ -201,7 +203,7 @@ impl App {
     }
 
     pub fn list_len(&self) -> usize {
-        if let Some(Page::Artist(a)) = self.page() {
+        if let Some(Page::Artist(a)) = self.page().filter(|_| !self.queue_open) {
             return a.rows.items.len();
         }
         match self.view() {

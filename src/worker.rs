@@ -45,7 +45,12 @@ pub enum Cmd {
     Volume(u8),
     Shuffle(bool),
     Repeat(&'static str),
-    Queue { uri: String, name: String },
+    /// Adds a song to Spotify's queue (`quiet`: no message, spotlite's queue handed it on).
+    Queue { uri: String, name: String, quiet: bool },
+    /// Adds a song to Spotify's queue and skips to it (next with spotlite's queue).
+    QueueNext { uri: String },
+    /// Songs for the queue view's add picker.
+    QueueSearch(String),
     CheckSaved(String),
     SetSaved { uri: String, saved: bool },
     /// What plays next (for the stage column's "Up next").
@@ -122,6 +127,8 @@ pub enum Msg {
     Added { playlist_id: String, text: String },
     /// The songs that play next, in order (up to 20).
     UpNext(Vec<Track>),
+    /// Songs found for the queue view's add picker.
+    QueueFound { query: String, found: Vec<Track> },
     /// Every Liked Song, newest first (from the saved copy, brought up to date).
     Liked(Vec<Track>),
     /// A true shuffle started: these songs play for `context`.
@@ -182,6 +189,7 @@ fn control_lane(cmd: &Cmd) -> bool {
             | Cmd::Shuffle(_)
             | Cmd::Repeat(_)
             | Cmd::Queue { .. }
+            | Cmd::QueueNext { .. }
             | Cmd::CheckSaved(_)
             | Cmd::SetSaved { .. }
             | Cmd::SetSavedMany { .. }
@@ -402,7 +410,7 @@ impl Worker {
                 // Init ends with the first player state, like a poll.
                 Cmd::Poll | Cmd::Init => Kind::Poll,
                 Cmd::Volume(_) => Kind::Volume,
-                Cmd::Sample { .. } | Cmd::Unsample { .. } | Cmd::Resume(_) | Cmd::Play(_) | Cmd::PlayAt(..) | Cmd::PlayShuffled { .. } | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
+                Cmd::Sample { .. } | Cmd::Unsample { .. } | Cmd::Resume(_) | Cmd::Play(_) | Cmd::PlayAt(..) | Cmd::PlayShuffled { .. } | Cmd::PlayLiked { .. } | Cmd::Toggle | Cmd::Next | Cmd::QueueNext { .. } | Cmd::Prev | Cmd::Seek(_) => Kind::Player,
                 _ => Kind::Other,
             };
             let list = match &cmd {
@@ -491,7 +499,7 @@ impl Worker {
             Cmd::Poll => self.poll(),
             Cmd::FindDevice => self.find_device().map(|_| ()),
             Cmd::Load { list, offset } => self.load(list, offset),
-            Cmd::Play(play) => self.player(|api, dev| api.play(dev, Some(&play))),
+            Cmd::Play(play) => self.start(&play, 0),
             Cmd::PlayLiked { from } => {
                 let user = match self.user() {
                     Some(u) => u,
@@ -503,7 +511,7 @@ impl Worker {
                 };
                 self.player(|api, dev| api.play(dev, Some(&play)))
             }
-            Cmd::PlayAt(play, ms) => self.player(|api, dev| api.play_at(dev, Some(&play), ms)),
+            Cmd::PlayAt(play, ms) => self.start(&play, ms),
             Cmd::PlayShuffled { context, from, position_ms } => self.play_shuffled(context, from, position_ms),
             Cmd::Toggle => {
                 let playing = self.last.as_ref().is_some_and(|pb| pb.is_playing);
@@ -542,7 +550,7 @@ impl Worker {
                     Some(uri) => Play::Context { uri: uri.clone(), from: Some(sp.track.clone()) },
                     None => Play::Tracks { uris: vec![sp.track.clone()], offset: 0 },
                 };
-                self.player(|api, dev| api.play_at(dev, Some(&play), sp.position_ms))?;
+                self.start(&play, sp.position_ms)?;
                 // Shuffle, repeat and volume after play: they need an active device. Spotify's
                 // own shuffle stays off: spotlite shuffles itself.
                 let _ = self.player(|api, dev| api.set_shuffle(dev, false));
@@ -562,9 +570,20 @@ impl Worker {
                 self.send(Msg::UpNext(next));
                 Ok(())
             }
-            Cmd::Queue { uri, name } => {
+            Cmd::QueueSearch(query) => {
+                let found = self.api.search_tracks(&query, 0)?.items;
+                self.send(Msg::QueueFound { query, found });
+                Ok(())
+            }
+            Cmd::QueueNext { uri } => {
                 self.player(|api, dev| api.queue(dev, &uri))?;
-                self.send(Msg::Info(format!("Added to queue: {name}")));
+                self.player(|api, dev| api.next(dev))
+            }
+            Cmd::Queue { uri, name, quiet } => {
+                self.player(|api, dev| api.queue(dev, &uri))?;
+                if !quiet {
+                    self.send(Msg::Info(format!("Added to queue: {name}")));
+                }
                 if let Ok(next) = self.api.up_next() {
                     self.send(Msg::UpNext(next));
                 }
@@ -724,7 +743,7 @@ impl Worker {
                         Some(uri) => Play::Context { uri, from: Some(r.track) },
                         None => Play::Tracks { uris: vec![r.track], offset: 0 },
                     };
-                    self.player(|api, dev| api.play_at(dev, Some(&play), r.position_ms))?;
+                    self.start(&play, r.position_ms)?;
                     if !r.playing {
                         self.player(|api, dev| api.pause(dev))?;
                     }
@@ -816,7 +835,7 @@ impl Worker {
         // 20% in: past the intro, and 10 s from the end at least.
         let position_ms = (track.duration_ms / 5).min(track.duration_ms.saturating_sub(12_000));
         let play = Play::Tracks { uris: vec![track.uri.clone()], offset: 0 };
-        self.player(|api, dev| api.play_at(dev, Some(&play), position_ms))?;
+        self.start(&play, position_ms)?;
         Ok(track)
     }
 
@@ -896,7 +915,15 @@ impl Worker {
         // Only keep the position when the song it is for comes first.
         let position_ms = if from.as_deref() == uris.first().map(String::as_str) { position_ms } else { 0 };
         let play = Play::Tracks { uris: uris.clone(), offset: 0 };
-        self.player(|api, dev| api.play_at(dev, Some(&play), position_ms))?;
+        match self.player(|api, dev| api.play_at(dev, Some(&play), position_ms)) {
+            Err(e) if refused_list(&e) => {
+                // spotifyd refuses song lists: play the context with Spotify's own shuffle.
+                let _ = self.player(|api, dev| api.set_shuffle(dev, true));
+                let play = Play::Context { uri: context, from };
+                return self.player(|api, dev| api.play_at(dev, Some(&play), position_ms)).map_err(|_| e);
+            }
+            other => other?,
+        }
         self.send(Msg::Shuffled { context, uris });
         Ok(())
     }
@@ -962,6 +989,27 @@ impl Worker {
     /// Runs a player command on our device. If Spotify says the device is gone
     /// (e.g. spotifyd restarted), looks it up again and retries once. The UI asks for the new
     /// state itself, so the thread is free for the next command at once.
+    /// Starts `play`. Some players (spotifyd 0.4) refuse a list of songs with 403
+    /// "Restriction violated", as their librespot finds no context for it. Then the song plays
+    /// in its album, from that song, and a message says so.
+    fn start(&mut self, play: &Play, position_ms: u64) -> Result<()> {
+        let err = match self.player(|api, dev| api.play_at(dev, Some(play), position_ms)) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let Play::Tracks { uris, offset } = play else { return Err(err) };
+        let Some(uri) = uris.get(*offset).filter(|_| refused_list(&err)) else { return Err(err) };
+        let Some(id) = uri.strip_prefix("spotify:track:") else { return Err(err) };
+        let Some(album) = self.api.track(id).ok().and_then(|t| t.album).and_then(|a| a.uri) else { return Err(err) };
+        let instead = Play::Context { uri: album, from: Some(uri.clone()) };
+        if self.player(|api, dev| api.play_at(dev, Some(&instead), position_ms)).is_err() {
+            return Err(err);
+        }
+        let player = crate::engine::name();
+        self.send(Msg::Info(format!("{player} refused the song list: the song plays in its album")));
+        Ok(())
+    }
+
     fn player(&mut self, mut f: impl FnMut(&mut Spotify, Option<&str>) -> Result<()>) -> Result<()> {
         let dev = self.require_device()?;
         match f(&mut self.api, Some(&dev)) {
@@ -1308,6 +1356,11 @@ where
             Ok(page)
         }
     }
+}
+
+/// True for the refusal some players give to a list of songs (see `Worker::start`).
+fn refused_list(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref::<ApiError>(), Some(ApiError::Forbidden))
 }
 
 #[cfg(test)]

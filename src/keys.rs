@@ -62,6 +62,12 @@ pub enum Act {
     Mark,
     MarkAll,
     Undo,
+    // Queue
+    QueueView,
+    QueueUp,
+    QueueDown,
+    QueueShuffle,
+    QueueClear,
     // Other
     Filters,
     Discover,
@@ -70,6 +76,7 @@ pub enum Act {
     Visualizer,
     SideEffect,
     Reload,
+    PlayerLog,
     Help,
     Quit,
     QuitStop,
@@ -89,7 +96,7 @@ const fn i(act: Act, name: &'static str, section: &'static str, help: &'static s
 }
 
 /// Help sections, in the order they show.
-pub const SECTIONS: [&str; 5] = ["Move", "Play", "Song", "Sidebar", "Other"];
+pub const SECTIONS: [&str; 6] = ["Move", "Play", "Song", "Queue", "Sidebar", "Other"];
 
 pub const ALL: &[Info] = &[
     i(Act::Down, "down", "Move", "move down", &["j", "down"]),
@@ -126,18 +133,23 @@ pub const ALL: &[Info] = &[
     i(Act::Mute, "mute", "Play", "mute / unmute", &["m"]),
     i(Act::Devices, "devices", "Play", "play on another device", &["y"]),
     i(Act::Actions, "actions", "Song", "all actions (or right-click)", &["."]),
-    i(Act::Queue, "queue", "Song", "add to the queue", &["a"]),
+    i(Act::Queue, "queue", "Song", "add to the queue (in the queue: search to add)", &["a"]),
     i(Act::Artist, "artist", "Song", "go to the artist", &["i"]),
     i(Act::Album, "album", "Song", "go to the album", &["b"]),
     i(Act::Radio, "radio", "Song", "song radio (or the artist's)", &["o"]),
     i(Act::Randomize, "randomize", "Song", "50 random songs of a genre", &["z"]),
     i(Act::AddToPlaylist, "add_to_playlist", "Song", "add to a playlist", &["e"]),
     i(Act::AddAgain, "add_again", "Song", "add to the last playlist again", &["E"]),
-    i(Act::Remove, "remove", "Song", "remove from this playlist", &["D"]),
+    i(Act::Remove, "remove", "Song", "remove from this playlist or the queue", &["D"]),
     i(Act::Like, "like", "Song", "like / unlike", &["f"]),
     i(Act::Mark, "mark", "Song", "mark (act on all marked)", &["w"]),
     i(Act::MarkAll, "mark_all", "Song", "mark all, or none", &["W"]),
     i(Act::Undo, "undo", "Song", "undo the last change", &["u"]),
+    i(Act::QueueView, "queue_view", "Queue", "show the queue, or close it", &["A"]),
+    i(Act::QueueUp, "queue_up", "Queue", "in the queue: move the song up", &["ctrl-up", "{"]),
+    i(Act::QueueDown, "queue_down", "Queue", "in the queue: move the song down", &["ctrl-down", "}"]),
+    i(Act::QueueShuffle, "queue_shuffle", "Queue", "in the queue: shuffle it", &["Z"]),
+    i(Act::QueueClear, "queue_clear", "Queue", "in the queue: empty it", &[]),
     i(Act::Sidebar, "sidebar", "Sidebar", "open, focus, close the sidebar", &["\\", "ctrl-b"]),
     i(Act::SidePlaying, "side_playing", "Sidebar", "sidebar: now playing", &["<"]),
     i(Act::SideLibrary, "side_library", "Sidebar", "sidebar: library", &[">"]),
@@ -150,6 +162,7 @@ pub const ALL: &[Info] = &[
     i(Act::Visualizer, "visualizer", "Other", "sound visualizer", &["v"]),
     i(Act::SideEffect, "side_effect", "Other", "sidebar effect", &["V"]),
     i(Act::Reload, "reload", "Other", "load again from Spotify", &["R"]),
+    i(Act::PlayerLog, "player_log", "Other", "the player's log (or click the device)", &["J"]),
     i(Act::Help, "help", "Other", "these keys", &["?"]),
     i(Act::Quit, "quit", "Other", "quit (music keeps playing)", &["q"]),
     i(Act::QuitStop, "quit_stop", "Other", "quit and stop the player (spotifyd)", &["Q"]),

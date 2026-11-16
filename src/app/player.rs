@@ -78,7 +78,10 @@ impl App {
         }
         // Back, after the first seconds, starts the same song again (Spotify does so).
         let restart = !next && self.progress_ms() > 3000;
-        let up_next = if next { self.up_next.clone() } else { None };
+        // The queue's first song, when Spotify does not have it yet: it goes to Spotify with
+        // the skip.
+        let hand = if next { self.user_queue.to_hand().cloned() } else { None };
+        let up_next = if next { self.next_song().cloned() } else { None };
         if let Some(pb) = self.playback.as_mut() {
             pb.progress_ms = Some(0);
         }
@@ -90,6 +93,12 @@ impl App {
             // The next song shows at once when spotlite knows it; either way polls come fast
             // until Spotify shows the change.
             self.expect_switch(up_next, true);
+        }
+        if let Some(t) = hand {
+            self.user_queue.mark_handed();
+            self.send(Cmd::QueueNext { uri: t.uri });
+            self.poll_soon();
+            return;
         }
         self.player(if next { Ctl::Next } else { Ctl::Prev });
     }
@@ -172,7 +181,8 @@ impl App {
             let full = self
                 .up_next
                 .iter()
-                .chain(self.queue.iter())
+                .chain(self.spotify_next.iter())
+                .chain(self.user_queue.items().iter())
                 .find(|t| t.uri == track.uri)
                 .cloned()
                 .or_else(|| self.find_track(&track.uri));
@@ -476,6 +486,7 @@ impl App {
         // The song that starts, shown at once.
         let first = self.selected_track();
         match self.view() {
+            View::Queue => self.queue_play_now(),
             View::Album | View::Liked | View::Playlist if self.tracks().is_some_and(|l| l.reshaped()) => {
                 // Filtered or sorted: the songs play as they show.
                 let Some(l) = self.tracks() else { return };
@@ -596,12 +607,7 @@ impl App {
     pub(super) fn queue_selected(&mut self) {
         let Some(t) = self.tracks().and_then(|l| l.current()).cloned() else { return };
         let songs = self.chosen(t);
-        for t in &songs {
-            self.send(Cmd::Queue { uri: t.uri.clone(), name: t.name.clone() });
-        }
-        if songs.len() > 1 {
-            self.info(format!("Adding {} songs to the queue", songs.len()));
-        }
+        self.add_to_queue(songs);
         self.marks.clear();
     }
 
@@ -662,14 +668,15 @@ impl App {
     /// A new song plays: "up next" moves on through the list Spotify gave, and asks again only
     /// when the list runs out or the song is not the one it said.
     pub(super) fn song_changed(&mut self, uri: &str) {
+        self.user_queue.on_song(uri);
         let was_next = self.up_next.as_ref().is_some_and(|t| t.uri == uri);
         if was_next {
-            self.up_next = self.queue.pop_front();
+            self.up_next = self.spotify_next.pop_front();
             if self.up_next.is_some() {
                 return;
             }
         }
-        self.queue.clear();
+        self.spotify_next.clear();
         self.up_next = None;
         self.send(Cmd::UpNext);
     }

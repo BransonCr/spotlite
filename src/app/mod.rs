@@ -26,12 +26,15 @@ mod menus;
 mod mouse;
 mod nav;
 mod player;
+mod playerlog;
+mod queue;
 mod search;
 mod side;
 #[cfg(test)]
 mod tests;
 
 pub use lists::{Change, Listing, Shape, Viewable};
+pub use playerlog::PlayerLog;
 #[cfg(test)]
 use lists::SortBy;
 
@@ -165,6 +168,8 @@ pub enum View {
     Radio,
     /// Randomize: random songs of one genre.
     Random,
+    /// spotlite's queue (`A`), over the tab.
+    Queue,
 }
 
 /// What a menu entry does.
@@ -172,6 +177,9 @@ pub enum View {
 pub enum Action {
     Play,
     Queue,
+    /// In the queue view: the song goes first, or leaves the queue.
+    QueueTop,
+    QueueRemove,
     Artist { id: String, name: String },
     Album(Album),
     Radio,
@@ -244,6 +252,18 @@ pub struct Picker {
     pub cursor: usize,
 }
 
+/// The queue view's add picker (`a`): type a search, Enter runs it; then Enter adds the
+/// song under the cursor at the end of the queue.
+#[derive(Default)]
+pub struct QueueAdd {
+    pub query: Input,
+    /// The query the results are for (typing again searches again on Enter).
+    pub searched: String,
+    pub found: Vec<Track>,
+    pub cursor: usize,
+    pub loading: bool,
+}
+
 /// A yes/no question before a change that cannot be undone from spotlite.
 pub struct Confirm {
     pub text: String,
@@ -254,6 +274,8 @@ pub struct Confirm {
 #[derive(Default, Debug)]
 pub struct Hits {
     pub tabs: Vec<(Rect, Loc)>,
+    /// The device dot and name at the top right: a click opens the player's log.
+    pub device: Rect,
     /// Song / artist / album / playlist switches in the search results title.
     pub search_kinds: Vec<(Rect, SearchKind)>,
     pub search_box: Rect,
@@ -336,6 +358,8 @@ enum Drag {
     Volume,
     /// The list's scrollbar.
     Scroll,
+    /// A row of the queue view, from its place to where it would go.
+    QueueRow { from: usize, to: usize },
 }
 
 /// 0.0 at the left edge of `r`, 1.0 at the right edge.
@@ -379,6 +403,8 @@ pub struct App {
     /// Messages that wait for an error to have been read.
     toasts: std::collections::VecDeque<Toast>,
     pub help: bool,
+    /// The player's log, open over everything (J, or a click on the device).
+    pub player_log: Option<PlayerLog>,
     /// The filter typed in help, and how far help is scrolled.
     pub help_query: Input,
     pub help_scroll: usize,
@@ -471,7 +497,13 @@ pub struct App {
     pub up_next: Option<Track>,
     /// The songs after `up_next`, as Spotify listed them: a song change takes the next from
     /// here instead of asking again.
-    queue: std::collections::VecDeque<Track>,
+    pub spotify_next: std::collections::VecDeque<Track>,
+    /// spotlite's own queue (`a`, the queue view `A`): Spotify gets one song of it at a time.
+    pub user_queue: crate::queue::Queue,
+    /// The queue view is shown over the tab (`A`).
+    pub queue_open: bool,
+    /// The add picker of the queue view: a search, and the songs found.
+    pub queue_add: Option<QueueAdd>,
     /// Spotify cannot be reached: the header says so, and the poll waits longer.
     pub offline: bool,
     /// The playlists shown came from the saved copy: the first page is asked for again.
@@ -564,6 +596,7 @@ impl App {
             toast: None,
             toasts: Default::default(),
             help: false,
+            player_log: None,
             help_query: Input::default(),
             help_scroll: 0,
             keys: Keys::default(),
@@ -621,7 +654,10 @@ impl App {
             picker: None,
             palette: None,
             up_next: None,
-            queue: Default::default(),
+            spotify_next: Default::default(),
+            user_queue: if cfg!(test) { Default::default() } else { crate::queue::Queue::load() },
+            queue_open: false,
+            queue_add: None,
             offline: false,
             playlists_stale: false,
             filtering: false,
@@ -724,6 +760,9 @@ impl App {
     }
 
     pub fn view(&self) -> View {
+        if self.queue_open {
+            return View::Queue;
+        }
         match self.page() {
             Some(Page::Artist(_)) => return View::Artist,
             Some(Page::Album(_)) => return View::Album,
@@ -746,6 +785,7 @@ impl App {
             (View::Album, Some(Page::Album(a))) => Some(&a.tracks),
             (View::Radio, Some(Page::Radio(r))) => Some(&r.tracks),
             (View::Random, Some(Page::Random(r))) => Some(&r.tracks),
+            (View::Queue, _) => Some(&self.user_queue.list),
             (View::Search, _) if self.search_kind == SearchKind::Songs => Some(&self.search),
             (View::Liked, _) => Some(&self.liked),
             (View::Recent, _) => Some(&self.recent),
@@ -756,6 +796,7 @@ impl App {
 
     pub fn tracks_mut(&mut self) -> Option<&mut Listing<Track>> {
         match self.view() {
+            View::Queue => Some(&mut self.user_queue.list),
             View::Search if self.search_kind == SearchKind::Songs => Some(&mut self.search),
             View::Search => None,
             View::Liked => Some(&mut self.liked),
@@ -778,6 +819,9 @@ impl App {
     }
 
     fn artist_page_mut(&mut self) -> Option<&mut ArtistPage> {
+        if self.queue_open {
+            return None;
+        }
         match self.page_mut() {
             Some(Page::Artist(a)) => Some(a),
             _ => None,
@@ -786,7 +830,7 @@ impl App {
 
     /// The track under the cursor, in any view that lists tracks.
     pub fn selected_track(&self) -> Option<Track> {
-        if let Some(Page::Artist(a)) = self.page() {
+        if let Some(Page::Artist(a)) = self.page().filter(|_| !self.queue_open) {
             return match a.rows.current()? {
                 ArtistRow::Track(t) => Some(t.clone()),
                 _ => None,
@@ -841,6 +885,7 @@ impl App {
             let from = self.playing_uri().map(str::to_owned);
             self.switch = Some(Switch { from, want: None, at: now, len: SWITCH_HOLD });
         }
+        self.hand_off();
         if !self.vol_in_flight {
             if let Some(v) = self.vol_target.take() {
                 self.vol_in_flight = true;
@@ -921,7 +966,7 @@ impl App {
                 Some(Page::Album(a)) => a.tracks.wants_page().map(|off| (List::Album(a.id.clone()), off)),
                 _ => None,
             },
-            View::Artist | View::Radio | View::Random => None,
+            View::Artist | View::Radio | View::Random | View::Queue => None,
         };
         // The playlist picker lists every playlist, so it needs them all.
         let request = request.or_else(|| {
@@ -1276,9 +1321,10 @@ impl App {
                 }
                 self.open_cache.retain(|o| o.playlist.id != playlist_id);
             }
+            Msg::QueueFound { query, found } => self.on_queue_found(query, found),
             Msg::UpNext(next) => {
-                self.queue = next.into();
-                self.up_next = self.queue.pop_front();
+                self.spotify_next = next.into();
+                self.up_next = self.spotify_next.pop_front();
             }
             Msg::Liked(songs) => {
                 // Shown at once, with the selection kept where it was.

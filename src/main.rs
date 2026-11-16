@@ -18,6 +18,7 @@ mod aura;
 mod log;
 mod login;
 mod pages;
+mod queue;
 mod palette;
 mod platform;
 mod card;

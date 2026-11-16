@@ -110,3 +110,43 @@ fn spotifyd_stream() -> Option<u32> {
 pub fn credentials_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("spotifyd"))
 }
+
+/// spotifyd's last `max` log lines, from the systemd journal.
+pub fn log_tail(max: usize) -> (String, Result<Vec<String>, String>) {
+    let source = "journalctl --user -u spotifyd".to_owned();
+    let out = Command::new("journalctl")
+        .args(["--user", "-u", "spotifyd", "--no-pager", "-o", "short", "-n", &max.to_string()])
+        .stdin(Stdio::null())
+        .output();
+    let lines = match out {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).lines().map(tidy_journal).collect()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_owned()),
+        Err(e) => Err(format!("journalctl: {e}")),
+    };
+    (source, lines)
+}
+
+/// A journal line without the host and process name: "Nov 13 10:56:38 host spotifyd[23279]:
+/// [INFO] text" becomes "Nov 13 10:56:38  [INFO] text". Other lines stay as they are.
+fn tidy_journal(line: &str) -> String {
+    let Some(time) = line.get(..15).filter(|t| t.as_bytes().get(12) == Some(&b':')) else { return line.to_owned() };
+    match line[15..].split_once("]: ") {
+        Some((_, text)) => format!("{time}  {text}"),
+        None => line.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tidy_journal;
+
+    #[test]
+    fn journal_lines_lose_host_and_process() {
+        assert_eq!(
+            tidy_journal("Nov 13 10:56:38 archbox spotifyd[23279]: [INFO] Loading <Sonne>"),
+            "Nov 13 10:56:38  [INFO] Loading <Sonne>"
+        );
+        assert_eq!(tidy_journal("-- No entries --"), "-- No entries --");
+        assert_eq!(tidy_journal(""), "");
+    }
+}

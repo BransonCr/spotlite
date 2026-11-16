@@ -362,6 +362,8 @@ pub enum Change {
     Liked { uris: Vec<String>, saved: bool },
     /// A pin taken off the sidebar, and its place.
     Unpinned(Box<Pin>, usize),
+    /// The queue before an edit.
+    Queue(Vec<Track>),
 }
 
 
@@ -388,7 +390,8 @@ impl App {
     /// The list shown, for its filter and sort.
     pub fn shape_mut(&mut self) -> Option<&mut dyn Shape> {
         match self.view() {
-            View::Artist => None,
+            // The queue's order is what plays: no filter or sort over it.
+            View::Artist | View::Queue => None,
             View::Playlists if self.foldered() => Some(&mut self.rows),
             View::Playlists => Some(&mut self.playlists),
             View::Search if self.search_kind != SearchKind::Songs => Some(&mut self.found),
@@ -600,6 +603,10 @@ impl App {
             Change::Unpinned(pin, at) => {
                 self.info(format!("Pinned {} again", pin.name()));
                 self.pins.insert(at.min(self.pins.len()), *pin);
+            }
+            Change::Queue(items) => {
+                self.user_queue.restore(items);
+                self.info("Queue as it was");
             }
         }
     }

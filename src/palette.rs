@@ -52,6 +52,12 @@ pub fn entries(app: &App) -> Vec<Entry> {
             add("Roll again (50 new random songs)", Act::Discover);
             add("Save these songs as a playlist", Act::Save);
         }
+        View::Queue => {
+            add("Add songs to the queue (search)", Act::Queue);
+            add("Shuffle the queue", Act::QueueShuffle);
+            add("Empty the queue", Act::QueueClear);
+            add("Close the queue", Act::QueueView);
+        }
         View::Artist => add("Next section", Act::NextSection),
         View::Album | View::Playlist | View::Playlists => add("Play all", Act::PlayAll),
         View::Search => {
@@ -63,11 +69,13 @@ pub fn entries(app: &App) -> Vec<Entry> {
             };
             add(&format!("Search results: show {next}"), Act::SearchType);
         }
-        _ => {}
+        _ => add("Show the queue", Act::QueueView),
     }
     if app.selected_track().is_some() {
         add("Song actions…", Act::Actions);
-        add("Add the song to the queue", Act::Queue);
+        if view != View::Queue {
+            add("Add the song to the queue", Act::Queue);
+        }
         add("Go to the song's artist", Act::Artist);
         add("Go to the song's album", Act::Album);
         add("Song radio", Act::Radio);
@@ -116,6 +124,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
     add("Sound visualizer on / off", Act::Visualizer);
     add("Randomize a genre…", Act::Randomize);
     add("Reload the list", Act::Reload);
+    add("The player's log", Act::PlayerLog);
     add("Help: all keys", Act::Help);
     add("Quit (music keeps playing)", Act::Quit);
     add("Quit and stop the player (spotifyd)", Act::QuitStop);

@@ -160,6 +160,12 @@ pub fn ensure_login(again: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The engine's last `max` log lines (oldest first), and where they come from. Err: why the
+/// log cannot be read.
+pub fn log_tail(max: usize) -> (String, Result<Vec<String>, String>) {
+    pick!(builtin::log_tail(max), spotifyd::log_tail(max))
+}
+
 /// The engine's name in messages.
 pub fn name() -> &'static str {
     pick!("spotlite's player", "spotifyd")
