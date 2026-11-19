@@ -44,6 +44,11 @@
 - A drag of the progress bar, the volume or the scrollbar always ends when you let go, also
   over the sidebar or outside the window (before, the progress bar could freeze).
 
+### New playlists
+- Add to playlist (`e`) can make a new playlist: type a name no playlist has and press
+  Enter, or choose the last row. The song (or the marked songs) goes in it.
+- `N`, or the `+ new playlist` button in the Playlists tab, makes an empty playlist.
+
 ## 0.2.0
 
 ### Find and act faster

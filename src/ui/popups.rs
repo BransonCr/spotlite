@@ -201,7 +201,8 @@ pub(super) fn draw_sample(f: &mut Frame, app: &mut App, picker: Rect) {
     }
 }
 
-/// The playlist picker (Add to playlist): a filter line, then your playlists, each with its cover.
+/// The playlist picker (Add to playlist): a filter line, then your playlists, each with its
+/// cover, then a row that makes a new playlist (named by the filter text).
 pub(super) fn draw_picker(f: &mut Frame, app: &mut App) {
     let choices: Vec<(String, Vec<ImageRef>, Option<usize>)> =
         app.picker_choices().iter().map(|p| (p.name.clone(), p.images.clone(), p.track_count())).collect();
@@ -221,19 +222,20 @@ pub(super) fn draw_picker(f: &mut Frame, app: &mut App) {
         query,
     );
     f.set_cursor_position(Position::new(query.x + 2 + picker.query.cursor_cols(), query.y));
-    if choices.is_empty() {
-        let msg = if loading { "Loading your playlists…" } else { "No playlist of yours matches." };
-        f.render_widget(Span::styled(msg, theme::faint()), list);
+    if choices.is_empty() && loading {
+        f.render_widget(Span::styled("Loading your playlists…", theme::faint()), list);
         return;
     }
-    let cursor = picker.cursor.min(choices.len() - 1);
+    let typed = picker.query.trim().to_owned();
+    let len = choices.len() + 1;
+    let cursor = picker.cursor.min(len - 1);
     let rows = (list.height / PLAYLIST_ROW).max(1) as usize;
     let start = cursor.saturating_sub(rows - 1);
     // Marker, then the cover, then the name over the song count.
     let thumb = app.images.square_cols(PLAYLIST_ROW);
     let text_x = list.x + 2 + thumb + 1;
     let text_w = list.right().saturating_sub(text_x) as usize;
-    for (n, (i, (name, images, count))) in choices.iter().enumerate().skip(start).take(rows).enumerate() {
+    for (n, i) in (start..len).take(rows).enumerate() {
         let row = Rect::new(list.x, list.y + n as u16 * PLAYLIST_ROW, list.width, PLAYLIST_ROW);
         if row.bottom() > list.bottom() {
             break;
@@ -242,18 +244,62 @@ pub(super) fn draw_picker(f: &mut Frame, app: &mut App) {
         let style = if selected { Style::new().bg(theme::c().selected).fg(theme::c().bright).add_modifier(Modifier::BOLD) } else { theme::text() };
         let marker = Span::styled(if selected { theme::c().marker.to_string() } else { " ".into() }, theme::accent());
         f.render_widget(Paragraph::new(vec![Line::from(marker.clone()), Line::from(marker)]).style(style), row);
-        let count = count.map(|n| format!("{n} tracks")).unwrap_or_default();
         let text = Rect::new(text_x, row.y, text_w as u16, PLAYLIST_ROW);
+        let cover = Rect::new(list.x + 2, row.y, thumb, PLAYLIST_ROW);
+        let (name, sub) = match choices.get(i) {
+            Some((name, images, count)) => {
+                draw_cover(f, &mut app.images, images, cover);
+                (name.clone(), count.map(|n| format!("{n} tracks")).unwrap_or_default())
+            }
+            None => {
+                let mid = Rect::new(cover.x + cover.width.saturating_sub(1) / 2, cover.y, 1, 1);
+                f.render_widget(Span::styled("+", theme::accent()), mid);
+                if typed.is_empty() {
+                    ("New playlist…".to_owned(), "type a name above, or choose this".to_owned())
+                } else {
+                    (format!("New playlist “{typed}”"), "make it and add the song".to_owned())
+                }
+            }
+        };
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled(fit(name, text_w), style)),
-                Line::from(Span::styled(fit(&count, text_w), theme::faint())),
+                Line::from(Span::styled(fit(&name, text_w), style)),
+                Line::from(Span::styled(fit(&sub, text_w), theme::faint())),
             ]),
             text,
         );
-        draw_cover(f, &mut app.images, images, Rect::new(list.x + 2, row.y, thumb, PLAYLIST_ROW));
         app.hits.popup_rows.push((row, i));
     }
+}
+
+/// Asks for the name of a new playlist.
+pub(super) fn draw_naming(f: &mut Frame, app: &mut App) {
+    let Some(naming) = app.naming.as_ref() else { return };
+    let area = popup_area(f, 50, 7);
+    let title = match naming.uris.len() {
+        0 => "New playlist".to_owned(),
+        1 => "New playlist with 1 song".to_owned(),
+        n => format!("New playlist with {n} songs"),
+    };
+    let block = popup_block(title);
+    let inner = block.inner(area).inner(Margin::new(0, 1));
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    app.hits.popup = area;
+    let [name, _, buttons] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    let line = if naming.name.is_empty() {
+        Line::from(vec![Span::styled("name ", theme::accent()), Span::styled("type a name", theme::faint())])
+    } else {
+        Line::from(vec![Span::styled("name ", theme::accent()), Span::styled(naming.name.to_string(), theme::text())])
+    };
+    f.render_widget(line, name);
+    f.set_cursor_position(Position::new(name.x + 5 + naming.name.cursor_cols(), name.y));
+    let make = span_rect(buttons, buttons.x, 10);
+    let cancel = span_rect(buttons, buttons.x + 13, 14);
+    f.render_widget(Span::styled(" ⏎  Make ", theme::accent().add_modifier(Modifier::BOLD)), make);
+    f.render_widget(Span::styled(" esc  Cancel ", theme::muted()), cancel);
+    app.hits.popup_rows.push((make, 0));
+    app.hits.popup_rows.push((cancel, 1));
 }
 
 /// The command palette: a filter line, then the matching actions with their keys.

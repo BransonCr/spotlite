@@ -161,6 +161,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let popup = app.menu.is_some()
         || app.genre_picker.is_some()
         || app.picker.is_some()
+        || app.naming.is_some()
         || app.queue_add.is_some()
         || app.confirm.is_some()
         || app.palette.is_some()
@@ -181,6 +182,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_menu(f, app);
     } else if app.genre_picker.is_some() {
         draw_genre_picker(f, app);
+    } else if app.naming.is_some() {
+        draw_naming(f, app);
     } else if app.picker.is_some() {
         draw_picker(f, app);
     } else if app.queue_add.is_some() {

@@ -90,6 +90,7 @@ selected song, so you do not need to remember the keys below.
 | `d` | Discover: new songs outside your taste (on a radio page; again for a new round) |
 | `S` | Save the radio list on screen as a new playlist (asks first) |
 | `e` / `E` | Add the selected song to one of your playlists / to the last one again |
+| `N` | Make a new, empty playlist (it asks for a name) |
 | `D` | Remove the selected song from the open playlist (`u` puts it back) |
 | `Ctrl+F` | Filter the list as you type (Esc clears it) |
 | `,` / `;` | Sort the list by title, artist, album, time / turn the sort round |
@@ -208,7 +209,9 @@ quits or its window closes.
   you logged in with an older spotlite, run `spotlite auth` again (without them, discover
   knows Liked Songs only).
 - **Playlists**: `e` adds a song to one of your playlists (type to narrow the list);
-  `D` removes it from the open playlist. These need the `playlist-modify-*` permissions:
+  the last row of that list makes a new playlist with the song, named by what you typed.
+  `N` or `+ new playlist` in the Playlists tab makes an empty one.
+  `D` removes a song from the open playlist. These need the `playlist-modify-*` permissions:
   if you logged in with an older spotlite, run `spotlite auth` again.
 
 ### Mouse

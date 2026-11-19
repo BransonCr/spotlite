@@ -288,12 +288,60 @@ impl App {
         list
     }
 
+    /// Chooses the picker row under the cursor. The row after the playlists makes a new
+    /// playlist: with the typed text as its name, or it asks for a name.
     pub(super) fn pick_playlist(&mut self) {
         let Some(picker) = self.picker.as_ref() else { return };
-        let Some(pl) = self.picker_choices().get(picker.cursor).map(|p| (*p).clone()) else { return };
+        let chosen = self.picker_choices().get(picker.cursor).map(|p| (*p).clone());
         let track = picker.track.clone();
+        let name = picker.query.trim().to_owned();
         self.picker = None;
-        self.add_to(pl, track);
+        match chosen {
+            Some(pl) => self.add_to(pl, track),
+            None => self.new_playlist(Some(track), name),
+        }
+    }
+
+    /// Makes a new playlist with the chosen songs of `track` (none without one). Without a
+    /// name, it asks for one first.
+    pub(super) fn new_playlist(&mut self, track: Option<Track>, name: String) {
+        if !self.can_edit {
+            self.error("Run `spotlite auth` again to allow editing playlists.");
+            return;
+        }
+        let uris: Vec<String> = track.map(|t| self.chosen(t).into_iter().map(|t| t.uri).collect()).unwrap_or_default();
+        if name.is_empty() {
+            self.naming = Some(Naming { name: Input::default(), uris });
+        } else {
+            self.marks.clear();
+            self.send(Cmd::CreatePlaylist { name, description: String::new(), uris });
+        }
+    }
+
+    /// Enter in the name pop-up: makes the playlist, if it has a name.
+    pub(super) fn finish_naming(&mut self) {
+        let Some(n) = self.naming.as_ref() else { return };
+        let name = n.name.trim().to_owned();
+        if name.is_empty() {
+            self.info("Type a name for the playlist.");
+            return;
+        }
+        let Some(n) = self.naming.take() else { return };
+        self.marks.clear();
+        self.send(Cmd::CreatePlaylist { name, description: String::new(), uris: n.uris });
+    }
+
+    /// Keys in the name pop-up: type the name, Enter makes the playlist, Esc closes.
+    pub(super) fn naming_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.naming = None,
+            KeyCode::Enter => self.finish_naming(),
+            _ => {
+                if let Some(n) = self.naming.as_mut() {
+                    n.name.edit(&key);
+                }
+            }
+        }
     }
 
     pub(super) fn ask_remove(&mut self, track: Track) {
@@ -327,7 +375,8 @@ impl App {
         let len = if let Some(m) = &self.menu {
             m.items.len()
         } else if self.picker.is_some() {
-            self.picker_choices().len()
+            // The playlists, then "new playlist".
+            self.picker_choices().len() + 1
         } else {
             return;
         };

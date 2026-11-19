@@ -252,6 +252,13 @@ pub struct Picker {
     pub cursor: usize,
 }
 
+/// A name for a new playlist (Enter makes it, with `uris` in it).
+pub struct Naming {
+    pub name: Input,
+    /// The songs the new playlist starts with (none from the Playlists tab).
+    pub uris: Vec<String>,
+}
+
 /// The queue view's add picker (`a`): type a search, Enter runs it; then Enter adds the
 /// song under the cursor at the end of the queue.
 #[derive(Default)]
@@ -284,6 +291,8 @@ pub struct Hits {
     pub row_height: u16,
     pub list_offset: usize,
     pub back: Rect,
+    /// "+ new" in the Playlists title: makes a new playlist.
+    pub new_playlist: Rect,
     pub play: Rect,
     pub prev: Rect,
     pub next: Rect,
@@ -494,6 +503,7 @@ pub struct App {
     theme_watch: (Instant, Option<std::time::SystemTime>, Option<std::time::SystemTime>),
     pub menu: Option<Menu>,
     pub picker: Option<Picker>,
+    pub naming: Option<Naming>,
     pub palette: Option<crate::palette::Palette>,
     /// The song after the playing one, when Spotify said.
     pub up_next: Option<Track>,
@@ -655,6 +665,7 @@ impl App {
             theme_watch: (Instant::now(), None, None),
             menu: None,
             picker: None,
+            naming: None,
             palette: None,
             up_next: None,
             spotify_next: Default::default(),
@@ -1341,9 +1352,13 @@ impl App {
                 self.liked.fill(songs);
             }
             Msg::Created(pl) => {
+                let pl_id = pl.id.clone();
                 self.playlists.items.insert(0, *pl);
                 self.playlists.fetched += 1;
                 self.playlists.total = self.playlists.total.map(|t| t + 1);
+                // E adds to the new playlist next.
+                self.recent_playlists.insert(0, pl_id);
+                self.recent_playlists.truncate(20);
                 self.rebuild_rows();
             }
             Msg::Devices(list) => self.open_devices(list),

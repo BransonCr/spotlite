@@ -135,7 +135,13 @@ impl App {
             }
             return;
         }
-        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.palette.is_some() || self.undo.is_some() {
+        if self.menu.is_some()
+            || self.picker.is_some()
+            || self.naming.is_some()
+            || self.confirm.is_some()
+            || self.palette.is_some()
+            || self.undo.is_some()
+        {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     let hit = self.hits.popup_rows.iter().find(|(r, _)| r.contains(pos)).map(|(_, i)| *i);
@@ -162,6 +168,8 @@ impl App {
                             }
                             self.pick_playlist();
                         }
+                        Some(0) if self.naming.is_some() => self.finish_naming(),
+                        Some(_) if self.naming.is_some() => self.naming = None,
                         Some(0) => {
                             if let Some(c) = self.confirm.take() {
                                 self.send(c.cmd);
@@ -171,6 +179,7 @@ impl App {
                             self.close_menu();
                             self.palette = None;
                             self.picker = None;
+                            self.naming = None;
                             self.confirm = None;
                             self.undo = None;
                         }
@@ -253,6 +262,8 @@ impl App {
             self.typing = true;
         } else if h.back.contains(pos) {
             self.back();
+        } else if h.new_playlist.contains(pos) {
+            self.new_playlist(None, String::new());
         } else if h.np_artist.contains(pos) {
             if let Some(t) = self.playback.as_ref().and_then(|p| p.item.clone()) {
                 self.go_to_artist(&t);
@@ -325,6 +336,7 @@ impl App {
     fn popup_open(&self) -> bool {
         self.menu.is_some()
             || self.picker.is_some()
+            || self.naming.is_some()
             || self.queue_add.is_some()
             || self.palette.is_some()
             || self.genre_picker.is_some()
@@ -371,7 +383,7 @@ impl App {
         if let Some(r) = at(h.np_artist) {
             return Some((r, Hot::Link));
         }
-        let controls = [h.time, h.back, h.play, h.prev, h.next, h.shuffle, h.repeat, h.like, h.volume, h.progress];
+        let controls = [h.time, h.back, h.new_playlist, h.play, h.prev, h.next, h.shuffle, h.repeat, h.like, h.volume, h.progress];
         if let Some(r) = controls.into_iter().find(|r| r.contains(pos)) {
             return Some((r, Hot::Control));
         }
