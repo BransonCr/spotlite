@@ -1354,6 +1354,73 @@ fn add_and_remove_with_picker_and_confirm() {
 }
 
 #[test]
+fn the_picker_makes_a_new_playlist_with_the_song() {
+    let (mut app, rx) = test_app();
+    app.on_msg(Msg::User(serde_json::from_value(serde_json::json!({"id": "me", "uri": "spotify:user:me"})).unwrap()));
+    app.on_msg(Msg::Playlists { offset: 0, page: ApiPage { items: vec![pl("p1", "Gym")], raw: 1, total: 1 } });
+    app.tab = Tab::Playlists;
+    app.open = Some(OpenPlaylist { playlist: pl("p1", "Gym"), tracks: Listing::default() });
+    let t = track_by("1", ("a", "A"), ("b", "B"));
+    app.on_msg(Msg::Tracks { list: List::Playlist("p1".into()), offset: 0, page: ApiPage { items: vec![t], raw: 1, total: 1 } });
+    drain(&rx);
+
+    // A name that no playlist has: the only row makes it, with the song in it.
+    app.on_key(KeyEvent::from(KeyCode::Char('e')));
+    for c in "Road trip".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    assert!(app.picker_choices().is_empty());
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert!(app.picker.is_none() && app.naming.is_none());
+    let cmds = drain(&rx);
+    assert!(
+        cmds.iter().any(|c| matches!(c, Cmd::CreatePlaylist { name, uris, .. } if name == "Road trip" && uris == &["spotify:track:1"])),
+        "{cmds:?}"
+    );
+    // The new playlist is the one E adds to next.
+    app.on_msg(Msg::Created(Box::new(pl("p9", "Road trip"))));
+    assert_eq!(app.recent_playlists.first().map(String::as_str), Some("p9"));
+
+    // With no text, the last row asks for a name first.
+    app.on_key(KeyEvent::from(KeyCode::Char('e')));
+    app.move_popup(-1);
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.naming.as_ref().map(|n| n.uris.clone()), Some(vec!["spotify:track:1".to_owned()]));
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert!(app.naming.is_some(), "no name: it stays open");
+    for c in "Mix".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert!(app.naming.is_none());
+    let cmds = drain(&rx);
+    assert!(cmds.iter().any(|c| matches!(c, Cmd::CreatePlaylist { name, uris, .. } if name == "Mix" && uris.len() == 1)), "{cmds:?}");
+}
+
+#[test]
+fn n_makes_an_empty_playlist() {
+    let (mut app, rx) = test_app();
+    app.tab = Tab::Playlists;
+    drain(&rx);
+    app.on_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+    assert!(app.naming.as_ref().is_some_and(|n| n.uris.is_empty()));
+    for c in "Later".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    assert!(app.naming.is_none());
+    assert!(!drain(&rx).iter().any(|c| matches!(c, Cmd::CreatePlaylist { .. })), "esc makes nothing");
+
+    app.on_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+    for c in "Later".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    let cmds = drain(&rx);
+    assert!(cmds.iter().any(|c| matches!(c, Cmd::CreatePlaylist { name, uris, .. } if name == "Later" && uris.is_empty())), "{cmds:?}");
+}
+
+#[test]
 fn mute_and_unmute() {
     let (mut app, rx) = test_app();
     app.on_msg(playing(35, 1000));

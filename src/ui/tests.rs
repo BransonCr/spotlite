@@ -873,8 +873,29 @@ fn the_playlist_picker_shows_a_cover_and_count_per_playlist() {
     let name_x = (0..row.width).find(|&x| rows[jammer].chars().nth((row.x + x) as usize) == Some('J')).unwrap();
     assert_eq!(name_x, 2 + app.images.square_cols(PLAYLIST_ROW) + 1, "{out}");
     let hits: Vec<(u16, usize)> = app.hits.popup_rows.iter().map(|(r, i)| (r.height, *i)).collect();
-    assert_eq!(hits, vec![(PLAYLIST_ROW, 0), (PLAYLIST_ROW, 1)]);
+    assert_eq!(hits, vec![(PLAYLIST_ROW, 0), (PLAYLIST_ROW, 1), (PLAYLIST_ROW, 2)]);
     assert_eq!(app.hits.popup_rows[0].0.y as usize, jammer);
+    // After the playlists: a row that makes a new one, named by the typed text.
+    assert!(rows[jammer + 4].contains("New playlist…"), "{out}");
+    app.picker.as_mut().unwrap().query.set("Road trip");
+    let out = screen(&mut app, 90, 30);
+    assert!(out.contains("New playlist “Road trip”"), "{out}");
+}
+
+#[test]
+fn the_playlists_tab_has_a_new_playlist_button_and_name_popup() {
+    let (mut app, _rx) = test_app();
+    app.tab = crate::app::Tab::Playlists;
+    let out = screen(&mut app, 90, 30);
+    assert!(out.contains("+ new playlist"), "{out}");
+    assert!(app.hits.new_playlist.width > 0);
+    app.can_edit = true;
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let b = app.hits.new_playlist;
+    app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: b.x + 2, row: b.y, modifiers: KeyModifiers::NONE });
+    assert!(app.naming.is_some());
+    let out = screen(&mut app, 90, 30);
+    assert!(out.contains("New playlist") && out.contains("type a name"), "{out}");
 }
 
 #[test]

@@ -62,6 +62,10 @@ impl App {
             self.queue_add_key(key);
             return;
         }
+        if self.naming.is_some() {
+            self.naming_key(key);
+            return;
+        }
         if self.picker.is_some() {
             match key.code {
                 KeyCode::Esc => self.picker = None,
@@ -171,6 +175,8 @@ impl App {
             p.cursor = 0;
         } else if let Some(p) = self.queue_add.as_mut() {
             p.query.insert(text);
+        } else if let Some(n) = self.naming.as_mut() {
+            n.name.insert(text);
         } else if let Some(p) = self.picker.as_mut() {
             p.query.insert(text);
             p.cursor = 0;
@@ -336,6 +342,7 @@ impl App {
             Act::Save if self.view() == View::Radio => self.ask_save_radio(),
             Act::Save if self.view() == View::Random => self.ask_save_random(),
             Act::Save => {}
+            Act::NewPlaylist => self.new_playlist(None, String::new()),
             Act::Randomize => self.randomize_key(),
             Act::Reload => self.reload(),
             Act::Sidebar => self.toggle_sidebar(),

@@ -90,6 +90,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
     if app.playback.as_ref().is_some_and(|p| p.item.is_some()) {
         add("Share card of the song (picture)", Act::Card);
     }
+    add("Make a new playlist…", Act::NewPlaylist);
     add("Search", Act::Search);
     const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
     for (i, tab) in Tab::ALL.iter().enumerate() {

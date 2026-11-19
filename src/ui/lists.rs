@@ -351,10 +351,15 @@ pub(super) fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
         title.push(Span::styled("› ", theme::faint()));
         title.push(Span::styled(format!("{name} "), if last { theme::bright() } else { theme::muted() }));
     }
-    let title = Line::from(title);
+    let crumbs = Line::from(title.clone()).width() as u16;
     if !path.is_empty() {
-        app.hits.back = span_rect(area, title_x(area), title.width() as u16);
+        app.hits.back = span_rect(area, title_x(area), crumbs);
     }
+    // A button: a click makes a new playlist (as the new-playlist key does).
+    let new = " + new playlist ";
+    app.hits.new_playlist = span_rect(area, title_x(area) + crumbs, new.width() as u16);
+    title.push(Span::styled(new, theme::accent()));
+    let title = Line::from(title);
 
     let images = &mut app.images;
     let (entries, state, label, loading): (Vec<Entry>, &mut TableState, String, bool) = if foldered {

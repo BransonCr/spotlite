@@ -59,7 +59,7 @@ pub enum Cmd {
     Resume(Box<crate::state::SavedPlayback>),
     /// Likes a song, or unlikes it if it is liked (asks Spotify which first).
     ToggleSaved(String),
-    /// A new private playlist with these songs.
+    /// A new private playlist with these songs (maybe none).
     CreatePlaylist { name: String, description: String, uris: Vec<String> },
     /// Saves a share card picture of the song (on its own thread).
     Card(Box<Track>),
@@ -610,7 +610,11 @@ impl Worker {
                 }
                 self.stale.insert(kept::PLAYLISTS.to_owned(), SystemTime::now());
                 self.send(Msg::Created(Box::new(pl)));
-                self.send(Msg::Info(format!("Saved {} songs to the new playlist “{name}”", uris.len())));
+                self.send(Msg::Info(match uris.len() {
+                    0 => format!("Made the new playlist “{name}”"),
+                    1 => format!("Saved 1 song to the new playlist “{name}”"),
+                    n => format!("Saved {n} songs to the new playlist “{name}”"),
+                }));
                 Ok(())
             }
             Cmd::SetSavedMany { uris, saved } => {
