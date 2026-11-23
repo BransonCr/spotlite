@@ -233,6 +233,12 @@ def main():
     ap.add_argument("--settle", type=float, default=2.0, help="seconds to wait after ready before the search")
     ap.add_argument("--json", help="also write every run to this file")
     args = ap.parse_args()
+    # Another spotlite starts its own daemon when the benchmark stops one: the runs then
+    # talk to the wrong daemon.
+    others = subprocess.run(["pgrep", "-ax", "spotlite"], capture_output=True, text=True).stdout.splitlines()
+    others = [o for o in others if not o.rstrip().endswith(" daemon") and "<defunct>" not in o]
+    if others:
+        sys.exit("quit every other spotlite first (Q also stops its player):\n" + "\n".join(others))
     builds = {"base": os.path.abspath(args.base), "new": os.path.abspath(args.new)}
     results = {"base": [], "new": []}
     for i in range(args.runs):
