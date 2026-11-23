@@ -69,6 +69,9 @@ usage:
 
 fn main() -> Result<()> {
     let arg = std::env::args().nth(1);
+    if arg.is_none() {
+        log::mark("start");
+    }
     // The player engine, for every command (a bad `backend` shows in the UI).
     if let Ok(cfg) = Config::load() {
         let _ = engine::init(&cfg);
@@ -378,6 +381,7 @@ fn run_tui() -> Result<()> {
         let mut shown_title = String::new();
         // Something on screen changed by input (or it is the first frame): draw.
         let mut input = true;
+        let mut first_frame = true;
         // The program that started spotlite (the terminal, or a shell in it). If it goes away
         // the terminal is gone too, even when no SIGHUP came (a shell in between does not pass
         // it on): stop, instead of spinning on a dead terminal.
@@ -420,6 +424,12 @@ fn run_tui() -> Result<()> {
             if dirty {
                 draw(&mut terminal, &mut app)?;
                 last_draw = std::time::Instant::now();
+                if std::mem::take(&mut first_frame) {
+                    log::mark("first-frame");
+                }
+                for m in app.drawn_marks.drain(..) {
+                    log::mark(&m);
+                }
                 // The window title follows the song (task bars and window lists show it).
                 let title = app.window_title();
                 if title != shown_title {

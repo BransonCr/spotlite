@@ -127,6 +127,7 @@ impl App {
         self.search_history.insert(0, q.clone());
         self.search_history.truncate(30);
         self.history_at = None;
+        crate::log::mark(&format!("search-go {q}"));
         self.searched = q;
         self.search.reset();
         self.found.reset();
