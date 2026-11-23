@@ -10,6 +10,10 @@
   the background, keeps playing after `q` and stops with `Q`. Fast controls, song changes and
   the visualizer work as with spotifyd, and media keys work through MPRIS on Linux and the
   media flyout on Windows.
+- With the built-in player, songs start much sooner. Plays go to the player itself, not
+  through the Web API. The player loads the next song in the background, so a skip starts
+  at once (about 0.01 s, was 1 to 2.5 s with spotifyd). When the selection rests on a song,
+  that song loads in the background, so Enter starts it in about 0.2 s (was about 3 s).
 - The first run asks for the Client ID and writes `config.toml`.
 - New `config.toml` keys: `backend`, `daemon_port`, `nerd_font` (off by default on Windows).
 

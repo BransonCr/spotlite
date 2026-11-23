@@ -428,6 +428,11 @@ backend = "builtin"     # "spotifyd" (Linux default) or "builtin" (Windows defau
 - Commands, song changes and visualizer audio go over the local socket, about as fast as
   spotifyd over MPRIS. Connections must present the token in
   `~/.local/state/spotlite/daemon.token` (mode 600).
+- Songs start sooner than with spotifyd. Plays go to the player directly, not through the
+  Web API. The player loads the next song in the background, so a skip starts at once. When
+  the selection rests on a song for 0.3 s, that song loads instead, so Enter starts it at
+  once; 20 s after the selection last moved, the next song loads again. A play from another
+  album or playlist still waits about 0.5 s while the player reads that list.
 - Media keys work through MPRIS under the name `spotlite` (`playerctl -p spotlite`, waybar
   `"player": "spotlite"`).
 - Log: `~/.local/state/spotlite/daemon.log`.

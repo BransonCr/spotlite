@@ -2,8 +2,9 @@
 //! over TCP on 127.0.0.1. Each connection first sends the token (from the daemon's token
 //! file), then one request:
 //!
-//! - a command (`play`, `pause`, `next`, `prev`, `seek <ms>`, `volume <0-100>`), or `age`, or
-//!   `quit`: one answer line, `ok` (`ok <seconds>` for age) or `err <text>`;
+//! - a command (`play`, `pause`, `next`, `prev`, `seek <ms>`, `volume <0-100>`), a load (see
+//!   `Load`), `preload <uri>`, or `age`, or `quit`: one answer line, `ok` (`ok <seconds>` for
+//!   age) or `err <text>`;
 //! - `follow`: one line per player change, in playerctl's `--follow` format (see
 //!   `control::parse_follow`), until the connection closes;
 //! - `pcm`: the sound, 22 050 Hz mono s16le, until the connection closes.
@@ -15,18 +16,52 @@
 
 use crate::control::Ctl;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     Ctl(Ctl),
+    /// Plays a context or a list of songs at once, with no Web API request.
+    Load(Load),
+    /// Loads a song in the background, so that it starts at once when it plays next.
+    Preload(String),
     Age,
     Quit,
     Follow,
     Pcm,
 }
 
+/// What a `Load` plays. Spotify URIs have no spaces, so the line is the words
+/// `load <shuffle 0|1> <position_ms> <offset> <context or -> <from or -> <song>...`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Load {
+    /// The context (an album, a playlist, Liked Songs); None: the songs below are the list.
+    pub context: Option<String>,
+    /// The song of the context to start with (None: its first song).
+    pub from: Option<String>,
+    /// The songs to play when there is no context.
+    pub tracks: Vec<String>,
+    /// The song of `tracks` to start with.
+    pub offset: usize,
+    pub position_ms: u64,
+    /// Spotify's own shuffle, on or off.
+    pub shuffle: bool,
+}
+
 /// The request line for a command.
 pub fn line(req: Request) -> String {
     match req {
+        Request::Load(l) => {
+            let mut words = vec![
+                "load".to_owned(),
+                u8::from(l.shuffle).to_string(),
+                l.position_ms.to_string(),
+                l.offset.to_string(),
+                l.context.unwrap_or_else(|| "-".into()),
+                l.from.unwrap_or_else(|| "-".into()),
+            ];
+            words.extend(l.tracks);
+            words.join(" ")
+        }
+        Request::Preload(uri) => format!("preload {uri}"),
         Request::Ctl(Ctl::Play) => "play".into(),
         Request::Ctl(Ctl::Pause) => "pause".into(),
         Request::Ctl(Ctl::Next) => "next".into(),
@@ -43,7 +78,26 @@ pub fn line(req: Request) -> String {
 /// Reads a request line. None for anything else.
 pub fn parse(line: &str) -> Option<Request> {
     let mut words = line.split_whitespace();
+    if line.starts_with("load ") {
+        words.next();
+        let shuffle = match words.next()? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let position_ms = words.next()?.parse().ok()?;
+        let offset = words.next()?.parse().ok()?;
+        let uri = |w: &str| (w != "-").then(|| w.to_owned());
+        let context = uri(words.next()?);
+        let from = uri(words.next()?);
+        let tracks: Vec<String> = words.map(str::to_owned).collect();
+        if context.is_none() && tracks.is_empty() {
+            return None;
+        }
+        return Some(Request::Load(Load { context, from, tracks, offset, position_ms, shuffle }));
+    }
     let req = match (words.next()?, words.next()) {
+        ("preload", Some(uri)) => Request::Preload(uri.to_owned()),
         ("play", None) => Request::Ctl(Ctl::Play),
         ("pause", None) => Request::Ctl(Ctl::Pause),
         ("next", None) => Request::Ctl(Ctl::Next),
@@ -132,9 +186,24 @@ mod tests {
             Request::Quit,
             Request::Follow,
             Request::Pcm,
+            Request::Preload("spotify:track:2K7xn816oNHJZ0aVqdQsha".into()),
+            Request::Load(Load {
+                context: Some("spotify:album:4LH4d3cOWNNsVw41Gqt2kv".into()),
+                from: Some("spotify:track:2K7xn816oNHJZ0aVqdQsha".into()),
+                position_ms: 61_000,
+                ..Default::default()
+            }),
+            Request::Load(Load {
+                tracks: vec!["spotify:track:a".into(), "spotify:track:b".into()],
+                offset: 1,
+                shuffle: true,
+                ..Default::default()
+            }),
         ] {
-            assert_eq!(parse(&line(req)), Some(req), "{}", line(req));
+            assert_eq!(parse(&line(req.clone())), Some(req.clone()), "{}", line(req));
         }
+        assert_eq!(parse("load 0 0 0 - -"), None, "nothing to play");
+        assert_eq!(parse("load 2 0 0 - - spotify:track:a"), None);
         assert_eq!(line(Request::Ctl(Ctl::Volume(150))), "volume 100");
         assert_eq!(parse("volume 300"), None);
         assert_eq!(parse("seek"), None);

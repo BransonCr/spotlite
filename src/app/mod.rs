@@ -61,6 +61,12 @@ const VOLUME_HOLD: Duration = Duration::from_millis(2500);
 const PLAYER_HOLD: Duration = Duration::from_millis(2500);
 /// How soon to confirm a player command with a poll.
 const CONFIRM_AFTER: Duration = Duration::from_millis(500);
+/// The selection rests on a song this long before the player preloads it (moving through a
+/// list fast starts no download).
+const PRELOAD_REST: Duration = Duration::from_millis(300);
+/// After the selection last moved, its song stays the preload this long; then the next song
+/// is preloaded again.
+const PRELOAD_KEEP: Duration = Duration::from_secs(20);
 /// Playing somewhere else (a phone): no player events come from there, so poll more often.
 const POLL_REMOTE: Duration = Duration::from_secs(5);
 /// After a play or a skip, a poll that still shows the song before is Spotify being late, not
@@ -569,6 +575,10 @@ pub struct App {
     pub like_burst: Option<(Instant, bool)>,
     /// A like asked for without knowing the state: the animation waits for Spotify's answer.
     like_pending: Option<String>,
+    /// The song last given to the player to preload (the next one, or the selected one).
+    preloaded: Option<String>,
+    /// The selected song, and when the selection came to it.
+    sel_seen: Option<(String, Instant)>,
     pub confirm: Option<Confirm>,
     /// Liked Songs index for the radio filters; asked for once, when a radio opens.
     pub library: Option<Library>,
@@ -699,6 +709,8 @@ impl App {
             follow: None,
             like_burst: None,
             like_pending: None,
+            preloaded: None,
+            sel_seen: None,
             confirm: None,
             library: None,
             library_asked: false,
@@ -746,6 +758,7 @@ impl App {
             || self.like_animating()
             || self.search_due.is_some()
             || self.sample.is_some()
+            || self.preload_due()
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
@@ -900,6 +913,7 @@ impl App {
             self.switch = Some(Switch { from, want: None, at: now, len: SWITCH_HOLD });
         }
         self.hand_off();
+        self.preload_next();
         if !self.vol_in_flight {
             if let Some(v) = self.vol_target.take() {
                 self.vol_in_flight = true;
