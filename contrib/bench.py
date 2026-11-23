@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Times spotlite: start to ready, a search, a play from a song list, a play from Liked.
 
+Each run starts the player daemon, then opens spotlite twice. The first time
+(`open-cold`, not a target) the daemon has just started; a search and a play from it
+follow, then `q` (the music goes on). The second time (`open`) the daemon plays; a play
+from Liked follows. A play counts until the player says it plays (Spotify can play a
+relinked copy of a song, with another id).
+
 Runs two builds one after the other (A B, then B A, ...), each in a pseudo terminal, with
 `SPOTLITE_LOG` on, and reads the timing marks the builds write (`mark ...` lines, see
 src/log.rs). Each run starts the build's own player daemon first, so it needs
@@ -35,6 +41,7 @@ from pathlib import Path
 QUERIES = ["radiohead creep", "daft punk one more time", "miles davis so what", "nirvana lithium", "fleetwood mac dreams"]
 METRICS = [
     ("open", "start", "ready"),
+    ("open-cold", "start", "ready"),
     ("first-frame", "start", "first-frame"),
     ("search", "search-go", "search-shown"),
     ("play-list", "play-key", "playing"),
@@ -43,8 +50,8 @@ METRICS = [
 TARGETED = ["open", "search", "play-list", "play-context"]
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "spotlite"
 AUDIO_CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "spotlite/audio"
-# What a terminal answers to "which device are you" (DA1): the picture probe stops there.
-DA1 = re.compile(rb"\x1b\[0?c")
+# The picture probe ends with a status query (DSR): a terminal answers "ok" (and to DA1).
+DSR = re.compile(rb"\x1b\[5n")
 
 
 class Log:
@@ -102,7 +109,7 @@ def prepare_state(state_dir):
 
 
 class Terminal:
-    """The build in a 120x40 pseudo terminal that answers the device query."""
+    """The build in a 120x40 pseudo terminal that answers the picture probe."""
 
     def __init__(self, binary, env):
         pid, fd = pty.fork()
@@ -124,9 +131,9 @@ class Terminal:
             if not data:
                 return
             tail = (tail + data)[-64:]
-            if DA1.search(tail):
+            if DSR.search(tail):
                 tail = b""
-                os.write(self.fd, b"\x1b[?62;22c")
+                os.write(self.fd, b"\x1b[?62;22c\x1b[0n")
 
     def keys(self, text, gap=0.0):
         for ch in text:
@@ -168,12 +175,12 @@ def one_run(binary, i, settle):
         while time.time() < end and not (dlog.exists() and "connected" in dlog.read_text(errors="replace")):
             time.sleep(0.05)
         time.sleep(1.0)
-        term = Terminal(binary, env)
         got = {}
+        term = Terminal(binary, env)
         try:
             start, _ = log.wait("start")
-            got["first-frame"] = log.wait("first-frame")[0] - start
-            got["open"] = log.wait("ready")[0] - start
+            got["first-frame"] = log.wait("first-frame", after=start)[0] - start
+            got["open-cold"] = log.wait("ready", after=start)[0] - start
             time.sleep(settle)
             q = QUERIES[i % len(QUERIES)]
             term.keys("/")
@@ -187,9 +194,18 @@ def one_run(binary, i, settle):
             time.sleep(1.0)
             t0 = time.time() - 0.05
             term.keys("\r")
-            key, uri = log.wait("play-key", after=t0)
-            got["play-list"] = log.wait("playing", uri, after=key)[0] - key
+            key, _ = log.wait("play-key", after=t0)
+            got["play-list"] = log.wait("playing", after=key)[0] - key
             time.sleep(2.0)
+        finally:
+            term.close()
+        time.sleep(0.5)
+        term = Terminal(binary, env)
+        try:
+            t0 = time.time() - 0.05
+            start, _ = log.wait("start", after=t0)
+            got["open"] = log.wait("ready", after=start)[0] - start
+            time.sleep(settle)
             term.keys("3")
             time.sleep(0.5)
             term.keys("g")
@@ -197,8 +213,8 @@ def one_run(binary, i, settle):
             time.sleep(1.0)
             t0 = time.time() - 0.05
             term.keys("\r")
-            key, uri = log.wait("play-key", after=t0)
-            got["play-context"] = log.wait("playing", uri, after=key)[0] - key
+            key, _ = log.wait("play-key", after=t0)
+            got["play-context"] = log.wait("playing", after=key)[0] - key
         finally:
             term.close()
             stop_daemons()
