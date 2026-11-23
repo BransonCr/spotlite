@@ -105,6 +105,10 @@ pub fn load(port: u16, load: proto::Load) -> bool {
     ask(port, Request::Load(load)).as_deref() == Some("ok")
 }
 
+pub fn state(port: u16) -> Option<proto::State> {
+    proto::parse_state(&ask(port, Request::State)?)
+}
+
 pub fn preload(port: u16, uri: &str) -> bool {
     ask(port, Request::Preload(uri.to_owned())).as_deref() == Some("ok")
 }

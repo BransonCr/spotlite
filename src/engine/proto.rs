@@ -5,6 +5,7 @@
 //! - a command (`play`, `pause`, `next`, `prev`, `seek <ms>`, `volume <0-100>`), a load (see
 //!   `Load`), `preload <uri>`, or `age`, or `quit`: one answer line, `ok` (`ok <seconds>` for
 //!   age) or `err <text>`;
+//! - `state`: one answer line, `ok` and the player's state (see `State`);
 //! - `follow`: one line per player change, in playerctl's `--follow` format (see
 //!   `control::parse_follow`), until the connection closes;
 //! - `pcm`: the sound, 22 050 Hz mono s16le, until the connection closes.
@@ -24,6 +25,8 @@ pub enum Request {
     /// Loads a song in the background, so that it starts at once when it plays next.
     Preload(String),
     Age,
+    /// What the player plays now, with its position (see `State`).
+    State,
     Quit,
     Follow,
     Pcm,
@@ -69,6 +72,7 @@ pub fn line(req: Request) -> String {
         Request::Ctl(Ctl::Seek(ms)) => format!("seek {ms}"),
         Request::Ctl(Ctl::Volume(pct)) => format!("volume {}", pct.min(100)),
         Request::Age => "age".into(),
+        Request::State => "state".into(),
         Request::Quit => "quit".into(),
         Request::Follow => "follow".into(),
         Request::Pcm => "pcm".into(),
@@ -105,6 +109,7 @@ pub fn parse(line: &str) -> Option<Request> {
         ("seek", Some(ms)) => Request::Ctl(Ctl::Seek(ms.parse().ok()?)),
         ("volume", Some(pct)) => Request::Ctl(Ctl::Volume(pct.parse::<u8>().ok()?.min(100))),
         ("age", None) => Request::Age,
+        ("state", None) => Request::State,
         ("quit", None) => Request::Quit,
         ("follow", None) => Request::Follow,
         ("pcm", None) => Request::Pcm,
@@ -142,6 +147,52 @@ pub fn follow_line(playing: bool, song: Option<&Song>) -> String {
         clean(s.album),
         clean(s.cover),
     )
+}
+
+/// The answer to `state`: `ok <active 0|1> <position_ms> <shuffle 0|1> <repeat> <volume>`,
+/// a tab, then the `follow` line. `active`: a song is loaded and the device was not left for
+/// another one, so this is Spotify's player state too.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct State {
+    pub active: bool,
+    pub position_ms: u64,
+    pub shuffle: bool,
+    /// "off", "context" or "track".
+    pub repeat: String,
+    /// Percent.
+    pub volume: u8,
+    pub follow: String,
+}
+
+pub fn state_line(st: &State) -> String {
+    format!(
+        "ok {} {} {} {} {}\t{}",
+        u8::from(st.active),
+        st.position_ms,
+        u8::from(st.shuffle),
+        st.repeat,
+        st.volume.min(100),
+        st.follow
+    )
+}
+
+pub fn parse_state(line: &str) -> Option<State> {
+    let (head, follow) = line.trim_end_matches(['\n', '\r']).split_once('\t')?;
+    let mut w = head.split(' ');
+    if w.next()? != "ok" {
+        return None;
+    }
+    let flag = |w: Option<&str>| match w? {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    };
+    let active = flag(w.next())?;
+    let position_ms = w.next()?.parse().ok()?;
+    let shuffle = flag(w.next())?;
+    let repeat = w.next().filter(|r| matches!(*r, "off" | "context" | "track"))?.to_owned();
+    let volume = w.next()?.parse::<u8>().ok()?.min(100);
+    Some(State { active, position_ms, shuffle, repeat, volume, follow: follow.to_owned() })
 }
 
 /// Turns the player's sound (44 100 Hz stereo, interleaved, -1..=1) into the `pcm` stream's
@@ -184,6 +235,7 @@ mod tests {
             Request::Ctl(Ctl::Volume(42)),
             Request::Age,
             Request::Quit,
+            Request::State,
             Request::Follow,
             Request::Pcm,
             Request::Preload("spotify:track:2K7xn816oNHJZ0aVqdQsha".into()),
@@ -203,6 +255,17 @@ mod tests {
             assert_eq!(parse(&line(req.clone())), Some(req.clone()), "{}", line(req));
         }
         assert_eq!(parse("load 0 0 0 - -"), None, "nothing to play");
+        let st = State {
+            active: true,
+            position_ms: 61_000,
+            shuffle: false,
+            repeat: "context".into(),
+            volume: 60,
+            follow: follow_line(true, None),
+        };
+        assert_eq!(parse_state(&state_line(&st)), Some(st));
+        assert_eq!(parse_state("ok 1 0 0 sometimes 60\tPlaying"), None);
+        assert_eq!(parse_state("err not connected"), None);
         assert_eq!(parse("load 2 0 0 - - spotify:track:a"), None);
         assert_eq!(line(Request::Ctl(Ctl::Volume(150))), "volume 100");
         assert_eq!(parse("volume 300"), None);

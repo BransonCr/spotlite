@@ -130,6 +130,13 @@ impl App {
         self.menu = None;
     }
 
+    /// spotlite itself saved the state file: the theme watcher does not read it again for that.
+    pub fn state_saved(&mut self) {
+        if self.theme_watch.2.is_some() {
+            self.theme_watch.2 = std::fs::metadata(crate::state::path()).and_then(|m| m.modified()).ok();
+        }
+    }
+
     /// Live reload, once a second: the theme file changed (an edit), or the saved theme name
     /// changed (`spotlite theme set`, from a shell or an AI agent).
     pub(super) fn watch_theme(&mut self) {

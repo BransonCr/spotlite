@@ -313,7 +313,12 @@ fn run_tui() -> Result<()> {
     let images = if std::env::var_os("SPOTLITE_NO_IMAGES").is_some() {
         images::Images::disabled()
     } else {
-        images::Images::new(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()))
+        // A terminal answers in a few ms; one that does not costs this wait (the default is 2 s).
+        let options = ratatui_image::picker::cap_parser::QueryStdioOptions {
+            timeout: Duration::from_millis(500),
+            ..Default::default()
+        };
+        images::Images::new(Picker::from_query_stdio_with_options(options).unwrap_or_else(|_| Picker::halfblocks()))
     };
     // From here on only the input thread reads the terminal (the picture query above is done).
     let input_tx = msg_tx.clone();
@@ -397,6 +402,7 @@ fn run_tui() -> Result<()> {
                 if let Ok(json) = serde_json::to_string(&st) {
                     if json != saved_json && state::save(&st).is_ok() {
                         saved_json = json;
+                        app.state_saved();
                     }
                 }
             }

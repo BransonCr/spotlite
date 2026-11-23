@@ -174,8 +174,32 @@ struct Shared {
     user: Option<User>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Lane {
+    Control,
+    Search,
+    Data,
+}
+
 /// The thread a command runs on. Player commands and polls have their own, so play, pause and
-/// skip never wait behind a long load (a randomize can take 40 requests).
+/// skip never wait behind a long load (a randomize can take 40 requests). Searches have their
+/// own too, so a search never waits behind a library sync or a playlist load.
+fn lane(cmd: &Cmd) -> Lane {
+    if matches!(cmd, Cmd::Load { list: List::Search(_) | List::Found { .. }, .. } | Cmd::QueueSearch(_)) {
+        return Lane::Search;
+    }
+    if control_lane(cmd) {
+        Lane::Control
+    } else {
+        Lane::Data
+    }
+}
+
+/// A check that can wait for a command the user gave after it (a poll, the ♥ of a song).
+fn background(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::Poll | Cmd::UpNext | Cmd::CheckSaved(_) | Cmd::Devices | Cmd::Preload(_))
+}
+
 fn control_lane(cmd: &Cmd) -> bool {
     matches!(
         cmd,
@@ -215,7 +239,8 @@ pub fn spawn(api: Spotify) -> (Sender<Cmd>, Sender<Msg>, Receiver<Msg>) {
     let shared = Arc::new(Mutex::new(Shared::default()));
     let (control_tx, control_rx) = channel();
     let (data_tx, data_rx) = channel();
-    for (name, rx) in [("spotlite-api", control_rx), ("spotlite-data", data_rx)] {
+    let (search_tx, search_rx) = channel();
+    for (name, rx) in [("spotlite-api", control_rx), ("spotlite-data", data_rx), ("spotlite-search", search_rx)] {
         let worker = Worker::new(api.clone(), msg_tx.clone(), shared.clone());
         thread::Builder::new()
             .name(name.into())
@@ -226,7 +251,11 @@ pub fn spawn(api: Spotify) -> (Sender<Cmd>, Sender<Msg>, Receiver<Msg>) {
         .name("spotlite-route".into())
         .spawn(move || {
             for cmd in cmd_rx {
-                let lane = if control_lane(&cmd) { &control_tx } else { &data_tx };
+                let lane = match lane(&cmd) {
+                    Lane::Control => &control_tx,
+                    Lane::Search => &search_tx,
+                    Lane::Data => &data_tx,
+                };
                 if lane.send(cmd).is_err() {
                     return;
                 }
@@ -400,7 +429,13 @@ impl Worker {
                 }
             }
             waiting.extend(rx.try_iter());
-            let Some(cmd) = waiting.pop_front() else { continue };
+            // What the user asked for goes before checks that can wait (a play before a poll).
+            let first = if background(waiting.front().expect("not empty")) {
+                waiting.iter().position(|c| !background(c)).unwrap_or(0)
+            } else {
+                0
+            };
+            let Some(cmd) = waiting.remove(first) else { continue };
             // A search typed further makes the load of the older text useless: skip it.
             if is_search_start(&cmd) && waiting.iter().any(is_search_start) {
                 if let Cmd::Load { list, .. } = cmd {
@@ -484,6 +519,10 @@ impl Worker {
                     Ok(user) => self.set_user(user.clone()),
                     Err(_) => self.me_tried = Some(Instant::now()),
                 }
+                // spotlite's own player knows at once what it plays; Spotify's view follows.
+                if let Some(pb) = self.engine_playback() {
+                    self.send(Msg::Playback(Some(Box::new(pb))));
+                }
                 self.find_device()?;
                 self.poll()?;
                 match user {
@@ -510,6 +549,19 @@ impl Worker {
                     Some(u) => u,
                     None => self.api.me_cached()?,
                 };
+                // spotlite's own player: the saved Liked list as a song list. As a context the
+                // player first reads every Liked song from Spotify (about 1 s).
+                if crate::engine::loads() {
+                    let library: Option<Library> = crate::store::read("library.json");
+                    if let Some(order) = library.map(|l| l.liked_order) {
+                        if let Some(offset) = order.iter().position(|u| *u == from) {
+                            let songs = Play::Tracks { uris: order, offset };
+                            if self.load_here(&songs, 0, self.spotify_shuffle()) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 let play = Play::Context {
                     uri: format!("{}:collection", user.uri),
                     from: Some(from),
@@ -969,6 +1021,29 @@ impl Worker {
         self.last = pb.clone();
         self.send(Msg::Playback(pb.map(Box::new)));
         Ok(())
+    }
+
+    /// The state of spotlite's own player, when it is the active device (no request).
+    fn engine_playback(&self) -> Option<Playback> {
+        if cfg!(test) || !crate::engine::loads() {
+            return None;
+        }
+        let st = crate::engine::state().filter(|st| st.active)?;
+        let (playing, item) = crate::control::parse_follow(&st.follow)?;
+        Some(Playback {
+            device: Some(crate::api::Device {
+                id: None,
+                name: self.api.config().device_name.clone(),
+                is_active: true,
+                volume_percent: Some(st.volume),
+            }),
+            is_playing: playing,
+            progress_ms: Some(st.position_ms),
+            shuffle_state: st.shuffle,
+            repeat_state: st.repeat,
+            context: None,
+            item: Some(item?),
+        })
     }
 
     fn find_device(&mut self) -> Result<Option<String>> {
@@ -1544,11 +1619,19 @@ mod tests {
     #[test]
     fn player_commands_never_wait_behind_loads() {
         for cmd in [Cmd::Toggle, Cmd::Next, Cmd::Poll, Cmd::Volume(3), Cmd::Seek(1), Cmd::UpNext] {
-            assert!(control_lane(&cmd), "{cmd:?}");
+            assert_eq!(lane(&cmd), Lane::Control, "{cmd:?}");
         }
         for cmd in [Cmd::Load { list: List::Liked, offset: 0 }, Cmd::Randomize("x".into()), Cmd::Library, Cmd::Artist("a".into())] {
-            assert!(!control_lane(&cmd), "{cmd:?}");
+            assert_eq!(lane(&cmd), Lane::Data, "{cmd:?}");
         }
+        for cmd in [
+            Cmd::Load { list: List::Search("a".into()), offset: 0 },
+            Cmd::Load { list: List::Found { query: "a".into(), kind: "album" }, offset: 10 },
+            Cmd::QueueSearch("a".into()),
+        ] {
+            assert_eq!(lane(&cmd), Lane::Search, "{cmd:?}");
+        }
+        assert!(background(&Cmd::Poll) && !background(&Cmd::Next));
         assert!(is_search_start(&Cmd::Load { list: List::Search("a".into()), offset: 0 }));
         assert!(!is_search_start(&Cmd::Load { list: List::Search("a".into()), offset: 10 }));
     }

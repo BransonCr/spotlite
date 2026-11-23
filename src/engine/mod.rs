@@ -151,6 +151,12 @@ pub fn preload(uri: &str) -> bool {
     pick!(builtin::preload(get().port, uri), false)
 }
 
+/// The player's state from the engine itself, with no Web API request (the built-in player
+/// only). None if it cannot.
+pub fn state() -> Option<proto::State> {
+    pick!(builtin::state(get().port), None)
+}
+
 /// True when play commands can go to the engine itself (`load`).
 pub fn loads() -> bool {
     pick!(true, false)

@@ -153,8 +153,46 @@ struct Shared {
     player: Mutex<Option<Arc<Player>>>,
     /// Readers of player changes, and the last change (a new reader gets it at once).
     followers: Mutex<(Vec<TcpStream>, String)>,
+    /// The player's state, for `state`.
+    live: Mutex<Live>,
     tap: Arc<Tap>,
     quit: AtomicBool,
+}
+
+/// What the player does now, from its events.
+#[derive(Default)]
+struct Live {
+    /// A song is loaded and the device was not left for another one.
+    loaded: bool,
+    playing: bool,
+    /// The position at `at`.
+    position_ms: u64,
+    at: Option<Instant>,
+    shuffle: bool,
+    repeat: &'static str,
+    volume: u16,
+}
+
+impl Live {
+    fn state(&self, follow: &str) -> proto::State {
+        let ran = match (self.playing, self.at) {
+            (true, Some(at)) => at.elapsed().as_millis() as u64,
+            _ => 0,
+        };
+        proto::State {
+            active: self.loaded,
+            position_ms: self.position_ms + ran,
+            shuffle: self.shuffle,
+            repeat: if self.repeat.is_empty() { "off" } else { self.repeat }.to_owned(),
+            volume: (u32::from(self.volume) * 100).div_ceil(u32::from(u16::MAX)) as u8,
+            follow: follow.to_owned(),
+        }
+    }
+
+    fn at(&mut self, position_ms: u32) {
+        self.position_ms = u64::from(position_ms);
+        self.at = Some(Instant::now());
+    }
 }
 
 impl Shared {
@@ -200,6 +238,7 @@ fn serve(cfg: &Config) -> Result<()> {
         spirc: Mutex::new(None),
         player: Mutex::new(None),
         followers: Mutex::new((Vec::new(), proto::follow_line(false, None))),
+        live: Mutex::new(Live { volume: volume(60), ..Default::default() }),
         tap: Tap::start(),
         quit: AtomicBool::new(false),
     });
@@ -243,6 +282,13 @@ fn answer(conn: TcpStream, shared: &Shared) {
     };
     let reply = match req {
         Request::Age => format!("ok {}", shared.started.elapsed().as_secs()),
+        Request::State => {
+            let follow = shared.followers.lock().map(|f| f.1.clone()).unwrap_or_default();
+            match shared.live.lock() {
+                Ok(live) => proto::state_line(&live.state(&follow)),
+                Err(_) => "err busy".to_owned(),
+            }
+        }
         Request::Quit => {
             let _ = out.write_all(b"ok\n");
             shared.quit.store(true, Ordering::SeqCst);
@@ -425,6 +471,34 @@ async fn follow(mut events: PlayerEventChannel, shared: Arc<Shared>, media: Opti
         }
     };
     while let Some(event) = events.recv().await {
+        if let Ok(mut live) = shared.live.lock() {
+            match &event {
+                PlayerEvent::TrackChanged { .. } => live.loaded = true,
+                PlayerEvent::Playing { position_ms, .. } => {
+                    live.loaded = true;
+                    live.playing = true;
+                    live.at(*position_ms);
+                }
+                PlayerEvent::Paused { position_ms, .. } => {
+                    live.playing = false;
+                    live.at(*position_ms);
+                }
+                PlayerEvent::Loading { position_ms, .. }
+                | PlayerEvent::Seeked { position_ms, .. }
+                | PlayerEvent::PositionCorrection { position_ms, .. }
+                | PlayerEvent::PositionChanged { position_ms, .. } => live.at(*position_ms),
+                PlayerEvent::Stopped { .. } | PlayerEvent::SessionDisconnected { .. } => {
+                    live.loaded = false;
+                    live.playing = false;
+                }
+                PlayerEvent::VolumeChanged { volume } => live.volume = *volume,
+                PlayerEvent::ShuffleChanged { shuffle } => live.shuffle = *shuffle,
+                PlayerEvent::RepeatChanged { context, track } => {
+                    live.repeat = if *track { "track" } else if *context { "context" } else { "off" };
+                }
+                _ => {}
+            }
+        }
         match event {
             PlayerEvent::TrackChanged { audio_item } => {
                 let s = Playing::new(&audio_item);
