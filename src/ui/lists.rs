@@ -23,7 +23,7 @@ pub(super) fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
         f.set_cursor_position(Position::new(x.min(inner.right().saturating_sub(1)), inner.y));
     }
 
-    // Title: the result kinds (click one, or t / T), then the query.
+    // Title: the result kinds (click one, t, or alt-1 … alt-4), then the query.
     let mut spans = vec![Span::raw(" ")];
     let mut x = title_x(list) + 1;
     for kind in SearchKind::ALL {
@@ -52,9 +52,9 @@ pub(super) fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
         let recent: Vec<String> = app.search_history.iter().take(3).map(|q| format!("“{q}”")).collect();
         format!("Search Spotify\n/ to type · ↑ in the box for earlier searches: {}", recent.join(", "))
     } else if app.searched.is_empty() {
-        "Search Spotify\n/ to type · Enter to search · t for songs, artists, albums or playlists".to_owned()
+        "Search Spotify\n/ to type · Enter to search · alt-1 … alt-4 (or t) for songs, artists, albums or playlists".to_owned()
     } else {
-        "No results.\nTry other words, or t for another kind".to_owned()
+        "No results.\nTry other words, or alt-1 … alt-4 (or t) for another kind".to_owned()
     };
     if app.search_kind == SearchKind::Songs {
         draw_tracks(f, app, list, title, &empty);

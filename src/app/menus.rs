@@ -9,10 +9,14 @@ impl App {
         (self.view() == View::Playlist && self.owns(&o.playlist)).then_some(&o.playlist)
     }
 
-    /// Opens the action menu for the selected track.
+    /// Opens the action menu for the selected track. In a playlist with no song selected,
+    /// the playlist's own menu opens.
     pub fn open_menu(&mut self) {
         let Some(track) = self.selected_track() else {
-            self.info("Select a song first.");
+            match self.open.as_ref().filter(|_| self.view() == View::Playlist).map(|o| o.playlist.clone()) {
+                Some(pl) => self.open_playlist_menu(pl),
+                None => self.info("Select a song first."),
+            }
             return;
         };
         let mut items: Vec<(&'static str, String, Action)> = if self.queue_open {
@@ -50,7 +54,84 @@ impl App {
             None => "Like / unlike",
         };
         items.push(("f", label.into(), Action::Like));
+        if let Some(o) = self.open.as_ref().filter(|_| self.view() == View::Playlist && !self.queue_open) {
+            let only_list = |(_, _, a): &(&str, String, Action)| !matches!(a, Action::OpenPlaylist(_) | Action::PlayPlaylist(_));
+            items.extend(self.playlist_items(&o.playlist).into_iter().filter(only_list));
+        }
         self.menu = Some(Menu { title: track.name.clone(), items, cursor: 0, track: Some(track), at: None });
+    }
+
+    /// The playlist under the cursor: a playlist search result, or a row of the Playlists tab.
+    pub(super) fn selected_playlist(&self) -> Option<Playlist> {
+        match self.view() {
+            View::Search if self.search_kind == SearchKind::Playlists => match self.found.current()? {
+                Found::Playlist(p) => Some(p.clone()),
+                _ => None,
+            },
+            View::Playlists => self.current_playlist(),
+            _ => None,
+        }
+    }
+
+    /// The playlist's entries: open, play, pin it, save it to your library (not your own), copy it.
+    fn playlist_items(&self, pl: &Playlist) -> Vec<(&'static str, String, Action)> {
+        let b = || Box::new(pl.clone());
+        let mut items = vec![("⏎", "Open".to_owned(), Action::OpenPlaylist(b())), ("P", "Play".to_owned(), Action::PlayPlaylist(b()))];
+        let pinned = self.pins.iter().any(|p| p.uri() == pl.uri);
+        items.push(("*", if pinned { "Unpin from the sidebar" } else { "Pin to the sidebar" }.to_owned(), Action::PinPlaylist(b())));
+        if !self.owns(pl) {
+            let saved = self.playlists.items.iter().any(|p| p.id == pl.id);
+            let label = if saved { "Remove from your library" } else { "Add to your library" };
+            items.push(("+", label.to_owned(), Action::FollowPlaylist(b())));
+        }
+        items.push(("c", "Copy to a new playlist…".to_owned(), Action::CopyPlaylist(b())));
+        items
+    }
+
+    /// The menu of a playlist (`.` on a playlist, or in an open playlist with no song).
+    pub(super) fn open_playlist_menu(&mut self, pl: Playlist) {
+        let items = self.playlist_items(&pl);
+        self.menu = Some(Menu { title: pl.name.clone(), items, cursor: 0, track: None, at: None });
+    }
+
+    /// Runs an entry of the playlist menu. False for any other action.
+    fn run_playlist_action(&mut self, action: &Action) -> bool {
+        match action.clone() {
+            Action::OpenPlaylist(p) => {
+                let p = *p;
+                if self.owns(&p) || crate::client::AVAILABLE {
+                    self.open_playlist(p);
+                    self.switch_tab(Tab::Playlists);
+                } else {
+                    self.info(format!("Playing {}", p.name));
+                    self.play(Cmd::Play(Play::Context { uri: p.uri, from: None }), None);
+                }
+            }
+            Action::PlayPlaylist(p) => {
+                self.info(format!("Playing {}", p.name));
+                self.play(Cmd::Play(Play::Context { uri: p.uri, from: None }), None);
+            }
+            Action::PinPlaylist(p) => self.toggle_pin(Pin::Playlist { uri: p.uri, name: p.name, images: p.images }),
+            Action::FollowPlaylist(p) => {
+                if !self.can_edit {
+                    self.error("Run `spotlite auth` again to allow editing your library.");
+                } else {
+                    let follow = !self.playlists.items.iter().any(|q| q.id == p.id);
+                    self.send(Cmd::FollowPlaylist { playlist: p, follow });
+                }
+            }
+            Action::CopyPlaylist(p) => {
+                if !self.can_edit {
+                    self.error("Run `spotlite auth` again to allow editing playlists.");
+                } else {
+                    let mut name = Input::default();
+                    name.set(format!("{} (copy)", p.name));
+                    self.naming = Some(Naming { name, uris: Vec::new(), copy_of: Some(*p) });
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     pub(super) fn filter_menu_items(&self) -> Vec<(&'static str, String, Action)> {
@@ -231,6 +312,9 @@ impl App {
             return;
         }
         self.menu = None;
+        if self.run_playlist_action(&action) {
+            return;
+        }
         let Some(track) = track else { return };
         self.run_action(action, track);
     }
@@ -248,7 +332,15 @@ impl App {
             Action::AddToPlaylist => self.open_picker(track),
             Action::RemoveFromPlaylist => self.ask_remove(track),
             Action::Like => self.toggle_like(Some(track)),
-            Action::Filter(_) | Action::Theme(_) | Action::SideFx(_) | Action::Device { .. } => {}
+            Action::Filter(_)
+            | Action::Theme(_)
+            | Action::SideFx(_)
+            | Action::Device { .. }
+            | Action::OpenPlaylist(_)
+            | Action::PlayPlaylist(_)
+            | Action::PinPlaylist(_)
+            | Action::FollowPlaylist(_)
+            | Action::CopyPlaylist(_) => {}
         }
     }
 
@@ -318,7 +410,7 @@ impl App {
         }
         let uris: Vec<String> = track.map(|t| self.chosen(t).into_iter().map(|t| t.uri).collect()).unwrap_or_default();
         if name.is_empty() {
-            self.naming = Some(Naming { name: Input::default(), uris });
+            self.naming = Some(Naming { name: Input::default(), uris, copy_of: None });
         } else {
             self.marks.clear();
             self.send(Cmd::CreatePlaylist { name, description: String::new(), uris });
@@ -334,6 +426,12 @@ impl App {
             return;
         }
         let Some(n) = self.naming.take() else { return };
+        if let Some(from) = n.copy_of {
+            let description = format!("A copy of “{}” by {}.", from.name, from.owner_name());
+            self.info(format!("Copying “{}”…", from.name));
+            self.send(Cmd::CopyPlaylist { from: from.id, name, description });
+            return;
+        }
         self.marks.clear();
         self.send(Cmd::CreatePlaylist { name, description: String::new(), uris: n.uris });
     }

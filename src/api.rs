@@ -172,18 +172,18 @@ impl Track {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Owner {
     pub id: String,
     pub display_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Total {
     pub total: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: String,
     pub uri: String,
@@ -821,6 +821,17 @@ impl Spotify {
             .ok_or_else(|| anyhow::anyhow!("empty create-playlist response"))?
             .into_json()
             .map_err(Into::into)
+    }
+
+    /// Saves a playlist to your library (follows it), or removes it (needs user-library-modify;
+    /// the older followers endpoint needs playlist-modify-*).
+    pub fn set_followed(&mut self, playlist_id: &str, follow: bool) -> Result<()> {
+        let uri = format!("spotify:playlist:{playlist_id}");
+        let method = if follow { "PUT" } else { "DELETE" };
+        match self.send(method, "/me/library", &[("uris", &uri)], None) {
+            Ok(()) => Ok(()),
+            Err(_) => self.send(method, &format!("/playlists/{playlist_id}/followers"), &[], None),
+        }
     }
 
     pub fn is_saved(&mut self, uri: &str) -> Result<bool> {

@@ -24,6 +24,10 @@ pub enum Act {
     Jump,
     Search,
     SearchType,
+    SearchSongs,
+    SearchArtists,
+    SearchAlbums,
+    SearchPlaylists,
     Palette,
     Filter,
     Sort,
@@ -116,6 +120,10 @@ pub const ALL: &[Info] = &[
     i(Act::Jump, "jump", "Move", "jump to the playing song", &["c"]),
     i(Act::Search, "search", "Move", "search", &["/"]),
     i(Act::SearchType, "search_type", "Move", "results: songs, artists, albums…", &["t"]),
+    i(Act::SearchSongs, "search_songs", "Move", "search results: songs (ctrl-1 if the terminal sends it)", &["alt-1", "ctrl-1"]),
+    i(Act::SearchArtists, "search_artists", "Move", "search results: artists", &["alt-2", "ctrl-2"]),
+    i(Act::SearchAlbums, "search_albums", "Move", "search results: albums", &["alt-3", "ctrl-3"]),
+    i(Act::SearchPlaylists, "search_playlists", "Move", "search results: playlists", &["alt-4", "ctrl-4"]),
     i(Act::Palette, "palette", "Move", "do anything (palette)", &[":", "ctrl-p"]),
     i(Act::Filter, "filter", "Move", "filter the list as you type", &["ctrl-f"]),
     i(Act::Sort, "sort", "Move", "sort: title, artist, album, time", &[","]),
@@ -387,6 +395,15 @@ mod tests {
 
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn alt_and_ctrl_digits_pick_search_kinds() {
+        let keys = Keys::default();
+        assert_eq!(keys.get(&ev(KeyCode::Char('1'), KeyModifiers::ALT)), Some(Act::SearchSongs));
+        assert_eq!(keys.get(&ev(KeyCode::Char('4'), KeyModifiers::ALT)), Some(Act::SearchPlaylists));
+        assert_eq!(keys.get(&ev(KeyCode::Char('3'), KeyModifiers::CONTROL)), Some(Act::SearchAlbums));
+        assert_eq!(parse("alt-2"), Ok(Key { code: KeyCode::Char('2'), mods: KeyModifiers::ALT }));
     }
 
     #[test]

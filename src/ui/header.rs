@@ -333,9 +333,10 @@ pub(super) fn hints(app: &App) -> Vec<(String, &'static str)> {
         };
     }
     acts(match app.view() {
+        View::Search if app.search_kind == SearchKind::Playlists => &[(Act::Search, "search"), (Act::Play, "open"), (Act::Actions, "pin, save, copy"), (Act::SearchType, "type"), (Act::Help, "help")],
         View::Search if app.search_kind != SearchKind::Songs => &[(Act::Search, "search"), (Act::Play, "open"), (Act::SearchType, "type"), (Act::Palette, "anything"), (Act::Help, "help")],
         View::Search => &[(Act::Search, "search"), (Act::Play, "play"), (Act::SearchType, "type"), (Act::Actions, "actions"), (Act::Radio, "radio"), (Act::Palette, "anything"), (Act::Help, "help")],
-        View::Playlists => &[(Act::Play, "open"), (Act::PlayAll, "play all"), (Act::Filter, "filter"), (Act::NewPlaylist, "new"), (Act::Back, "up"), (Act::Palette, "anything"), (Act::Help, "help")],
+        View::Playlists => &[(Act::Play, "open"), (Act::PlayAll, "play all"), (Act::Filter, "filter"), (Act::NewPlaylist, "new"), (Act::Actions, "actions"), (Act::Back, "up"), (Act::Help, "help")],
         View::Playlist => &[(Act::Play, "play"), (Act::Actions, "actions"), (Act::Filter, "filter"), (Act::Sort, "sort"), (Act::Mark, "mark"), (Act::AddToPlaylist, "add to…"), (Act::Back, "back"), (Act::Help, "help")],
         View::Liked => &[(Act::Play, "play"), (Act::Actions, "actions"), (Act::Filter, "filter"), (Act::Sort, "sort"), (Act::Mark, "mark"), (Act::Like, "unlike"), (Act::Help, "help")],
         View::Recent => &[(Act::Play, "play"), (Act::Actions, "actions"), (Act::Like, "like"), (Act::Radio, "radio"), (Act::Reload, "reload"), (Act::Help, "help")],

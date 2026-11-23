@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) fn draw_menu(f: &mut Frame, app: &mut App) {
     let Some(menu) = app.menu.as_ref() else { return };
-    let filters = menu.track.is_none() && !menu.is_theme();
+    let filters = menu.is_filters();
     let width = menu.items.iter().map(|(_, l, _)| l.width()).max().unwrap_or(10).max(menu.title.width()) as u16 + 12;
     let (w, h) = (width.clamp(30, 64), menu.items.len() as u16 + 4);
     let area = match menu.at {
@@ -277,6 +277,7 @@ pub(super) fn draw_naming(f: &mut Frame, app: &mut App) {
     let Some(naming) = app.naming.as_ref() else { return };
     let area = popup_area(f, 50, 7);
     let title = match naming.uris.len() {
+        _ if naming.copy_of.is_some() => "Copy to a new playlist".to_owned(),
         0 => "New playlist".to_owned(),
         1 => "New playlist with 1 song".to_owned(),
         n => format!("New playlist with {n} songs"),

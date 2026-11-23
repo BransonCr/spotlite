@@ -149,6 +149,17 @@ impl SearchKind {
         }
     }
 
+    /// The kind a key of the table shows (alt-1 … alt-4), if it is one of those keys.
+    pub fn of_act(act: Act) -> Option<SearchKind> {
+        match act {
+            Act::SearchSongs => Some(SearchKind::Songs),
+            Act::SearchArtists => Some(SearchKind::Artists),
+            Act::SearchAlbums => Some(SearchKind::Albums),
+            Act::SearchPlaylists => Some(SearchKind::Playlists),
+            _ => None,
+        }
+    }
+
     /// The Web API's search type (None for songs, which have their own list).
     fn api(self) -> Option<&'static str> {
         match self {
@@ -201,6 +212,12 @@ pub enum Action {
     SideFx(SideFx),
     /// A Spotify Connect device to play on (the device menu).
     Device { id: String, name: String },
+    /// The playlist menu: open it, play it, pin it, save it to your library, copy it.
+    OpenPlaylist(Box<Playlist>),
+    PlayPlaylist(Box<Playlist>),
+    PinPlaylist(Box<Playlist>),
+    FollowPlaylist(Box<Playlist>),
+    CopyPlaylist(Box<Playlist>),
 }
 
 /// A pop-up list of actions: for a track (`.` or right-click), or the radio filters (`F`).
@@ -218,6 +235,11 @@ pub struct Menu {
 impl Menu {
     pub fn is_theme(&self) -> bool {
         matches!(self.items.first(), Some((_, _, Action::Theme(_))))
+    }
+
+    /// The radio filters (`F`): they change in place and stay open.
+    pub fn is_filters(&self) -> bool {
+        matches!(self.items.first(), Some((_, _, Action::Filter(_))))
     }
 }
 
@@ -263,6 +285,8 @@ pub struct Naming {
     pub name: Input,
     /// The songs the new playlist starts with (none from the Playlists tab).
     pub uris: Vec<String>,
+    /// The playlist whose songs the new one copies (the playlist menu's copy).
+    pub copy_of: Option<Playlist>,
 }
 
 /// The queue view's add picker (`a`): type a search, Enter runs it; then Enter adds the
@@ -1383,6 +1407,23 @@ impl App {
                 // E adds to the new playlist next.
                 self.recent_playlists.insert(0, pl_id);
                 self.recent_playlists.truncate(20);
+                self.rebuild_rows();
+            }
+            Msg::Followed { playlist, follow } => {
+                let known = self.playlists.items.iter().position(|p| p.id == playlist.id);
+                match (follow, known) {
+                    (true, None) => {
+                        self.playlists.items.insert(0, *playlist);
+                        self.playlists.fetched += 1;
+                        self.playlists.total = self.playlists.total.map(|t| t + 1);
+                    }
+                    (false, Some(i)) => {
+                        self.playlists.items.remove(i);
+                        self.playlists.fetched = self.playlists.fetched.saturating_sub(1);
+                        self.playlists.total = self.playlists.total.map(|t| t.saturating_sub(1));
+                    }
+                    _ => {}
+                }
                 self.rebuild_rows();
             }
             Msg::Devices(list) => self.open_devices(list),

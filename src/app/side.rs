@@ -249,6 +249,10 @@ impl App {
                 None => None,
             },
             View::Playlists => self.current_playlist().map(|p| Pin::Playlist { uri: p.uri, name: p.name, images: p.images }),
+            // A playlist that is not yours: * pins the playlist itself, not a song of it.
+            View::Playlist if self.open.as_ref().is_some_and(|o| !self.owns(&o.playlist)) => {
+                self.open.as_ref().map(|o| o.playlist.clone()).map(|p| Pin::Playlist { uri: p.uri, name: p.name, images: p.images })
+            }
             View::Artist => match self.page() {
                 Some(Page::Artist(a)) => match a.rows.current() {
                     Some(ArtistRow::Album(album)) => Some(Pin::Album { album: album.clone() }),

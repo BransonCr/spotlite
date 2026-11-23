@@ -87,7 +87,7 @@ impl App {
         if self.menu.is_some() {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('.') => self.close_menu(),
-                KeyCode::Char('F') if self.menu.as_ref().is_some_and(|m| m.track.is_none() && !m.is_theme()) => {
+                KeyCode::Char('F') if self.menu.as_ref().is_some_and(Menu::is_filters) => {
                     self.close_menu()
                 }
                 KeyCode::Char('T') if self.menu.as_ref().is_some_and(Menu::is_theme) => self.close_menu(),
@@ -146,6 +146,14 @@ impl App {
                     self.history_at = None;
                 }
                 KeyCode::Enter => self.submit_search(),
+                _ if self.keys.get(&key).and_then(SearchKind::of_act).is_some() => {
+                    // Alt+1 … Alt+4 while typing: search the text in the box as that kind.
+                    if let Some(kind) = self.keys.get(&key).and_then(SearchKind::of_act) {
+                        self.submit_search();
+                        self.typing = true;
+                        self.set_search_kind(kind);
+                    }
+                }
                 _ => {
                     if self.query.edit(&key) == Edit::Changed {
                         self.search_due = Some(Instant::now() + SEARCH_DELAY);
@@ -155,7 +163,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char(c @ '1'..='9') if !ctrl => {
+            KeyCode::Char(c @ '1'..='9') if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
                 if let Some(loc) = self.locs().get(c as usize - '1' as usize).cloned() {
                     self.go(loc);
                 }
@@ -189,8 +197,7 @@ impl App {
             self.help_scroll = 0;
         } else if self.menu.is_none() && self.confirm.is_none() && self.undo.is_none() {
             if !self.typing {
-                self.switch_tab(Tab::Search);
-                self.typing = true;
+                self.start_typing();
             }
             self.query.insert(text);
             self.search_due = Some(Instant::now() + SEARCH_DELAY);
@@ -240,10 +247,7 @@ impl App {
                 self.help_query.clear();
                 self.help_scroll = 0;
             }
-            Act::Search => {
-                self.switch_tab(Tab::Search);
-                self.typing = true;
-            }
+            Act::Search => self.start_typing(),
             Act::PlayerLog => self.open_player_log(),
             Act::Palette => self.palette = Some(Default::default()),
             Act::UndoTree => self.open_undo(),
@@ -261,6 +265,11 @@ impl App {
                 self.set_search_kind(SearchKind::ALL[(i + 1) % SearchKind::ALL.len()]);
             }
             Act::SearchType => {}
+            Act::SearchSongs | Act::SearchArtists | Act::SearchAlbums | Act::SearchPlaylists => {
+                if let Some(kind) = SearchKind::of_act(act) {
+                    self.set_search_kind(kind);
+                }
+            }
             Act::Theme => self.open_themes(),
             Act::Pin => self.pin_selected(),
             Act::Card => {
@@ -272,7 +281,10 @@ impl App {
             Act::Discover if self.view() == View::Random => self.reroll(),
             Act::Discover => {}
             Act::Back => self.back(),
-            Act::Actions => self.open_menu(),
+            Act::Actions => match self.selected_playlist() {
+                Some(pl) => self.open_playlist_menu(pl),
+                None => self.open_menu(),
+            },
             Act::Artist => {
                 if let Some(t) = self.target_track() {
                     self.go_to_artist(&t);

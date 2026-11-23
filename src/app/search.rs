@@ -102,6 +102,16 @@ impl App {
         }
     }
 
+    /// Opens the search box empty for a new search. The last results stay until it runs;
+    /// ↑ in the box brings back earlier searches.
+    pub(super) fn start_typing(&mut self) {
+        self.switch_tab(Tab::Search);
+        self.query.clear();
+        self.history_at = None;
+        self.search_due = None;
+        self.typing = true;
+    }
+
     pub(super) fn submit_search(&mut self) {
         let q = self.query.trim().to_owned();
         self.typing = false;

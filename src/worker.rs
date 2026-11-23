@@ -63,6 +63,10 @@ pub enum Cmd {
     ToggleSaved(String),
     /// A new private playlist with these songs (maybe none).
     CreatePlaylist { name: String, description: String, uris: Vec<String> },
+    /// A copy of a playlist in your library: every song of `from` in a new playlist `name`.
+    CopyPlaylist { from: String, name: String, description: String },
+    /// Saves a playlist to your library (follows it), or removes it.
+    FollowPlaylist { playlist: Box<Playlist>, follow: bool },
     /// Saves a share card picture of the song (on its own thread).
     Card(Box<Track>),
     /// Profile, popular songs and albums of an artist (by id).
@@ -142,6 +146,8 @@ pub enum Msg {
     Sampling { genre: String, result: Result<Track, String> },
     /// A playlist was created.
     Created(Box<Playlist>),
+    /// A playlist was saved to (true) or removed from your library.
+    Followed { playlist: Box<Playlist>, follow: bool },
     /// The player state could not be read: no connection (the count of failures in a row).
     Offline(u32),
     /// The connection is back.
@@ -666,17 +672,39 @@ impl Worker {
                 Ok(())
             }
             Cmd::CreatePlaylist { name, description, uris } => {
-                let pl = self.api.create_playlist(&name, &description)?;
-                for chunk in uris.chunks(100) {
-                    self.api.add_to_playlist(&pl.id, chunk, None)?;
-                }
-                self.stale.insert(kept::PLAYLISTS.to_owned(), SystemTime::now());
-                self.send(Msg::Created(Box::new(pl)));
+                self.create_with(&name, &description, &uris)?;
                 self.send(Msg::Info(match uris.len() {
                     0 => format!("Made the new playlist “{name}”"),
                     1 => format!("Saved 1 song to the new playlist “{name}”"),
                     n => format!("Saved {n} songs to the new playlist “{name}”"),
                 }));
+                Ok(())
+            }
+            Cmd::CopyPlaylist { from, name, description } => {
+                let uris = match self.playlist_song_uris(&from) {
+                    Ok(uris) => uris,
+                    Err(e) => {
+                        self.send(Msg::Error(format!("Could not read the songs of that playlist, so no copy was made: {e:#}")));
+                        return Ok(());
+                    }
+                };
+                self.create_with(&name, &description, &uris)?;
+                self.send(Msg::Info(match uris.len() {
+                    1 => format!("Copied 1 song to “{name}”"),
+                    n => format!("Copied {n} songs to “{name}”"),
+                }));
+                Ok(())
+            }
+            Cmd::FollowPlaylist { playlist, follow } => {
+                self.api.set_followed(&playlist.id, follow)?;
+                self.stale.insert(kept::PLAYLISTS.to_owned(), SystemTime::now());
+                let text = if follow {
+                    format!("Added “{}” to your library", playlist.name)
+                } else {
+                    format!("Removed “{}” from your library", playlist.name)
+                };
+                self.send(Msg::Followed { playlist, follow });
+                self.send(Msg::Info(text));
                 Ok(())
             }
             Cmd::SetSavedMany { uris, saved } => {
@@ -1158,6 +1186,41 @@ impl Worker {
     }
 
     /// The saved songs of a playlist, if they are what Spotify has now.
+    /// Makes a playlist with these songs (100 in one request) and tells the UI.
+    fn create_with(&mut self, name: &str, description: &str, uris: &[String]) -> Result<()> {
+        let pl = self.api.create_playlist(name, description)?;
+        for chunk in uris.chunks(100) {
+            self.api.add_to_playlist(&pl.id, chunk, None)?;
+        }
+        self.stale.insert(kept::PLAYLISTS.to_owned(), SystemTime::now());
+        self.send(Msg::Created(Box::new(pl)));
+        Ok(())
+    }
+
+    /// Every song of a playlist, in order: the kept copy, else the client protocol (any
+    /// playlist), else the Web API page by page. Local files and episodes are left out.
+    fn playlist_song_uris(&mut self, id: &str) -> Result<Vec<String>> {
+        let client = || crate::radio::playlist_uris(&format!("spotify:playlist:{id}")).ok();
+        let uris = if let Some(tracks) = self.kept_playlist(id) {
+            tracks.into_iter().map(|t| t.uri).collect()
+        } else if let Some(uris) = crate::client::AVAILABLE.then(client).flatten() {
+            uris
+        } else {
+            let mut all = Vec::new();
+            let mut offset = 0;
+            loop {
+                let page = self.api.playlist_tracks(id, offset)?;
+                all.extend(page.items.into_iter().map(|t| t.uri));
+                offset += page.raw;
+                if page.raw == 0 || offset >= page.total {
+                    break;
+                }
+            }
+            all
+        };
+        Ok(song_uris(uris))
+    }
+
     fn kept_playlist(&self, id: &str) -> Option<Vec<Track>> {
         let name = kept::playlist(id);
         if !self.current(&name, &name, None) {
@@ -1293,6 +1356,11 @@ impl Worker {
 }
 
 /// The load of a search's first page.
+/// The songs of a list of URIs: local files and episodes cannot go into a copy.
+fn song_uris(uris: Vec<String>) -> Vec<String> {
+    uris.into_iter().filter(|u| u.starts_with("spotify:track:")).collect()
+}
+
 fn is_search_start(cmd: &Cmd) -> bool {
     matches!(cmd, Cmd::Load { list: List::Search(_) | List::Found { .. }, offset: 0 })
 }
@@ -1634,5 +1702,11 @@ mod tests {
         assert!(background(&Cmd::Poll) && !background(&Cmd::Next));
         assert!(is_search_start(&Cmd::Load { list: List::Search("a".into()), offset: 0 }));
         assert!(!is_search_start(&Cmd::Load { list: List::Search("a".into()), offset: 10 }));
+    }
+
+    #[test]
+    fn a_copy_takes_only_songs() {
+        let uris = ["spotify:track:a", "spotify:local:x:y:z:1", "spotify:episode:e", "spotify:track:b"];
+        assert_eq!(song_uris(uris.iter().map(|u| u.to_string()).collect()), ["spotify:track:a", "spotify:track:b"]);
     }
 }

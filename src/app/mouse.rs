@@ -258,8 +258,9 @@ impl App {
             let loc = loc.clone();
             self.go(loc);
         } else if h.search_box.contains(pos) {
-            self.switch_tab(Tab::Search);
-            self.typing = true;
+            if !self.typing || self.view() != View::Search {
+                self.start_typing();
+            }
         } else if h.back.contains(pos) {
             self.back();
         } else if h.new_playlist.contains(pos) {

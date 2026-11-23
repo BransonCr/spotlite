@@ -1892,3 +1892,134 @@ fn spotify_shuffle_stays_on_when_the_player_refuses_song_lists() {
     app.on_msg(playing_in("spotify:playlist:p1"));
     assert!(!app.true_shuffle);
 }
+
+#[test]
+fn slash_opens_an_empty_box_and_keeps_the_results() {
+    let (mut app, rx) = test_app();
+    app.query = "bowie".into();
+    app.submit_search();
+    app.tick();
+    drain(&rx);
+    app.on_msg(Msg::Tracks { list: List::Search("bowie".into()), offset: 0, page: page(0..10, 10) });
+    app.on_key(KeyEvent::from(KeyCode::Char('/')));
+    assert!(app.typing);
+    assert!(app.query.is_empty(), "the old text is gone");
+    assert_eq!(app.searched, "bowie");
+    assert_eq!(app.search.items.len(), 10, "old results stay until the new search");
+    // ↑ still brings back the last search.
+    app.on_key(KeyEvent::from(KeyCode::Up));
+    assert_eq!(app.query.to_string(), "bowie");
+}
+
+#[test]
+fn alt_digits_pick_the_result_kind() {
+    let (mut app, rx) = test_app();
+    app.tab = Tab::Search;
+    app.query = "lofi".into();
+    app.submit_search();
+    let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+    app.on_key(alt('3'));
+    assert_eq!(app.search_kind, SearchKind::Albums);
+    assert_eq!(app.tab, Tab::Search, "alt-3 is not the third tab");
+    app.on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL));
+    assert_eq!(app.search_kind, SearchKind::Songs);
+    drain(&rx);
+
+    // While typing: the text in the box is searched as that kind, and typing goes on.
+    app.on_key(KeyEvent::from(KeyCode::Char('/')));
+    for c in "jazz".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    app.on_key(alt('4'));
+    assert_eq!(app.search_kind, SearchKind::Playlists);
+    assert_eq!(app.searched, "jazz");
+    assert!(app.typing);
+    assert_eq!(app.query.to_string(), "jazz", "the key is not typed into the box");
+    app.tick();
+    let cmds = drain(&rx);
+    let found = |c: &Cmd| matches!(c, Cmd::Load { list: List::Found { query, kind: "playlist" }, .. } if query == "jazz");
+    assert!(cmds.iter().any(found), "{cmds:?}");
+}
+
+fn their_pl(id: &str, name: &str) -> Playlist {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "uri": format!("spotify:playlist:{id}"), "name": name, "owner": {"id": "dj"}
+    }))
+    .unwrap()
+}
+
+fn found_playlist(app: &mut App, p: Playlist) {
+    app.tab = Tab::Search;
+    app.query = "mix".into();
+    app.submit_search();
+    app.set_search_kind(SearchKind::Playlists);
+    let page = ApiPage { items: vec![Found::Playlist(p)], raw: 1, total: 1 };
+    app.on_msg(Msg::Found { list: List::Found { query: "mix".into(), kind: "playlist" }, offset: 0, page });
+}
+
+fn menu_labels(app: &App) -> Vec<String> {
+    app.menu.as_ref().map(|m| m.items.iter().map(|(_, l, _)| l.clone()).collect()).unwrap_or_default()
+}
+
+#[test]
+fn playlist_menu_pins_saves_and_copies() {
+    let (mut app, rx) = test_app();
+    app.user_id = Some("me".into());
+    app.can_edit = true;
+    found_playlist(&mut app, their_pl("p1", "Night mix"));
+    drain(&rx);
+
+    app.on_key(KeyEvent::from(KeyCode::Char('.')));
+    let labels = menu_labels(&app);
+    for want in ["Pin to the sidebar", "Add to your library", "Copy to a new playlist…"] {
+        assert!(labels.iter().any(|l| l == want), "{want}: {labels:?}");
+    }
+
+    // * pins it.
+    app.on_key(KeyEvent::from(KeyCode::Char('*')));
+    assert!(app.menu.is_none());
+    assert_eq!(app.pins.first().map(|p| p.uri()).as_deref(), Some("spotify:playlist:p1"));
+
+    // + saves it to the library; the Playlists tab shows it once Spotify says so.
+    app.on_key(KeyEvent::from(KeyCode::Char('.')));
+    app.on_key(KeyEvent::from(KeyCode::Char('+')));
+    let cmds = drain(&rx);
+    let follow = |c: &Cmd| matches!(c, Cmd::FollowPlaylist { playlist, follow: true } if playlist.id == "p1");
+    assert!(cmds.iter().any(follow), "{cmds:?}");
+    app.on_msg(Msg::Followed { playlist: Box::new(their_pl("p1", "Night mix")), follow: true });
+    assert!(app.playlists.items.iter().any(|p| p.id == "p1"));
+    app.on_key(KeyEvent::from(KeyCode::Char('.')));
+    assert!(menu_labels(&app).iter().any(|l| l == "Remove from your library"));
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+
+    // c asks for a name, then copies.
+    app.on_key(KeyEvent::from(KeyCode::Char('.')));
+    app.on_key(KeyEvent::from(KeyCode::Char('c')));
+    assert_eq!(app.naming.as_ref().map(|n| n.name.to_string()).as_deref(), Some("Night mix (copy)"));
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    let cmds = drain(&rx);
+    let copy = |c: &Cmd| matches!(c, Cmd::CopyPlaylist { from, name, .. } if from == "p1" && name == "Night mix (copy)");
+    assert!(cmds.iter().any(copy), "{cmds:?}");
+}
+
+#[test]
+fn own_playlist_menu_has_no_library_entry() {
+    let (mut app, _rx) = test_app();
+    app.user_id = Some("me".into());
+    found_playlist(&mut app, pl("p2", "Mine"));
+    app.on_key(KeyEvent::from(KeyCode::Char('.')));
+    let labels = menu_labels(&app);
+    assert!(!labels.iter().any(|l| l.contains("library")), "{labels:?}");
+    assert!(labels.iter().any(|l| l == "Copy to a new playlist…"));
+}
+
+#[test]
+fn star_in_someone_elses_playlist_pins_the_playlist() {
+    let (mut app, _rx) = test_app();
+    app.user_id = Some("me".into());
+    app.switch_tab(Tab::Playlists);
+    app.open_playlist(their_pl("p3", "Theirs"));
+    app.on_msg(Msg::Tracks { list: List::Playlist("p3".into()), offset: 0, page: page(0..3, 3) });
+    app.pin_selected();
+    assert_eq!(app.pins.first().map(|p| p.uri()).as_deref(), Some("spotify:playlist:p3"));
+}

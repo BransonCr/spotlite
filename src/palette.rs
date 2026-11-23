@@ -68,6 +68,16 @@ pub fn entries(app: &App) -> Vec<Entry> {
                 SearchKind::Playlists => "songs",
             };
             add(&format!("Search results: show {next}"), Act::SearchType);
+            for (kind, act) in [
+                (SearchKind::Songs, Act::SearchSongs),
+                (SearchKind::Artists, Act::SearchArtists),
+                (SearchKind::Albums, Act::SearchAlbums),
+                (SearchKind::Playlists, Act::SearchPlaylists),
+            ] {
+                if kind != app.search_kind {
+                    add(&format!("Search results: {}", kind.title().to_lowercase()), act);
+                }
+            }
         }
         _ => add("Show the queue", Act::QueueView),
     }
