@@ -218,6 +218,7 @@ pub enum Action {
     PinPlaylist(Box<Playlist>),
     FollowPlaylist(Box<Playlist>),
     CopyPlaylist(Box<Playlist>),
+    DeletePlaylist(Box<Playlist>),
 }
 
 /// A pop-up list of actions: for a track (`.` or right-click), or the radio filters (`F`).
@@ -901,6 +902,11 @@ impl App {
         self.selected_track().or_else(|| self.playback.as_ref()?.item.clone())
     }
 
+    /// You made it (a collaborative playlist of someone else's can be edited, not deleted).
+    pub fn is_mine(&self, playlist: &Playlist) -> bool {
+        self.user_id.as_deref() == Some(playlist.owner.id.as_str())
+    }
+
     pub fn owns(&self, playlist: &Playlist) -> bool {
         playlist.collaborative || self.user_id.as_deref() == Some(playlist.owner.id.as_str())
     }
@@ -1413,7 +1419,7 @@ impl App {
                 let known = self.playlists.items.iter().position(|p| p.id == playlist.id);
                 match (follow, known) {
                     (true, None) => {
-                        self.playlists.items.insert(0, *playlist);
+                        self.playlists.items.insert(0, (*playlist).clone());
                         self.playlists.fetched += 1;
                         self.playlists.total = self.playlists.total.map(|t| t + 1);
                     }
@@ -1423,6 +1429,13 @@ impl App {
                         self.playlists.total = self.playlists.total.map(|t| t.saturating_sub(1));
                     }
                     _ => {}
+                }
+                if !follow && self.is_mine(&playlist) {
+                    if self.open.as_ref().is_some_and(|o| o.playlist.id == playlist.id) {
+                        self.close_playlist();
+                    }
+                    self.open_cache.retain(|o| o.playlist.id != playlist.id);
+                    self.pins.retain(|p| p.uri() != playlist.uri);
                 }
                 self.rebuild_rows();
             }

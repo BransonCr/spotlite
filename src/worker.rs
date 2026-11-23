@@ -67,6 +67,8 @@ pub enum Cmd {
     CopyPlaylist { from: String, name: String, description: String },
     /// Saves a playlist to your library (follows it), or removes it.
     FollowPlaylist { playlist: Box<Playlist>, follow: bool },
+    /// Deletes a playlist you made (Spotify keeps it for 90 days; your account page restores it).
+    DeletePlaylist(Box<Playlist>),
     /// Saves a share card picture of the song (on its own thread).
     Card(Box<Track>),
     /// Profile, popular songs and albums of an artist (by id).
@@ -704,6 +706,15 @@ impl Worker {
                     format!("Removed “{}” from your library", playlist.name)
                 };
                 self.send(Msg::Followed { playlist, follow });
+                self.send(Msg::Info(text));
+                Ok(())
+            }
+            Cmd::DeletePlaylist(playlist) => {
+                // Spotify has no delete: the owner unfollows the playlist, and it is gone.
+                self.api.set_followed(&playlist.id, false)?;
+                self.stale.insert(kept::PLAYLISTS.to_owned(), SystemTime::now());
+                let text = format!("Deleted “{}”", playlist.name);
+                self.send(Msg::Followed { playlist, follow: false });
                 self.send(Msg::Info(text));
                 Ok(())
             }

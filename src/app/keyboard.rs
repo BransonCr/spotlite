@@ -315,11 +315,14 @@ impl App {
                 }
             }
             Act::Remove if self.queue_open => self.queue_remove(),
-            Act::Remove => {
-                if let Some(t) = self.selected_track() {
-                    self.ask_remove(t);
+            Act::Remove => match self.selected_playlist() {
+                Some(pl) => self.ask_remove_playlist(pl),
+                None => {
+                    if let Some(t) = self.selected_track() {
+                        self.ask_remove(t);
+                    }
                 }
-            }
+            },
             Act::Filters => self.open_filters(),
             Act::Jump => self.jump_to_playing(),
             Act::VolumeUp => self.change_volume(true),

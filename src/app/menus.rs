@@ -79,13 +79,45 @@ impl App {
         let mut items = vec![("⏎", "Open".to_owned(), Action::OpenPlaylist(b())), ("P", "Play".to_owned(), Action::PlayPlaylist(b()))];
         let pinned = self.pins.iter().any(|p| p.uri() == pl.uri);
         items.push(("*", if pinned { "Unpin from the sidebar" } else { "Pin to the sidebar" }.to_owned(), Action::PinPlaylist(b())));
-        if !self.owns(pl) {
+        if !self.is_mine(pl) {
             let saved = self.playlists.items.iter().any(|p| p.id == pl.id);
             let label = if saved { "Remove from your library" } else { "Add to your library" };
             items.push(("+", label.to_owned(), Action::FollowPlaylist(b())));
         }
         items.push(("c", "Copy to a new playlist…".to_owned(), Action::CopyPlaylist(b())));
+        if self.is_mine(pl) {
+            items.push(("X", "Delete playlist…".to_owned(), Action::DeletePlaylist(b())));
+        }
         items
+    }
+
+    /// `D` on a playlist: asks to delete it if you made it, else asks to remove it from your
+    /// library.
+    pub(super) fn ask_remove_playlist(&mut self, pl: Playlist) {
+        if self.is_mine(&pl) {
+            self.ask_delete_playlist(pl);
+        } else if !self.playlists.items.iter().any(|p| p.id == pl.id) {
+            self.info(format!("“{}” is not in your library.", pl.name));
+        } else if !self.can_edit {
+            self.error("Run `spotlite auth` again to allow editing your library.");
+        } else {
+            self.confirm = Some(Confirm {
+                text: format!("Remove “{}” from your library?", pl.name),
+                cmd: Cmd::FollowPlaylist { playlist: Box::new(pl), follow: false },
+            });
+        }
+    }
+
+    /// Asks before a playlist you made is deleted.
+    pub(super) fn ask_delete_playlist(&mut self, pl: Playlist) {
+        if !self.can_edit {
+            self.error("Run `spotlite auth` again to allow editing playlists.");
+            return;
+        }
+        self.confirm = Some(Confirm {
+            text: format!("Delete your playlist “{}”? (Spotify can restore it for 90 days)", pl.name),
+            cmd: Cmd::DeletePlaylist(Box::new(pl)),
+        });
     }
 
     /// The menu of a playlist (`.` on a playlist, or in an open playlist with no song).
@@ -120,6 +152,7 @@ impl App {
                     self.send(Cmd::FollowPlaylist { playlist: p, follow });
                 }
             }
+            Action::DeletePlaylist(p) => self.ask_delete_playlist(*p),
             Action::CopyPlaylist(p) => {
                 if !self.can_edit {
                     self.error("Run `spotlite auth` again to allow editing playlists.");
@@ -340,7 +373,8 @@ impl App {
             | Action::PlayPlaylist(_)
             | Action::PinPlaylist(_)
             | Action::FollowPlaylist(_)
-            | Action::CopyPlaylist(_) => {}
+            | Action::CopyPlaylist(_)
+            | Action::DeletePlaylist(_) => {}
         }
     }
 

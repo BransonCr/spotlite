@@ -2023,3 +2023,45 @@ fn star_in_someone_elses_playlist_pins_the_playlist() {
     app.pin_selected();
     assert_eq!(app.pins.first().map(|p| p.uri()).as_deref(), Some("spotify:playlist:p3"));
 }
+
+#[test]
+fn d_deletes_your_playlist_after_a_yes() {
+    let (mut app, rx) = test_app();
+    app.user_id = Some("me".into());
+    app.can_edit = true;
+    app.switch_tab(Tab::Playlists);
+    app.on_msg(Msg::Playlists { offset: 0, page: ApiPage { items: vec![pl("p1", "Old mix")], raw: 1, total: 1 } });
+    app.pins.push(Pin::Playlist { uri: "spotify:playlist:p1".into(), name: "Old mix".into(), images: Vec::new() });
+    drain(&rx);
+    app.on_key(KeyEvent::from(KeyCode::Char('D')));
+    assert!(app.confirm.as_ref().is_some_and(|c| c.text.contains("Delete your playlist")));
+    app.on_key(KeyEvent::from(KeyCode::Char('y')));
+    let cmds = drain(&rx);
+    assert!(cmds.iter().any(|c| matches!(c, Cmd::DeletePlaylist(p) if p.id == "p1")), "{cmds:?}");
+    app.on_msg(Msg::Followed { playlist: Box::new(pl("p1", "Old mix")), follow: false });
+    assert!(app.playlists.items.is_empty());
+    assert!(app.pins.is_empty(), "a deleted playlist leaves the sidebar too");
+}
+
+#[test]
+fn d_removes_someone_elses_playlist_from_the_library() {
+    let (mut app, rx) = test_app();
+    app.user_id = Some("me".into());
+    app.can_edit = true;
+    app.switch_tab(Tab::Playlists);
+    app.on_msg(Msg::Playlists { offset: 0, page: ApiPage { items: vec![their_pl("p2", "Their mix")], raw: 1, total: 1 } });
+    drain(&rx);
+    app.on_key(KeyEvent::from(KeyCode::Char('D')));
+    assert!(app.confirm.as_ref().is_some_and(|c| c.text.contains("Remove “Their mix” from your library")));
+    app.on_key(KeyEvent::from(KeyCode::Char('y')));
+    let cmds = drain(&rx);
+    let unfollow = |c: &Cmd| matches!(c, Cmd::FollowPlaylist { playlist, follow: false } if playlist.id == "p2");
+    assert!(cmds.iter().any(unfollow), "{cmds:?}");
+
+    // The menu of your own playlist offers delete, not the library.
+    app.on_msg(Msg::Playlists { offset: 0, page: ApiPage { items: vec![pl("p3", "Mine")], raw: 1, total: 1 } });
+    app.open_playlist_menu(pl("p3", "Mine"));
+    let labels = menu_labels(&app);
+    assert!(labels.iter().any(|l| l == "Delete playlist…"), "{labels:?}");
+    assert!(!labels.iter().any(|l| l.contains("library")), "{labels:?}");
+}

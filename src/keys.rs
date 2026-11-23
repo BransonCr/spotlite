@@ -149,7 +149,7 @@ pub const ALL: &[Info] = &[
     i(Act::Randomize, "randomize", "Song", "50 random songs of a genre", &["z"]),
     i(Act::AddToPlaylist, "add_to_playlist", "Song", "add to a playlist", &["e"]),
     i(Act::AddAgain, "add_again", "Song", "add to the last playlist again", &["E"]),
-    i(Act::Remove, "remove", "Song", "remove from this playlist or the queue", &["D"]),
+    i(Act::Remove, "remove", "Song", "remove from this playlist or the queue; on a playlist: delete it or remove it from your library", &["D"]),
     i(Act::Like, "like", "Song", "like / unlike", &["f"]),
     i(Act::Mark, "mark", "Song", "mark (act on all marked)", &["w"]),
     i(Act::MarkAll, "mark_all", "Song", "mark all, or none", &["W"]),
