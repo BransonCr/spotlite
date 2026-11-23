@@ -437,7 +437,10 @@ async fn follow(mut events: PlayerEventChannel, shared: Arc<Shared>, media: Opti
                 });
                 song = Some(s);
             }
-            PlayerEvent::Playing { .. } => playing = true,
+            PlayerEvent::Playing { track_id, .. } => {
+                crate::log::mark(&format!("playing {track_id}"));
+                playing = true
+            }
             PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. } | PlayerEvent::SessionDisconnected { .. } => {
                 playing = false
             }

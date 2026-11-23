@@ -447,6 +447,10 @@ pub struct App {
     pub images: Images,
     pub hits: Hits,
     tx: Sender<Cmd>,
+    /// Timing marks to log after the next frame is drawn (`SPOTLITE_LOG`).
+    pub drawn_marks: Vec<String>,
+    /// The first player state came (the `ready` timing mark).
+    ready_marked: bool,
     in_flight: usize,
     poll_pending: bool,
     next_poll: Instant,
@@ -638,6 +642,8 @@ impl App {
             images,
             hits: Hits::default(),
             tx,
+            drawn_marks: Vec::new(),
+            ready_marked: false,
             in_flight: 0,
             poll_pending: true,
             next_poll: now + POLL_PLAYING,
@@ -1091,6 +1097,10 @@ impl App {
                 self.device = name;
             }
             Msg::Playback(pb) => {
+                if !self.ready_marked {
+                    self.ready_marked = true;
+                    self.drawn_marks.push("ready".into());
+                }
                 let mut pb = pb.map(|b| *b);
                 if let (Some((v, at)), Some(d)) = (self.vol_set, pb.as_mut().and_then(|p| p.device.as_mut())) {
                     if at.elapsed() < VOLUME_HOLD {
@@ -1385,11 +1395,21 @@ impl App {
                 }
             }
             Msg::Found { list, offset, page } => {
+                if offset == 0 && crate::log::on() {
+                    if let List::Found { query, .. } = &list {
+                        self.drawn_marks.push(format!("search-shown {query}"));
+                    }
+                }
                 if self.is_current_found(&list) {
                     self.found.apply(offset, page);
                 }
             }
             Msg::Tracks { list, offset, page } => {
+                if offset == 0 && crate::log::on() {
+                    if let List::Search(query) = &list {
+                        self.drawn_marks.push(format!("search-shown {query}"));
+                    }
+                }
                 if let Some(listing) = self.listing_for(&list) {
                     listing.apply(offset, page);
                 }

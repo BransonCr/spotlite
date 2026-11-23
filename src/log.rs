@@ -27,3 +27,10 @@ pub fn line(text: &str) {
         let _ = writeln!(f, "{}.{:03} {text}", now.as_secs(), now.subsec_millis());
     }
 }
+
+/// Adds a timing mark (`mark <what>`), for `contrib/bench.py`.
+pub fn mark(what: &str) {
+    if on() {
+        line(&format!("mark {what}"));
+    }
+}

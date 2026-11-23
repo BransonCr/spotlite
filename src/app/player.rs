@@ -181,6 +181,7 @@ impl App {
 
     /// Sends a play command whose first song is `first` (when known), and shows the change.
     pub(super) fn play(&mut self, cmd: Cmd, first: Option<Track>) {
+        crate::log::mark(&format!("play-key {}", first.as_ref().map_or("-", |t| t.uri.as_str())));
         self.send(cmd);
         self.expect_switch(first, false);
     }
