@@ -38,7 +38,7 @@ import fcntl
 import time
 from pathlib import Path
 
-QUERIES = ["radiohead creep", "daft punk one more time", "miles davis so what", "nirvana lithium", "fleetwood mac dreams"]
+QUERIES = ["radiohead creep", "daft punk one more time", "queen bohemian rhapsody", "adele hello", "the beatles let it be"]
 METRICS = [
     ("open", "start", "ready"),
     ("open-cold", "start", "ready"),
