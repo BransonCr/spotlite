@@ -101,6 +101,14 @@ pub fn run(port: u16, ctl: Ctl) -> bool {
     ask(port, Request::Ctl(ctl)).as_deref() == Some("ok")
 }
 
+pub fn load(port: u16, load: proto::Load) -> bool {
+    ask(port, Request::Load(load)).as_deref() == Some("ok")
+}
+
+pub fn preload(port: u16, uri: &str) -> bool {
+    ask(port, Request::Preload(uri.to_owned())).as_deref() == Some("ok")
+}
+
 /// A stream that lasts until the daemon or the reader ends it.
 fn open(port: u16, req: Request) -> Option<Stream> {
     let mut s = connect(port, Duration::from_secs(2))?;

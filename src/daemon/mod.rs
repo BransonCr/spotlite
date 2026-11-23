@@ -14,11 +14,11 @@ use crate::control::Ctl;
 use crate::engine::builtin;
 use crate::engine::proto::{self, Request, Song};
 use anyhow::{anyhow, bail, Context, Result};
-use librespot_connect::{ConnectConfig, Spirc};
+use librespot_connect::{ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack, Spirc};
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::DeviceType;
-use librespot_core::{Session, SessionConfig};
+use librespot_core::{Session, SessionConfig, SpotifyUri};
 use librespot_metadata::audio::{AudioItem, UniqueFields};
 use librespot_playback::audio_backend;
 use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
@@ -149,6 +149,8 @@ struct Shared {
     token: String,
     /// The Connect device, while it is connected.
     spirc: Mutex<Option<Arc<Spirc>>>,
+    /// Its player, for preloads.
+    player: Mutex<Option<Arc<Player>>>,
     /// Readers of player changes, and the last change (a new reader gets it at once).
     followers: Mutex<(Vec<TcpStream>, String)>,
     tap: Arc<Tap>,
@@ -196,6 +198,7 @@ fn serve(cfg: &Config) -> Result<()> {
         started: Instant::now(),
         token,
         spirc: Mutex::new(None),
+        player: Mutex::new(None),
         followers: Mutex::new((Vec::new(), proto::follow_line(false, None))),
         tap: Tap::start(),
         quit: AtomicBool::new(false),
@@ -270,6 +273,21 @@ fn answer(conn: TcpStream, shared: &Shared) {
                 Err(e) => format!("err {e}"),
             },
         },
+        Request::Load(l) => match shared.spirc.lock().ok().and_then(|s| s.clone()) {
+            None => "err not connected".to_owned(),
+            Some(spirc) => match load(&spirc, l) {
+                Ok(()) => "ok".to_owned(),
+                Err(e) => format!("err {e}"),
+            },
+        },
+        Request::Preload(uri) => match (shared.player.lock().ok().and_then(|p| p.clone()), SpotifyUri::from_uri(&uri)) {
+            (Some(player), Ok(id)) => {
+                player.preload(id);
+                "ok".to_owned()
+            }
+            (None, _) => "err not connected".to_owned(),
+            (_, Err(e)) => format!("err {e}"),
+        },
     };
     let _ = out.write_all(format!("{reply}\n").as_bytes());
 }
@@ -283,6 +301,23 @@ fn command(spirc: &Spirc, ctl: Ctl) -> Result<(), librespot_core::Error> {
         Ctl::Seek(ms) => spirc.set_position_ms(ms.min(u64::from(u32::MAX)) as u32),
         Ctl::Volume(pct) => spirc.set_volume(volume(pct)),
     }
+}
+
+/// Plays a context or songs here at once: the device takes the playback (a load is ignored
+/// while it is not the active one), then loads.
+fn load(spirc: &Spirc, l: proto::Load) -> Result<(), librespot_core::Error> {
+    spirc.activate()?;
+    let options = |playing_track| LoadRequestOptions {
+        start_playing: true,
+        seek_to: l.position_ms.min(u64::from(u32::MAX)) as u32,
+        context_options: Some(LoadContextOptions::Options(Options { shuffle: l.shuffle, ..Default::default() })),
+        playing_track,
+    };
+    let request = match l.context {
+        Some(uri) => LoadRequest::from_context_uri(uri, options(l.from.map(PlayingTrack::Uri))),
+        None => LoadRequest::from_tracks(l.tracks, options(Some(PlayingTrack::Index(l.offset as u32)))),
+    };
+    spirc.load(request)
 }
 
 /// A volume in percent as librespot's 0..=65535.
@@ -313,6 +348,9 @@ async fn play(name: String, shared: Arc<Shared>, media: Option<std::sync::mpsc::
             Box::new(TapSink::new(output(None, OUTPUT_FORMAT), tap))
         });
         let events = tokio::spawn(follow(player.get_player_event_channel(), shared.clone(), media.clone()));
+        if let Ok(mut p) = shared.player.lock() {
+            *p = Some(player.clone());
+        }
         let connect = ConnectConfig {
             name: name.clone(),
             device_type: DeviceType::Computer,
@@ -332,6 +370,9 @@ async fn play(name: String, shared: Arc<Shared>, media: Option<std::sync::mpsc::
         }
         if let Ok(mut s) = shared.spirc.lock() {
             *s = None;
+        }
+        if let Ok(mut p) = shared.player.lock() {
+            *p = None;
         }
         events.abort();
         session.shutdown();

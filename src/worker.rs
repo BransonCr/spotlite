@@ -49,6 +49,8 @@ pub enum Cmd {
     Queue { uri: String, name: String, quiet: bool },
     /// Adds a song to Spotify's queue and skips to it (next with spotlite's queue).
     QueueNext { uri: String },
+    /// Loads a song in the player in the background, so that a skip to it starts at once.
+    Preload(String),
     /// Songs for the queue view's add picker.
     QueueSearch(String),
     CheckSaved(String),
@@ -192,6 +194,7 @@ fn control_lane(cmd: &Cmd) -> bool {
             | Cmd::Repeat(_)
             | Cmd::Queue { .. }
             | Cmd::QueueNext { .. }
+            | Cmd::Preload(_)
             | Cmd::CheckSaved(_)
             | Cmd::SetSaved { .. }
             | Cmd::SetSavedMany { .. }
@@ -419,7 +422,7 @@ impl Worker {
                 Cmd::Load { list, .. } => Some(list.clone()),
                 _ => None,
             };
-            let quiet = matches!(cmd, Cmd::CheckSaved(_) | Cmd::UpNext);
+            let quiet = matches!(cmd, Cmd::CheckSaved(_) | Cmd::UpNext | Cmd::Preload(_));
             if let Err(err) = self.handle(cmd) {
                 if kind == Kind::Poll && matches!(err.downcast_ref::<ApiError>(), Some(ApiError::Offline)) {
                     self.offline += 1;
@@ -511,6 +514,9 @@ impl Worker {
                     uri: format!("{}:collection", user.uri),
                     from: Some(from),
                 };
+                if self.load_here(&play, 0, self.spotify_shuffle()) {
+                    return Ok(());
+                }
                 self.player(|api, dev| api.play(dev, Some(&play)))
             }
             Cmd::PlayAt(play, ms) => self.start(&play, ms),
@@ -575,6 +581,10 @@ impl Worker {
             Cmd::QueueSearch(query) => {
                 let found = self.api.search_tracks(&query, 0)?.items;
                 self.send(Msg::QueueFound { query, found });
+                Ok(())
+            }
+            Cmd::Preload(uri) => {
+                crate::engine::preload(&uri);
                 Ok(())
             }
             Cmd::QueueNext { uri } => {
@@ -912,16 +922,23 @@ impl Worker {
             // Cannot list it: play it with Spotify's own shuffle.
             _ => {
                 self.send(Msg::SpotifyShuffles);
-                let _ = self.player(|api, dev| api.set_shuffle(dev, true));
                 let play = Play::Context { uri: context, from };
+                if self.load_here(&play, position_ms, true) {
+                    return Ok(());
+                }
+                let _ = self.player(|api, dev| api.set_shuffle(dev, true));
                 return self.player(|api, dev| api.play_at(dev, Some(&play), position_ms));
             }
         };
         let uris = shuffled(uris, from.as_deref(), &mut rand::thread_rng());
-        let _ = self.player(|api, dev| api.set_shuffle(dev, false));
         // Only keep the position when the song it is for comes first.
         let position_ms = if from.as_deref() == uris.first().map(String::as_str) { position_ms } else { 0 };
         let play = Play::Tracks { uris: uris.clone(), offset: 0 };
+        if self.load_here(&play, position_ms, false) {
+            self.send(Msg::Shuffled { context, uris });
+            return Ok(());
+        }
+        let _ = self.player(|api, dev| api.set_shuffle(dev, false));
         match self.player(|api, dev| api.play_at(dev, Some(&play), position_ms)) {
             Err(e) if refused_list(&e) => {
                 // spotifyd refuses song lists: play the context with Spotify's own shuffle.
@@ -1002,6 +1019,9 @@ impl Worker {
     /// "Restriction violated", as their librespot finds no context for it. Then the song plays
     /// in its album, from that song, and a message says so.
     fn start(&mut self, play: &Play, position_ms: u64) -> Result<()> {
+        if self.load_here(play, position_ms, self.spotify_shuffle()) {
+            return Ok(());
+        }
         let err = match self.player(|api, dev| api.play_at(dev, Some(play), position_ms)) {
             Ok(()) => return Ok(()),
             Err(e) => e,
@@ -1017,6 +1037,18 @@ impl Worker {
         let player = crate::engine::name();
         self.send(Msg::Info(format!("{player} refused the song list: the song plays in its album")));
         Ok(())
+    }
+
+    /// Plays `play` on spotlite's own player directly: no Web API request, and no wait for
+    /// Spotify to pass the command on. False when the player cannot (spotifyd, or it does not
+    /// run): the caller then uses the Web API.
+    fn load_here(&mut self, play: &Play, position_ms: u64, shuffle: bool) -> bool {
+        crate::engine::loads() && !cfg!(test) && crate::engine::load(play, position_ms, shuffle)
+    }
+
+    /// Spotify's own shuffle as the last poll showed it (a new play keeps it).
+    fn spotify_shuffle(&self) -> bool {
+        self.last.as_ref().is_some_and(|pb| pb.shuffle_state)
     }
 
     fn player(&mut self, mut f: impl FnMut(&mut Spotify, Option<&str>) -> Result<()>) -> Result<()> {

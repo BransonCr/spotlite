@@ -28,6 +28,36 @@ impl App {
         }
     }
 
+    /// Has spotlite's own player load a song in the background, so that it starts at once
+    /// (spotifyd cannot be asked to). While the selection moves through songs, the one it
+    /// rests on (Enter plays it); else the next song (a skip plays it). The player keeps
+    /// one preload at a time.
+    pub(super) fn preload_next(&mut self) {
+        if !crate::engine::loads() || self.switch.is_some() || !self.local() {
+            return;
+        }
+        let now = Instant::now();
+        let sel = self.selected_track().map(|t| t.uri);
+        if self.sel_seen.as_ref().map(|(u, _)| u) != sel.as_ref() {
+            self.sel_seen = sel.map(|u| (u, now));
+        }
+        let want = match &self.sel_seen {
+            Some((_, at)) if now - *at < PRELOAD_REST => return,
+            Some((uri, at)) if now - *at < PRELOAD_KEEP => Some(uri.clone()),
+            _ => self.next_song().map(|t| t.uri.clone()),
+        };
+        let Some(uri) = want else { return };
+        if self.preloaded.as_deref() != Some(uri.as_str()) && self.playing_uri() != Some(uri.as_str()) {
+            self.preloaded = Some(uri.clone());
+            self.send(Cmd::Preload(uri));
+        }
+    }
+
+    /// True while the selection waits to rest on a song before its preload.
+    pub(super) fn preload_due(&self) -> bool {
+        crate::engine::loads() && self.sel_seen.as_ref().is_some_and(|(_, at)| at.elapsed() < PRELOAD_REST)
+    }
+
     /// Ask for fresh player state shortly, to confirm a command.
     pub(super) fn poll_soon(&mut self) {
         if self.poll_pending {

@@ -128,6 +128,34 @@ pub fn run(ctl: Ctl) -> bool {
     pick!(builtin::run(get().port, ctl), spotifyd::run(ctl))
 }
 
+/// Plays `play` on the engine itself, with no Web API request (the built-in player only).
+/// `shuffle`: Spotify's own shuffle. False if it cannot (the caller then uses the Web API).
+pub fn load(play: &crate::api::Play, position_ms: u64, shuffle: bool) -> bool {
+    use crate::api::Play;
+    let load = match play {
+        Play::Context { uri, from } => {
+            proto::Load { context: Some(uri.clone()), from: from.clone(), position_ms, shuffle, ..Default::default() }
+        }
+        Play::Tracks { uris, offset } => {
+            proto::Load { tracks: uris.clone(), offset: *offset, position_ms, shuffle, ..Default::default() }
+        }
+    };
+    let _ = &load;
+    pick!(builtin::load(get().port, load), false)
+}
+
+/// Loads `uri` in the background, so that it starts at once when it plays next (the built-in
+/// player only). False if it cannot.
+pub fn preload(uri: &str) -> bool {
+    let _ = uri;
+    pick!(builtin::preload(get().port, uri), false)
+}
+
+/// True when play commands can go to the engine itself (`load`).
+pub fn loads() -> bool {
+    pick!(true, false)
+}
+
 /// The engine's player changes, one line each, until the engine stops. None if it cannot be
 /// followed now (try again later).
 pub fn follow() -> Option<Stream> {
