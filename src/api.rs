@@ -400,8 +400,11 @@ pub fn unix_now() -> u64 {
 
 impl Spotify {
     pub fn new(cfg: Config) -> Result<Self> {
+        // Three API threads at once: keep a connection for each, so none pays a new TLS
+        // handshake when the others are busy.
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(10))
+            .max_idle_connections_per_host(4)
             .build();
         Ok(Spotify {
             agent,

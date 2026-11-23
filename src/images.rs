@@ -79,7 +79,7 @@ impl Images {
             let dir = dir.clone();
             let _ = thread::Builder::new().name("spotlite-img-prune".into()).spawn(move || crate::store::prune_dir(&dir, DISK_LIMIT));
         }
-        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build();
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).max_idle_connections_per_host(THREADS).build();
         for n in 0..THREADS {
             let (queue, img_tx, picker, dir, agent) = (queue.clone(), img_tx.clone(), picker.clone(), dir.clone(), agent.clone());
             thread::Builder::new()

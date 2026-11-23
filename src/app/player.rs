@@ -225,6 +225,15 @@ impl App {
             self.poll_soon();
             return;
         }
+        // The song that was asked for starts now: its time starts now too, not at the key.
+        if playing && self.switch.as_ref().is_some_and(|sw| sw.want.as_deref() == Some(track.uri.as_str())) {
+            if let Some(pb) = self.playback.as_mut() {
+                pb.progress_ms = Some(0);
+                pb.is_playing = true;
+            }
+            self.polled_at = Instant::now();
+            return;
+        }
         let shown = self.playback.as_ref().is_some_and(|pb| pb.is_playing);
         if shown != playing && self.play_hold.is_none() && self.switch.is_none() {
             self.bake_progress();
